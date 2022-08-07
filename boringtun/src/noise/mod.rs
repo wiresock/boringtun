@@ -306,7 +306,8 @@ impl TunnInner {
                 static_private,
                 static_public,
                 peer_static_public,
-                index << 8,
+                //index << 8,
+                index,
                 preshared_key,
             )
             .map_err(|_| "Invalid parameters")?,
