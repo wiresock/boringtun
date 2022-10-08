@@ -4,6 +4,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 struct wireguard_tunnel; // This corresponds to the Rust type
 
@@ -56,6 +57,22 @@ void x25519_key_to_str_free(const char *key_str);
 // Returns 0 if not
 int check_base64_encoded_x25519_key(const char *key);
 
+/// Sets the default tracing_subscriber to write to `log_func`.
+///
+/// Uses Compact format without level, target, thread ids, thread names, or ansi control characters.
+/// Subscribes to TRACE level events.
+///
+/// This function should only be called once as setting the default tracing_subscriber
+/// more than once will result in an error.
+///
+/// Returns false on failure.
+///
+/// # Safety
+///
+/// `c_char` will be freed by the library after calling `log_func`. If the value needs
+/// to be stored then `log_func` needs to create a copy, e.g. `strcpy`.
+bool set_logging_function(void (*log_func)(const char *));
+
 // Allocate a new tunnel
 struct wireguard_tunnel *new_tunnel(const char *static_private,
                                     const char *server_static_public,
@@ -66,24 +83,24 @@ struct wireguard_tunnel *new_tunnel(const char *static_private,
 // Deallocate the tunnel
 void tunnel_free(struct wireguard_tunnel *);
 
-struct wireguard_result wireguard_write(struct wireguard_tunnel *tunnel,
+struct wireguard_result wireguard_write(const struct wireguard_tunnel *tunnel,
                                         const uint8_t *src,
                                         uint32_t src_size,
                                         uint8_t *dst,
                                         uint32_t dst_size);
 
-struct wireguard_result wireguard_read(struct wireguard_tunnel *tunnel,
+struct wireguard_result wireguard_read(const struct wireguard_tunnel *tunnel,
                                        const uint8_t *src,
                                        uint32_t src_size,
                                        uint8_t *dst,
                                        uint32_t dst_size);
 
-struct wireguard_result wireguard_tick(struct wireguard_tunnel *tunnel,
+struct wireguard_result wireguard_tick(const struct wireguard_tunnel *tunnel,
                                        uint8_t *dst,
                                        uint32_t dst_size);
 
-struct wireguard_result wireguard_force_handshake(struct wireguard_tunnel *tunnel,
+struct wireguard_result wireguard_force_handshake(const struct wireguard_tunnel *tunnel,
                                                   uint8_t *dst,
                                                   uint32_t dst_size);
 
-struct stats wireguard_stats(struct wireguard_tunnel *tunnel);
+struct stats wireguard_stats(const struct wireguard_tunnel *tunnel);

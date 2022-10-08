@@ -2,18 +2,24 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
-use crate::noise::{TunnInner, TunnResult};
+use crate::noise::{Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(feature = "mock-instant")]
+use mock_instant::Instant;
+
+#[cfg(not(feature = "mock-instant"))]
+use crate::sleepyinstant::Instant;
 
 // Some constants, represent time in seconds
 // https://www.wireguard.com/papers/wireguard.pdf#page=14
-const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
+pub(crate) const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
-const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 
@@ -102,7 +108,7 @@ impl IndexMut<TimerName> for Timers {
     }
 }
 
-impl TunnInner {
+impl Tunn {
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
         match timer_name {
             TimeLastPacketReceived => {
@@ -159,7 +165,7 @@ impl TunnInner {
         }
     }
 
-    pub(super) fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
 
@@ -305,7 +311,7 @@ impl TunnInner {
         TunnResult::Done
     }
 
-    pub(super) fn time_since_last_handshake(&self) -> Option<Duration> {
+    pub fn time_since_last_handshake(&self) -> Option<Duration> {
         let current_session = self.current;
         if self.sessions[current_session % super::N_SESSIONS].is_some() {
             let duration_since_tun_start = Instant::now().duration_since(self.timers.time_started);
@@ -317,7 +323,7 @@ impl TunnInner {
         }
     }
 
-    pub(super) fn persistent_keepalive(&self) -> Option<u16> {
+    pub fn persistent_keepalive(&self) -> Option<u16> {
         let keepalive = self.timers.persistent_keepalive;
 
         if keepalive > 0 {

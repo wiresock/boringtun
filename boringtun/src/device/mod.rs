@@ -43,8 +43,10 @@ use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use allowed_ips::AllowedIps;
+use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
+use rand_core::{OsRng, RngCore};
 use tun::{errno, errno_str, TunSocket};
 use udp::UDPSocket;
 
@@ -128,10 +130,10 @@ pub struct Device {
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
 
-    peers: HashMap<x25519_dalek::PublicKey, Arc<Peer>>,
-    peers_by_ip: AllowedIps<Arc<Peer>>,
-    peers_by_idx: HashMap<u32, Arc<Peer>>,
-    next_index: u32,
+    peers: HashMap<x25519_dalek::PublicKey, Arc<Mutex<Peer>>>,
+    peers_by_ip: AllowedIps<Arc<Mutex<Peer>>>,
+    peers_by_idx: HashMap<u32, Arc<Mutex<Peer>>>,
+    next_index: IndexLfsr,
 
     config: DeviceConfig,
 
@@ -266,19 +268,19 @@ impl Drop for DeviceHandle {
 
 impl Device {
     fn next_index(&mut self) -> u32 {
-        let next_index = self.next_index;
-        self.next_index += 1;
-        assert!(next_index < (1 << 24), "Too many peers created");
-        next_index
+        self.next_index.next()
     }
 
     fn remove_peer(&mut self, pub_key: &x25519_dalek::PublicKey) {
         if let Some(peer) = self.peers.remove(pub_key) {
             // Found a peer to remove, now purge all references to it:
-            peer.shutdown_endpoint(); // close open udp socket and free the closure
-            self.peers_by_idx.remove(&peer.index()); // peers_by_idx
+            {
+                let p = peer.lock();
+                p.shutdown_endpoint(); // close open udp socket and free the closure
+                self.peers_by_idx.remove(&p.index());
+            }
             self.peers_by_ip
-                .remove(&|p: &Arc<Peer>| Arc::ptr_eq(&peer, p)); // peers_by_ip
+                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(&peer, p));
 
             tracing::info!("Peer removed");
         }
@@ -324,7 +326,7 @@ impl Device {
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 
-        let peer = Arc::new(peer);
+        let peer = Arc::new(Mutex::new(peer));
         self.peers.insert(pub_key, Arc::clone(&peer));
         self.peers_by_idx.insert(next_index, Arc::clone(&peer));
 
@@ -408,7 +410,7 @@ impl Device {
         }
 
         for peer in self.peers.values() {
-            peer.shutdown_endpoint();
+            peer.lock().shutdown_endpoint();
         }
 
         // Then open new sockets and bind to the port
@@ -456,8 +458,7 @@ impl Device {
         let rate_limiter = Arc::new(RateLimiter::new(&public_key, HANDSHAKE_RATE_LIMIT));
 
         for peer in self.peers.values_mut() {
-            let peer_mut =
-                Arc::<Peer>::get_mut(peer).expect("set_key requires other threads to be stopped");
+            let mut peer_mut = peer.lock();
 
             if peer_mut
                 .tunnel
@@ -470,7 +471,7 @@ impl Device {
             {
                 // In case we encounter an error, we will remove that peer
                 // An error will be a result of bad public key/secret key combination
-                bad_peers.push(peer);
+                bad_peers.push(Arc::clone(peer));
             }
         }
 
@@ -497,7 +498,7 @@ impl Device {
 
         // Then on all currently connected sockets
         for peer in self.peers.values() {
-            if let Some(ref sock) = peer.endpoint().conn {
+            if let Some(ref sock) = peer.lock().endpoint().conn {
                 sock.set_fwmark(mark)?
             }
         }
@@ -550,15 +551,16 @@ impl Device {
 
                 // Go over each peer and invoke the timer function
                 for peer in peer_map.values() {
-                    let endpoint_addr = match peer.endpoint().addr {
+                    let mut p = peer.lock();
+                    let endpoint_addr = match p.endpoint().addr {
                         Some(addr) => addr,
                         None => continue,
                     };
 
-                    match peer.update_timers(&mut t.dst_buf[..]) {
+                    match p.update_timers(&mut t.dst_buf[..]) {
                         TunnResult::Done => {}
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                            peer.shutdown_endpoint(); // close open udp socket
+                            p.shutdown_endpoint(); // close open udp socket
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
@@ -634,9 +636,11 @@ impl Device {
                         Some(peer) => peer,
                     };
 
+                    let mut p = peer.lock();
+
                     // We found a peer, use it to decapsulate the message+
                     let mut flush = false; // Are there packets to send from the queue?
-                    match peer
+                    match p
                         .tunnel
                         .handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
                     {
@@ -647,12 +651,12 @@ impl Device {
                             udp.sendto(packet, addr);
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if peer.is_allowed_ip(addr) {
+                            if p.is_allowed_ip(addr) {
                                 t.iface.write4(packet);
                             }
                         }
                         TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if peer.is_allowed_ip(addr) {
+                            if p.is_allowed_ip(addr) {
                                 t.iface.write6(packet);
                             }
                         }
@@ -661,7 +665,7 @@ impl Device {
                     if flush {
                         // Flush pending queue
                         while let TunnResult::WriteToNetwork(packet) =
-                            peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
+                            p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
                         {
                             udp.sendto(packet, addr);
                         }
@@ -669,9 +673,9 @@ impl Device {
 
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let ip_addr = addr.ip();
-                    peer.set_endpoint(addr);
+                    p.set_endpoint(addr);
                     if d.config.use_connected_socket {
-                        if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.fwmark) {
+                        if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                                 .unwrap();
                         }
@@ -690,7 +694,7 @@ impl Device {
 
     fn register_conn_handler(
         &self,
-        peer: Arc<Peer>,
+        peer: Arc<Mutex<Peer>>,
         udp: Arc<UDPSocket>,
         peer_addr: IpAddr,
     ) -> Result<(), Error> {
@@ -705,7 +709,8 @@ impl Device {
 
                 while let Ok(src) = udp.read(&mut t.src_buf[..]) {
                     let mut flush = false;
-                    match peer
+                    let mut p = peer.lock();
+                    match p
                         .tunnel
                         .decapsulate(Some(peer_addr), src, &mut t.dst_buf[..])
                     {
@@ -716,12 +721,12 @@ impl Device {
                             udp.write(packet);
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if peer.is_allowed_ip(addr) {
+                            if p.is_allowed_ip(addr) {
                                 iface.write4(packet);
                             }
                         }
                         TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if peer.is_allowed_ip(addr) {
+                            if p.is_allowed_ip(addr) {
                                 iface.write6(packet);
                             }
                         }
@@ -730,7 +735,7 @@ impl Device {
                     if flush {
                         // Flush pending queue
                         while let TunnResult::WriteToNetwork(packet) =
-                            peer.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
+                            p.tunnel.decapsulate(None, &[], &mut t.dst_buf[..])
                         {
                             udp.write(packet);
                         }
@@ -785,8 +790,8 @@ impl Device {
                         None => continue,
                     };
 
-                    let peer = match peers.find(dst_addr) {
-                        Some(peer) => peer,
+                    let mut peer = match peers.find(dst_addr) {
+                        Some(peer) => peer.lock(),
                         None => continue,
                     };
 
@@ -815,5 +820,54 @@ impl Device {
             }),
         )?;
         Ok(())
+    }
+}
+
+/// A basic linear-feedback shift register implemented as xorshift, used to
+/// distribute peer indexes across the 24-bit address space reserved for peer
+/// identification.
+/// The purpose is to obscure the total number of peers using the system and to
+/// ensure it requires a non-trivial amount of processing power and/or samples
+/// to guess other peers' indices. Anything more ambitious than this is wasted
+/// with only 24 bits of space.
+struct IndexLfsr {
+    initial: u32,
+    lfsr: u32,
+    mask: u32,
+}
+
+impl IndexLfsr {
+    /// Generate a random 24-bit nonzero integer
+    fn random_index() -> u32 {
+        const LFSR_MAX: u32 = 0xffffff; // 24-bit seed
+        loop {
+            let i = OsRng.next_u32() & LFSR_MAX;
+            if i > 0 {
+                // LFSR seed must be non-zero
+                return i;
+            }
+        }
+    }
+
+    /// Generate the next value in the pseudorandom sequence
+    fn next(&mut self) -> u32 {
+        // 24-bit polynomial for randomness. This is arbitrarily chosen to
+        // inject bitflips into the value.
+        const LFSR_POLY: u32 = 0xd80000; // 24-bit polynomial
+        let value = self.lfsr - 1; // lfsr will never have value of 0
+        self.lfsr = (self.lfsr >> 1) ^ ((0u32.wrapping_sub(self.lfsr & 1u32)) & LFSR_POLY);
+        assert!(self.lfsr != self.initial, "Too many peers created");
+        value ^ self.mask
+    }
+}
+
+impl Default for IndexLfsr {
+    fn default() -> Self {
+        let seed = Self::random_index();
+        IndexLfsr {
+            initial: seed,
+            lfsr: seed,
+            mask: Self::random_index(),
+        }
     }
 }

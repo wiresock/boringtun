@@ -20,14 +20,16 @@ pub struct Endpoint {
 }
 
 pub struct Peer {
-    pub(crate) tunnel: Box<Tunn>, // The associated tunnel struct
-    index: u32,                   // The index the tunnel uses
+    /// The associated tunnel struct
+    pub(crate) tunnel: Tunn,
+    /// The index the tunnel uses
+    index: u32,
     endpoint: RwLock<Endpoint>,
     allowed_ips: AllowedIps<()>,
     preshared_key: Option<[u8; 32]>,
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
 pub struct AllowedIP {
     pub addr: IpAddr,
     pub cidr: u8,
@@ -53,7 +55,7 @@ impl FromStr for AllowedIP {
 
 impl Peer {
     pub fn new(
-        tunnel: Box<Tunn>,
+        tunnel: Tunn,
         index: u32,
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],
@@ -71,7 +73,7 @@ impl Peer {
         }
     }
 
-    pub fn update_timers<'a>(&self, dst: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         self.tunnel.update_timers(dst)
     }
 
