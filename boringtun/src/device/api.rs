@@ -6,6 +6,7 @@ use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
 use crate::serialization::KeyBytes;
+use crate::x25519;
 use hex::encode as encode_hex;
 use libc::*;
 use std::fs::{create_dir, remove_file};
@@ -224,7 +225,7 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                     match key {
                         "private_key" => match val.parse::<KeyBytes>() {
                             Ok(key_bytes) => {
-                                device.set_key(x25519_dalek::StaticSecret::from(key_bytes.0))
+                                device.set_key(x25519::StaticSecret::from(key_bytes.0))
                             }
                             Err(_) => return EINVAL,
                         },
@@ -235,6 +236,11 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             },
                             Err(_) => return EINVAL,
                         },
+                        #[cfg(any(
+                            target_os = "android",
+                            target_os = "fuchsia",
+                            target_os = "linux"
+                        ))]
                         "fwmark" => match val.parse::<u32>() {
                             Ok(mark) => match device.set_fwmark(mark) {
                                 Ok(()) => {}
@@ -253,7 +259,7 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                                 return api_set_peer(
                                     reader,
                                     device,
-                                    x25519_dalek::PublicKey::from(key_bytes.0),
+                                    x25519::PublicKey::from(key_bytes.0),
                                 )
                             }
                             Err(_) => return EINVAL,
@@ -273,7 +279,7 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
 fn api_set_peer(
     reader: &mut BufReader<&UnixStream>,
     d: &mut Device,
-    pub_key: x25519_dalek::PublicKey,
+    pub_key: x25519::PublicKey,
 ) -> i32 {
     let mut cmd = String::new();
 

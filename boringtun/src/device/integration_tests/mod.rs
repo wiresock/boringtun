@@ -6,6 +6,7 @@
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use crate::device::{DeviceConfig, DeviceHandle};
+    use crate::x25519::{PublicKey, StaticSecret};
     use base64::encode as base64encode;
     use hex::encode;
     use rand_core::OsRng;
@@ -18,7 +19,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
-    use x25519_dalek::{PublicKey, StaticSecret};
 
     static NEXT_IFACE_IDX: AtomicUsize = AtomicUsize::new(100); // utun 100+ should be vacant during testing on CI
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(61111); // Use ports starting with 61111, hoping we don't run into a taken port 🤷
@@ -70,7 +70,7 @@ mod tests {
         fn drop(&mut self) {
             if let Some(name) = &self.container_name {
                 Command::new("docker")
-                    .args(&[
+                    .args([
                         "stop", // Run docker
                         &name[5..],
                     ])
@@ -87,7 +87,7 @@ mod tests {
         /// Create a new peer with a given endpoint and a list of allowed IPs
         fn new(endpoint: SocketAddr, allowed_ips: Vec<AllowedIp>) -> Peer {
             Peer {
-                key: StaticSecret::new(OsRng),
+                key: StaticSecret::random_from_rng(OsRng),
                 endpoint,
                 allowed_ips,
                 container_name: None,
@@ -110,11 +110,7 @@ mod tests {
             // The local endpoint port is the remote listen port
             let _ = writeln!(conf, "ListenPort = {}", self.endpoint.port());
             // HACK: this should consume the key so it can't be reused instead of cloning and serializing
-            let _ = writeln!(
-                conf,
-                "PrivateKey = {}",
-                base64encode(&self.key.clone().to_bytes())
-            );
+            let _ = writeln!(conf, "PrivateKey = {}", base64encode(self.key.to_bytes()));
 
             // We are the peer
             let _ = writeln!(conf, "[Peer]");
@@ -147,13 +143,13 @@ mod tests {
         ) {
             let peer_config = self.gen_wg_conf(local_key, local_addr, local_port);
             let peer_config_file = temp_path();
-            std::fs::write(&peer_config_file, &peer_config).unwrap();
+            std::fs::write(&peer_config_file, peer_config).unwrap();
             let nginx_config = self.gen_nginx_conf();
             let nginx_config_file = format!("{}.ngx", peer_config_file);
-            std::fs::write(&nginx_config_file, &nginx_config).unwrap();
+            std::fs::write(&nginx_config_file, nginx_config).unwrap();
 
             Command::new("docker")
-                .args(&[
+                .args([
                     "run",                 // Run docker
                     "-d",                  // In detached mode
                     "--cap-add=NET_ADMIN", // Grant permissions to open a tunnel
@@ -352,7 +348,7 @@ mod tests {
         /// Starts the tunnel
         fn start(&mut self) {
             Command::new("ip")
-                .args(&[
+                .args([
                     "address",
                     "add",
                     &self.addr_v4.to_string(),
@@ -363,7 +359,7 @@ mod tests {
                 .expect("failed to assign ip to tunnel");
 
             Command::new("ip")
-                .args(&[
+                .args([
                     "address",
                     "add",
                     &self.addr_v6.to_string(),
@@ -375,7 +371,7 @@ mod tests {
 
             // Start the tunnel
             Command::new("ip")
-                .args(&["link", "set", "mtu", "1400", "up", "dev", &self.name])
+                .args(["link", "set", "mtu", "1400", "up", "dev", &self.name])
                 .status()
                 .expect("failed to start the tunnel");
 
@@ -385,7 +381,7 @@ mod tests {
             for p in &self.peers {
                 for r in &p.allowed_ips {
                     Command::new("ip")
-                        .args(&[
+                        .args([
                             "route",
                             "add",
                             &format!("{}/{}", r.ip, r.cidr),
@@ -462,7 +458,7 @@ mod tests {
         let mut path = String::from("/tmp/");
         let mut buf = [0u8; 32];
         SystemRandom::new().fill(&mut buf[..]).unwrap();
-        path.push_str(&encode(&buf));
+        path.push_str(&encode(buf));
         path
     }
 
@@ -480,7 +476,7 @@ mod tests {
     /// Test if wireguard starts and creates a unix socket that we can use to set settings
     fn test_wireguard_set() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let own_public_key = PublicKey::from(&private_key);
 
         let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
@@ -498,7 +494,7 @@ mod tests {
             )
         );
 
-        let peer_key = StaticSecret::new(OsRng);
+        let peer_key = StaticSecret::random_from_rng(OsRng);
         let peer_pub_key = PublicKey::from(&peer_key);
         let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 0, 0, 1)), 50001);
         let allowed_ips = [
@@ -547,7 +543,7 @@ mod tests {
     #[ignore]
     fn test_wg_start_ipv4_non_connected() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -594,7 +590,7 @@ mod tests {
     #[ignore]
     fn test_wg_start_ipv4() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -630,7 +626,7 @@ mod tests {
     /// Test if wireguard can handle simple ipv6 connections
     fn test_wg_start_ipv6() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -666,7 +662,7 @@ mod tests {
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     fn test_wg_start_ipv6_endpoint() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -705,7 +701,7 @@ mod tests {
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     fn test_wg_start_ipv6_endpoint_not_connected() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -754,7 +750,7 @@ mod tests {
     #[ignore]
     fn test_wg_concurrent() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
@@ -805,7 +801,7 @@ mod tests {
     #[ignore]
     fn test_wg_concurrent_v6() {
         let port = next_port();
-        let private_key = StaticSecret::new(OsRng);
+        let private_key = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&private_key);
         let addr_v4 = next_ip();
         let addr_v6 = next_ip_v6();
