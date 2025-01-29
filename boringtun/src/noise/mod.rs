@@ -8,6 +8,8 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+use handshake::Obfuscation;
+
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -125,7 +127,7 @@ pub enum Packet<'a> {
 
 impl Tunn {
     #[inline(always)]
-    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
+    pub fn parse_incoming_packet(obf: Obfuscation, src: &[u8]) -> Result<Packet, WireGuardError> {
         if src.len() < 4 {
             return Err(WireGuardError::InvalidPacket);
         }
@@ -134,26 +136,26 @@ impl Tunn {
         let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
 
         Ok(match (packet_type, src.len()) {
-            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
+            (v, HANDSHAKE_INIT_SZ) if v == obf.obf_init => Packet::HandshakeInit(HandshakeInit {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
                     .expect("length already checked above"),
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
             }),
-            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
+            (v, HANDSHAKE_RESP_SZ) if v == obf.obf_resp => Packet::HandshakeResponse(HandshakeResponse {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
                     .expect("length already checked above"),
                 encrypted_nothing: &src[44..60],
             }),
-            (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
+            (v, COOKIE_REPLY_SZ) if v == obf.obf_cookie => Packet::PacketCookieReply(PacketCookieReply {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 nonce: &src[8..32],
                 encrypted_cookie: &src[32..64],
             }),
-            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
+            (v, DATA_OVERHEAD_SZ..=std::usize::MAX) if v == obf.obf_data => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
                 encrypted_encapsulated_packet: &src[16..],
@@ -198,6 +200,10 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
+        obf_init: u32,
+        obf_resp: u32,
+        obf_cookie: u32,
+        obf_data: u32,
     ) -> Self {
         let static_public = x25519::PublicKey::from(&static_private);
 
@@ -209,6 +215,10 @@ impl Tunn {
                 //index << 8,
                 index,
                 preshared_key,
+                obf_init,
+                obf_resp,
+                obf_cookie,
+                obf_data,
             ),
             sessions: Default::default(),
             current: Default::default(),
@@ -252,7 +262,7 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = session.format_packet_data(self.handshake.obf, src, dst);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -288,7 +298,7 @@ impl Tunn {
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
             .rate_limiter
-            .verify_packet(src_addr, datagram, &mut cookie)
+            .verify_packet(self.handshake.obf, src_addr, datagram, &mut cookie)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -354,7 +364,7 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = session.format_packet_data(self.handshake.obf, &[], dst);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -699,7 +709,7 @@ mod tests {
     fn handshake_init() {
         let (mut my_tun, _their_tun) = create_two_tuns();
         let init = create_handshake_init(&mut my_tun);
-        let packet = Tunn::parse_incoming_packet(&init).unwrap();
+        let packet = Tunn::parse_incoming_packet(my_tun.handshake.obf, &init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
     }
 
@@ -708,7 +718,7 @@ mod tests {
         let (mut my_tun, mut their_tun) = create_two_tuns();
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
-        let packet = Tunn::parse_incoming_packet(&resp).unwrap();
+        let packet = Tunn::parse_incoming_packet(my_tun.handshake.obf, &resp).unwrap();
         assert!(matches!(packet, Packet::HandshakeResponse(_)));
     }
 
@@ -718,7 +728,7 @@ mod tests {
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
         let keepalive = parse_handshake_resp(&mut my_tun, &resp);
-        let packet = Tunn::parse_incoming_packet(&keepalive).unwrap();
+        let packet = Tunn::parse_incoming_packet(my_tun.handshake.obf, &keepalive).unwrap();
         assert!(matches!(packet, Packet::PacketData(_)));
     }
 

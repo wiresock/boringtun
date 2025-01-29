@@ -247,6 +247,10 @@ pub unsafe extern "C" fn new_tunnel(
     preshared_key: *const c_char,
     keep_alive: u16,
     index: u32,
+    obf_init: u32,
+    obf_resp: u32,
+    obf_cookie: u32,
+    obf_data: u32,
 ) -> *mut Mutex<Tunn> {
     let c_str = CStr::from_ptr(static_private);
     let static_private = match c_str.to_str() {
@@ -299,6 +303,10 @@ pub unsafe extern "C" fn new_tunnel(
         keep_alive,
         index,
         None,
+        obf_init,
+        obf_resp,
+        obf_cookie,
+        obf_data,
     )));
 
     PANIC_HOOK.call_once(|| {

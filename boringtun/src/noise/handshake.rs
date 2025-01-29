@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
+use super::{HandshakeInit, HandshakeResponse, PacketCookieReply, HANDSHAKE_INIT, HANDSHAKE_RESP, COOKIE_REPLY, DATA};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
@@ -294,6 +294,28 @@ enum HandshakeState {
     Expired,
 }
 
+/// Represents an obfuscation mechanism used to disguise network traffic.
+/// This structure contains obfuscation parameters used for initializing,
+/// responding, managing cookies, and processing data.
+///
+/// # Traits
+/// - `Copy`: Allows bitwise copying of the structure.
+/// - `Clone`: Provides explicit duplication.
+/// - `PartialEq` / `Eq`: Enables equality comparisons.
+///
+/// # Fields
+/// - `obf_init`: Initial obfuscation value used during handshake.
+/// - `obf_resp`: Response obfuscation value used in challenge-response mechanisms.
+/// - `obf_cookie`: Unique obfuscation value used to track session state.
+/// - `obf_data`: Obfuscation key used to encrypt/decrypt transmitted data.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Obfuscation {
+    pub(super) obf_init: u32,
+    pub(super) obf_resp: u32,
+    pub(super) obf_cookie: u32,
+    pub(super) obf_data: u32,
+}
+
 pub struct Handshake {
     params: NoiseParams,
     /// Index of the next session
@@ -308,6 +330,8 @@ pub struct Handshake {
     // TODO: make TimeStamper a singleton
     stamper: TimeStamper,
     pub(super) last_rtt: Option<u32>,
+    // Packet type obfuscation parameters
+    pub(super) obf: Obfuscation,
 }
 
 #[derive(Default)]
@@ -414,6 +438,10 @@ impl Handshake {
         peer_static_public: x25519::PublicKey,
         global_idx: u32,
         preshared_key: Option<[u8; 32]>,
+        obf_init: u32,
+        obf_resp: u32,
+        obf_cookie: u32,
+        obf_data: u32,
     ) -> Handshake {
         let params = NoiseParams::new(
             static_private,
@@ -421,6 +449,13 @@ impl Handshake {
             peer_static_public,
             preshared_key,
         );
+
+        let obf = Obfuscation {
+            obf_init: if obf_init == 0 { HANDSHAKE_INIT } else { obf_init },
+            obf_resp: if obf_resp == 0 { HANDSHAKE_RESP } else { obf_resp },
+            obf_cookie: if obf_cookie == 0 { COOKIE_REPLY } else { obf_cookie },
+            obf_data: if obf_data == 0 { DATA } else { obf_data },
+        };
 
         Handshake {
             params,
@@ -431,6 +466,7 @@ impl Handshake {
             stamper: TimeStamper::new(),
             cookies: Default::default(),
             last_rtt: None,
+            obf,
         }
     }
 
@@ -731,7 +767,8 @@ impl Handshake {
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
+        // message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
+        message_type.copy_from_slice(&self.obf.obf_init.to_le_bytes());
         // msg.sender_index = little_endian(initiator.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
@@ -818,7 +855,8 @@ impl Handshake {
         let local_index = self.inc_index();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&super::HANDSHAKE_RESP.to_le_bytes());
+        // message_type.copy_from_slice(&super::HANDSHAKE_RESP.to_le_bytes());
+        message_type.copy_from_slice(&self.obf.obf_resp.to_le_bytes());
         // msg.sender_index = little_endian(responder.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
