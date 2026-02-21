@@ -11,7 +11,8 @@ use aead::{Aead, Payload};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::XChaCha20Poly1305;
-use rand_core::OsRng;
+use rand_chacha::ChaCha8Rng;
+use rand_core::{OsRng, SeedableRng};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
@@ -309,13 +310,12 @@ impl TagRange {
 
     /// Returns a uniformly random value from `[start..=end]`.
     /// If `start == end` the result is always that value.
-    pub fn random(&self) -> u32 {
+    pub fn random(&self, rng: &mut impl rand_core::RngCore) -> u32 {
         if self.start == self.end {
             return self.start;
         }
-        use rand_core::{OsRng, RngCore};
         let range_size = (self.end - self.start) as u64 + 1;
-        self.start + (OsRng.next_u64() % range_size) as u32
+        self.start + (rng.next_u64() % range_size) as u32
     }
 
     /// Returns `true` if `self` and `other` overlap (inclusive boundaries).
@@ -405,10 +405,10 @@ impl ObfuscationRanges {
     pub fn matches_h2(&self, v: u32) -> bool { self.h2_resp.contains(v) }
     pub fn matches_h3(&self, v: u32) -> bool { self.h3_cookie.contains(v) }
     pub fn matches_h4(&self, v: u32) -> bool { self.h4_data.contains(v) }
-    pub fn random_h1(&self) -> u32 { self.h1_init.random() }
-    pub fn random_h2(&self) -> u32 { self.h2_resp.random() }
-    pub fn random_h3(&self) -> u32 { self.h3_cookie.random() }
-    pub fn random_h4(&self) -> u32 { self.h4_data.random() }
+    pub fn random_h1(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h1_init.random(rng) }
+    pub fn random_h2(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h2_resp.random(rng) }
+    pub fn random_h3(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h3_cookie.random(rng) }
+    pub fn random_h4(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h4_data.random(rng) }
 }
 
 pub struct Handshake {
@@ -427,6 +427,8 @@ pub struct Handshake {
     pub(super) last_rtt: Option<u32>,
     // Packet type obfuscation ranges
     pub(super) obf: ObfuscationRanges,
+    // Fast CSPRNG for tag randomization (seeded once from OsRng)
+    pub(super) rng: ChaCha8Rng,
 }
 
 #[derive(Default)]
@@ -552,6 +554,7 @@ impl Handshake {
             cookies: Default::default(),
             last_rtt: None,
             obf,
+            rng: ChaCha8Rng::from_rng(OsRng).unwrap(),
         }
     }
 
@@ -852,7 +855,7 @@ impl Handshake {
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&self.obf.random_h1().to_le_bytes());
+        message_type.copy_from_slice(&self.obf.random_h1(&mut self.rng).to_le_bytes());
         // msg.sender_index = little_endian(initiator.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
@@ -939,7 +942,7 @@ impl Handshake {
         let local_index = self.inc_index();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&self.obf.random_h2().to_le_bytes());
+        message_type.copy_from_slice(&self.obf.random_h2(&mut self.rng).to_le_bytes());
         // msg.sender_index = little_endian(responder.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)

@@ -269,7 +269,7 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(self.handshake.obf, src, dst);
+            let packet = session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, src, dst);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -305,7 +305,7 @@ impl Tunn {
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
             .rate_limiter
-            .verify_packet(self.handshake.obf, src_addr, datagram, &mut cookie)
+            .verify_packet(self.handshake.obf, &mut self.handshake.rng, src_addr, datagram, &mut cookie)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -371,7 +371,7 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(self.handshake.obf, &[], dst);
+        let keepalive_packet = session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, &[], dst);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -924,14 +924,15 @@ mod tests {
     #[test]
     fn obf_outgoing_random_within_bounds() {
         let obf = ObfuscationRanges::new(100, 200, 300, 400, 500, 600, 700, 800).unwrap();
+        let mut rng = OsRng;
         for _ in 0..1000 {
-            let v = obf.random_h1();
+            let v = obf.random_h1(&mut rng);
             assert!(v >= 100 && v <= 200, "H1 random {v} out of range [100..200]");
-            let v = obf.random_h2();
+            let v = obf.random_h2(&mut rng);
             assert!(v >= 300 && v <= 400, "H2 random {v} out of range [300..400]");
-            let v = obf.random_h3();
+            let v = obf.random_h3(&mut rng);
             assert!(v >= 500 && v <= 600, "H3 random {v} out of range [500..600]");
-            let v = obf.random_h4();
+            let v = obf.random_h4(&mut rng);
             assert!(v >= 700 && v <= 800, "H4 random {v} out of range [700..800]");
         }
     }
@@ -939,11 +940,12 @@ mod tests {
     #[test]
     fn obf_fixed_range_random_is_constant() {
         let obf = ObfuscationRanges::new(42, 42, 99, 99, 7, 7, 13, 13).unwrap();
+        let mut rng = OsRng;
         for _ in 0..100 {
-            assert_eq!(obf.random_h1(), 42);
-            assert_eq!(obf.random_h2(), 99);
-            assert_eq!(obf.random_h3(), 7);
-            assert_eq!(obf.random_h4(), 13);
+            assert_eq!(obf.random_h1(&mut rng), 42);
+            assert_eq!(obf.random_h2(&mut rng), 99);
+            assert_eq!(obf.random_h3(&mut rng), 7);
+            assert_eq!(obf.random_h4(&mut rng), 13);
         }
     }
 

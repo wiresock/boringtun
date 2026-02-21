@@ -115,6 +115,7 @@ impl RateLimiter {
     pub(crate) fn format_cookie_reply<'a>(
         &self,
         obf: ObfuscationRanges,
+        rng: &mut impl RngCore,
         idx: u32,
         cookie: Cookie,
         mac1: &[u8],
@@ -131,7 +132,7 @@ impl RateLimiter {
 
         // msg.message_type = 3
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&obf.random_h3().to_le_bytes());
+        message_type.copy_from_slice(&obf.random_h3(rng).to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
         receiver_index.copy_from_slice(&idx.to_le_bytes());
         nonce.copy_from_slice(&self.nonce()[..]);
@@ -154,6 +155,7 @@ impl RateLimiter {
     pub fn verify_packet<'a, 'b>(
         &self,
         obf: ObfuscationRanges,
+        rng: &mut impl RngCore,
         src_addr: Option<IpAddr>,
         src: &'a [u8],
         dst: &'b mut [u8],
@@ -183,7 +185,7 @@ impl RateLimiter {
 
                 if verify_slices_are_equal(&computed_mac2[..16], mac2).is_err() {
                     let cookie_packet = self
-                        .format_cookie_reply(obf, sender_idx, cookie, mac1, dst)
+                        .format_cookie_reply(obf, rng, sender_idx, cookie, mac1, dst)
                         .map_err(TunnResult::Err)?;
                     return Err(TunnResult::WriteToNetwork(cookie_packet));
                 }
