@@ -82,7 +82,7 @@ bool set_logging_function(void (*log_func)(const char *));
 ///
 /// Each WireGuard packet type has an associated 4-byte "message type" tag.
 /// The h1-h4 start/end pairs let you override these tags with inclusive
-/// ranges `[start..end]`.  On outgoing packets a value is chosen uniformly
+/// ranges [start, end].  On outgoing packets a value is chosen uniformly
 /// at random from the range; on incoming packets any value within the range
 /// is accepted for that packet type.
 ///
@@ -91,14 +91,14 @@ bool set_logging_function(void (*log_func)(const char *));
 /// | start | end   | Resolved range                              |
 /// |-------|-------|---------------------------------------------|
 /// | 0     | 0     | Default WireGuard constant (1, 2, 3, or 4)  |
-/// | S > 0 | 0     | Fixed value [S..S]  (back-compat shorthand) |
-/// | S     | E >= S| Custom inclusive range [S..E]                |
+/// | S > 0 | 0     | Fixed value [S, S]  (back-compat shorthand) |
+/// | S     | E >= S| Custom inclusive range [S, E]                |
 /// | S     | E < S | **Invalid** - returns NULL                   |
 ///
 /// **Non-overlap requirement:**
 ///
 /// The four resolved ranges must not overlap (including at boundaries).
-/// For example H1=[10..20] and H4=[20..30] is rejected because value 20
+/// For example H1=[10, 20] and H4=[20, 30] is rejected because value 20
 /// belongs to both.  On conflict the function returns NULL.
 ///
 /// **Quick-start examples:**

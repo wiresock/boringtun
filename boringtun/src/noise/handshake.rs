@@ -298,11 +298,14 @@ enum HandshakeState {
 /// An inclusive range `[start..=end]` of obfuscation tag values for a packet type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct TagRange {
-    pub start: u32,
-    pub end: u32,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
 }
 
 impl TagRange {
+    pub fn start(&self) -> u32 { self.start }
+    pub fn end(&self) -> u32 { self.end }
+
     /// Returns `true` if `value` falls within `[start..=end]`.
     pub fn contains(&self, value: u32) -> bool {
         value >= self.start && value <= self.end
@@ -332,10 +335,10 @@ impl TagRange {
 /// * H4 – data
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ObfuscationRanges {
-    pub h1_init: TagRange,
-    pub h2_resp: TagRange,
-    pub h3_cookie: TagRange,
-    pub h4_data: TagRange,
+    pub(crate) h1_init: TagRange,
+    pub(crate) h2_resp: TagRange,
+    pub(crate) h3_cookie: TagRange,
+    pub(crate) h4_data: TagRange,
 }
 
 impl Default for ObfuscationRanges {
@@ -363,19 +366,19 @@ impl ObfuscationRanges {
         h3_start: u32, h3_end: u32,
         h4_start: u32, h4_end: u32,
     ) -> Result<Self, String> {
-        let resolve = |start: u32, end: u32, default: u32| -> Result<TagRange, String> {
+        let resolve = |name: &str, start: u32, end: u32, default: u32| -> Result<TagRange, String> {
             match (start, end) {
                 (0, 0) => Ok(TagRange { start: default, end: default }),
                 (s, 0) => Ok(TagRange { start: s, end: s }),
                 (s, e) if s <= e => Ok(TagRange { start: s, end: e }),
-                (s, e) => Err(format!("Invalid range: start ({s}) > end ({e})")),
+                (s, e) => Err(format!("Invalid {name} range: start ({s}) > end ({e})")),
             }
         };
 
-        let h1 = resolve(h1_start, h1_end, HANDSHAKE_INIT)?;
-        let h2 = resolve(h2_start, h2_end, HANDSHAKE_RESP)?;
-        let h3 = resolve(h3_start, h3_end, COOKIE_REPLY)?;
-        let h4 = resolve(h4_start, h4_end, DATA)?;
+        let h1 = resolve("H1", h1_start, h1_end, HANDSHAKE_INIT)?;
+        let h2 = resolve("H2", h2_start, h2_end, HANDSHAKE_RESP)?;
+        let h3 = resolve("H3", h3_start, h3_end, COOKIE_REPLY)?;
+        let h4 = resolve("H4", h4_start, h4_end, DATA)?;
 
         let ranges = [("H1", h1), ("H2", h2), ("H3", h3), ("H4", h4)];
         for i in 0..ranges.len() {
@@ -536,7 +539,7 @@ impl Handshake {
         global_idx: u32,
         preshared_key: Option<[u8; 32]>,
         obf: ObfuscationRanges,
-    ) -> Handshake {
+    ) -> Result<Handshake, String> {
         let params = NoiseParams::new(
             static_private,
             static_public,
@@ -544,7 +547,10 @@ impl Handshake {
             preshared_key,
         );
 
-        Handshake {
+        let rng = ChaCha8Rng::from_rng(OsRng)
+            .map_err(|e| format!("Failed to seed RNG from OS entropy: {e}"))?;
+
+        Ok(Handshake {
             params,
             next_index: global_idx,
             previous: HandshakeState::None,
@@ -554,8 +560,8 @@ impl Handshake {
             cookies: Default::default(),
             last_rtt: None,
             obf,
-            rng: ChaCha8Rng::from_rng(OsRng).unwrap(),
-        }
+            rng,
+        })
     }
 
     pub(crate) fn is_in_progress(&self) -> bool {

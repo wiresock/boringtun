@@ -226,7 +226,7 @@ impl Tunn {
                 index,
                 preshared_key,
                 obf,
-            ),
+            )?,
             sessions: Default::default(),
             current: Default::default(),
             tx_bytes: Default::default(),
@@ -871,6 +871,7 @@ mod tests {
         let result = ObfuscationRanges::new(20, 10, 100, 110, 200, 210, 300, 310);
         assert!(result.is_err());
         let msg = result.unwrap_err();
+        assert!(msg.contains("H1"), "Error should identify range H1: {msg}");
         assert!(msg.contains("start"), "Error should mention start: {msg}");
     }
 
@@ -969,5 +970,54 @@ mod tests {
         let resp = create_handshake_response(&mut their_tun, &init);
         let keepalive = parse_handshake_resp(&mut my_tun, &resp);
         parse_keepalive(&mut their_tun, &keepalive);
+    }
+
+    #[test]
+    fn obf_ranges_near_u32_max_random_within_bounds() {
+        let h1_min = u32::MAX - 10;
+        let h1_max = u32::MAX;
+        let h2_min = u32::MAX - 30;
+        let h2_max = u32::MAX - 21;
+        let h3_min = u32::MAX - 50;
+        let h3_max = u32::MAX - 41;
+        let h4_min = u32::MAX - 70;
+        let h4_max = u32::MAX - 61;
+        let obf = ObfuscationRanges::new(
+            h1_min, h1_max,
+            h2_min, h2_max,
+            h3_min, h3_max,
+            h4_min, h4_max,
+        )
+        .unwrap();
+        let mut rng = OsRng;
+        for _ in 0..10_000 {
+            let t1 = obf.random_h1(&mut rng);
+            assert!(t1 >= h1_min && t1 <= h1_max);
+            let t2 = obf.random_h2(&mut rng);
+            assert!(t2 >= h2_min && t2 <= h2_max);
+            let t3 = obf.random_h3(&mut rng);
+            assert!(t3 >= h3_min && t3 <= h3_max);
+            let t4 = obf.random_h4(&mut rng);
+            assert!(t4 >= h4_min && t4 <= h4_max);
+        }
+    }
+
+    #[test]
+    fn obf_ranges_near_u32_max_overlap_rejected() {
+        let h1_min = u32::MAX - 10;
+        let h1_max = u32::MAX;
+        let h2_min = u32::MAX - 5;
+        let h2_max = u32::MAX - 1;
+        let h3_min = u32::MAX - 30;
+        let h3_max = u32::MAX - 21;
+        let h4_min = u32::MAX - 50;
+        let h4_max = u32::MAX - 41;
+        let res = ObfuscationRanges::new(
+            h1_min, h1_max,
+            h2_min, h2_max,
+            h3_min, h3_max,
+            h4_min, h4_max,
+        );
+        assert!(res.is_err());
     }
 }
