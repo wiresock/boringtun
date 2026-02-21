@@ -8,7 +8,7 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
-use handshake::Obfuscation;
+use handshake::ObfuscationRanges;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -127,7 +127,7 @@ pub enum Packet<'a> {
 
 impl Tunn {
     #[inline(always)]
-    pub fn parse_incoming_packet(obf: Obfuscation, src: &[u8]) -> Result<Packet, WireGuardError> {
+    pub fn parse_incoming_packet(obf: ObfuscationRanges, src: &[u8]) -> Result<Packet, WireGuardError> {
         if src.len() < 4 {
             return Err(WireGuardError::InvalidPacket);
         }
@@ -136,26 +136,26 @@ impl Tunn {
         let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
 
         Ok(match (packet_type, src.len()) {
-            (v, HANDSHAKE_INIT_SZ) if v == obf.obf_init => Packet::HandshakeInit(HandshakeInit {
+            (v, HANDSHAKE_INIT_SZ) if obf.matches_h1(v) => Packet::HandshakeInit(HandshakeInit {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
                     .expect("length already checked above"),
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
             }),
-            (v, HANDSHAKE_RESP_SZ) if v == obf.obf_resp => Packet::HandshakeResponse(HandshakeResponse {
+            (v, HANDSHAKE_RESP_SZ) if obf.matches_h2(v) => Packet::HandshakeResponse(HandshakeResponse {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
                     .expect("length already checked above"),
                 encrypted_nothing: &src[44..60],
             }),
-            (v, COOKIE_REPLY_SZ) if v == obf.obf_cookie => Packet::PacketCookieReply(PacketCookieReply {
+            (v, COOKIE_REPLY_SZ) if obf.matches_h3(v) => Packet::PacketCookieReply(PacketCookieReply {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 nonce: &src[8..32],
                 encrypted_cookie: &src[32..64],
             }),
-            (v, DATA_OVERHEAD_SZ..=std::usize::MAX) if v == obf.obf_data => Packet::PacketData(PacketData {
+            (v, DATA_OVERHEAD_SZ..=std::usize::MAX) if obf.matches_h4(v) => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
                 encrypted_encapsulated_packet: &src[16..],
@@ -200,26 +200,33 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
-        obf_init: u32,
-        obf_resp: u32,
-        obf_cookie: u32,
-        obf_data: u32,
-    ) -> Self {
+        h1_init_start: u32,
+        h1_init_end: u32,
+        h2_resp_start: u32,
+        h2_resp_end: u32,
+        h3_cookie_start: u32,
+        h3_cookie_end: u32,
+        h4_data_start: u32,
+        h4_data_end: u32,
+    ) -> Result<Self, String> {
         let static_public = x25519::PublicKey::from(&static_private);
 
-        Tunn {
+        let obf = ObfuscationRanges::new(
+            h1_init_start, h1_init_end,
+            h2_resp_start, h2_resp_end,
+            h3_cookie_start, h3_cookie_end,
+            h4_data_start, h4_data_end,
+        )?;
+
+        Ok(Tunn {
             handshake: Handshake::new(
                 static_private,
                 static_public,
                 peer_static_public,
-                //index << 8,
                 index,
                 preshared_key,
-                obf_init,
-                obf_resp,
-                obf_cookie,
-                obf_data,
-            ),
+                obf,
+            )?,
             sessions: Default::default(),
             current: Default::default(),
             tx_bytes: Default::default(),
@@ -231,7 +238,7 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
-        }
+        })
     }
 
     /// Update the private key and clear existing sessions
@@ -262,7 +269,7 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(self.handshake.obf, src, dst);
+            let packet = session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, src, dst);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -298,7 +305,7 @@ impl Tunn {
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
             .rate_limiter
-            .verify_packet(self.handshake.obf, src_addr, datagram, &mut cookie)
+            .verify_packet(self.handshake.obf, &mut self.handshake.rng, src_addr, datagram, &mut cookie)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -364,7 +371,7 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(self.handshake.obf, &[], dst);
+        let keepalive_packet = session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, &[], dst);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -613,9 +620,11 @@ mod tests {
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let their_idx = OsRng.next_u32();
 
-        let my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None);
+        let my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None,
+            0, 0, 0, 0, 0, 0, 0, 0).unwrap();
 
-        let their_tun = Tunn::new(their_secret_key, my_public_key, None, None, their_idx, None);
+        let their_tun = Tunn::new(their_secret_key, my_public_key, None, None, their_idx, None,
+            0, 0, 0, 0, 0, 0, 0, 0).unwrap();
 
         (my_tun, their_tun)
     }
@@ -696,7 +705,7 @@ mod tests {
         } else {
             unreachable!();
         };
-        let packet = Tunn::parse_incoming_packet(packet_data).unwrap();
+        let packet = Tunn::parse_incoming_packet(tun.handshake.obf, packet_data).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
     }
 
@@ -770,7 +779,7 @@ mod tests {
         let (mut my_tun, _their_tun) = create_two_tuns();
 
         let init = create_handshake_init(&mut my_tun);
-        let packet = Tunn::parse_incoming_packet(&init).unwrap();
+        let packet = Tunn::parse_incoming_packet(my_tun.handshake.obf, &init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
         mock_instant::MockClock::advance(REKEY_TIMEOUT);
@@ -801,5 +810,214 @@ mod tests {
             unreachable!();
         };
         assert_eq!(sent_packet_buf, recv_packet_buf);
+    }
+
+    // ---- ObfuscationRanges unit tests ----
+
+    use crate::noise::handshake::{ObfuscationRanges, TagRange};
+
+    #[test]
+    fn obf_default_mapping() {
+        // (0,0) for all ranges yields default WG constants
+        let obf = ObfuscationRanges::new(0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        assert_eq!(obf.h1_init, TagRange { start: 1, end: 1 });
+        assert_eq!(obf.h2_resp, TagRange { start: 2, end: 2 });
+        assert_eq!(obf.h3_cookie, TagRange { start: 3, end: 3 });
+        assert_eq!(obf.h4_data, TagRange { start: 4, end: 4 });
+    }
+
+    #[test]
+    fn obf_fixed_mapping() {
+        // start=end yields a single-element range
+        let obf = ObfuscationRanges::new(10, 10, 20, 20, 30, 30, 40, 40).unwrap();
+        assert_eq!(obf.h1_init, TagRange { start: 10, end: 10 });
+        assert_eq!(obf.h2_resp, TagRange { start: 20, end: 20 });
+        assert_eq!(obf.h3_cookie, TagRange { start: 30, end: 30 });
+        assert_eq!(obf.h4_data, TagRange { start: 40, end: 40 });
+    }
+
+    #[test]
+    fn obf_back_compat_single_value() {
+        // (start, 0) where start != 0 => [start..=start]
+        let obf = ObfuscationRanges::new(10, 0, 20, 0, 30, 0, 40, 0).unwrap();
+        assert_eq!(obf.h1_init, TagRange { start: 10, end: 10 });
+        assert_eq!(obf.h2_resp, TagRange { start: 20, end: 20 });
+        assert_eq!(obf.h3_cookie, TagRange { start: 30, end: 30 });
+        assert_eq!(obf.h4_data, TagRange { start: 40, end: 40 });
+    }
+
+    #[test]
+    fn obf_overlap_detection() {
+        // H1 [10..20] and H4 [20..30] overlap at boundary 20
+        let result = ObfuscationRanges::new(10, 20, 100, 110, 200, 210, 20, 30);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("H1"), "Error should mention H1: {msg}");
+        assert!(msg.contains("H4"), "Error should mention H4: {msg}");
+        assert!(msg.contains("overlaps"), "Error should mention overlaps: {msg}");
+    }
+
+    #[test]
+    fn obf_overlap_detection_h2_h3() {
+        let result = ObfuscationRanges::new(10, 20, 50, 60, 55, 65, 100, 110);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("H2"), "Error should mention H2: {msg}");
+        assert!(msg.contains("H3"), "Error should mention H3: {msg}");
+    }
+
+    #[test]
+    fn obf_start_greater_than_end() {
+        let result = ObfuscationRanges::new(20, 10, 100, 110, 200, 210, 300, 310);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("H1"), "Error should identify range H1: {msg}");
+        assert!(msg.contains("start"), "Error should mention start: {msg}");
+    }
+
+    #[test]
+    fn obf_incoming_accept_reject() {
+        let obf = ObfuscationRanges::new(10, 20, 30, 40, 50, 60, 70, 80).unwrap();
+
+        // H1: packet with correct range and size should be accepted
+        let mut init_packet = vec![0u8; HANDSHAKE_INIT_SZ];
+        init_packet[0..4].copy_from_slice(&15u32.to_le_bytes()); // within [10..20]
+        let result = Tunn::parse_incoming_packet(obf, &init_packet);
+        assert!(matches!(result, Ok(Packet::HandshakeInit(_))));
+
+        // H1: tag outside range but correct size should be rejected
+        init_packet[0..4].copy_from_slice(&25u32.to_le_bytes()); // outside [10..20]
+        let result = Tunn::parse_incoming_packet(obf, &init_packet);
+        assert!(matches!(result, Err(WireGuardError::InvalidPacket)));
+
+        // H2: packet with correct range and size
+        let mut resp_packet = vec![0u8; HANDSHAKE_RESP_SZ];
+        resp_packet[0..4].copy_from_slice(&35u32.to_le_bytes()); // within [30..40]
+        let result = Tunn::parse_incoming_packet(obf, &resp_packet);
+        assert!(matches!(result, Ok(Packet::HandshakeResponse(_))));
+
+        // H2: tag outside range
+        resp_packet[0..4].copy_from_slice(&45u32.to_le_bytes()); // outside [30..40]
+        let result = Tunn::parse_incoming_packet(obf, &resp_packet);
+        assert!(matches!(result, Err(WireGuardError::InvalidPacket)));
+
+        // H3: cookie reply
+        let mut cookie_packet = vec![0u8; COOKIE_REPLY_SZ];
+        cookie_packet[0..4].copy_from_slice(&55u32.to_le_bytes()); // within [50..60]
+        let result = Tunn::parse_incoming_packet(obf, &cookie_packet);
+        assert!(matches!(result, Ok(Packet::PacketCookieReply(_))));
+
+        cookie_packet[0..4].copy_from_slice(&65u32.to_le_bytes()); // outside [50..60]
+        let result = Tunn::parse_incoming_packet(obf, &cookie_packet);
+        assert!(matches!(result, Err(WireGuardError::InvalidPacket)));
+
+        // H4: data packet (minimum size)
+        let mut data_packet = vec![0u8; DATA_OVERHEAD_SZ];
+        data_packet[0..4].copy_from_slice(&75u32.to_le_bytes()); // within [70..80]
+        let result = Tunn::parse_incoming_packet(obf, &data_packet);
+        assert!(matches!(result, Ok(Packet::PacketData(_))));
+
+        data_packet[0..4].copy_from_slice(&85u32.to_le_bytes()); // outside [70..80]
+        let result = Tunn::parse_incoming_packet(obf, &data_packet);
+        assert!(matches!(result, Err(WireGuardError::InvalidPacket)));
+    }
+
+    #[test]
+    fn obf_outgoing_random_within_bounds() {
+        let obf = ObfuscationRanges::new(100, 200, 300, 400, 500, 600, 700, 800).unwrap();
+        let mut rng = OsRng;
+        for _ in 0..1000 {
+            let v = obf.random_h1(&mut rng);
+            assert!(v >= 100 && v <= 200, "H1 random {v} out of range [100..200]");
+            let v = obf.random_h2(&mut rng);
+            assert!(v >= 300 && v <= 400, "H2 random {v} out of range [300..400]");
+            let v = obf.random_h3(&mut rng);
+            assert!(v >= 500 && v <= 600, "H3 random {v} out of range [500..600]");
+            let v = obf.random_h4(&mut rng);
+            assert!(v >= 700 && v <= 800, "H4 random {v} out of range [700..800]");
+        }
+    }
+
+    #[test]
+    fn obf_fixed_range_random_is_constant() {
+        let obf = ObfuscationRanges::new(42, 42, 99, 99, 7, 7, 13, 13).unwrap();
+        let mut rng = OsRng;
+        for _ in 0..100 {
+            assert_eq!(obf.random_h1(&mut rng), 42);
+            assert_eq!(obf.random_h2(&mut rng), 99);
+            assert_eq!(obf.random_h3(&mut rng), 7);
+            assert_eq!(obf.random_h4(&mut rng), 13);
+        }
+    }
+
+    #[test]
+    fn obf_ranges_handshake_roundtrip() {
+        // Verify that tunnels with matching range config can handshake
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let my_idx = OsRng.next_u32();
+
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let their_idx = OsRng.next_u32();
+
+        let mut my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None,
+            100, 200, 300, 400, 500, 600, 700, 800).unwrap();
+        let mut their_tun = Tunn::new(their_secret_key, my_public_key, None, None, their_idx, None,
+            100, 200, 300, 400, 500, 600, 700, 800).unwrap();
+
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+    }
+
+    #[test]
+    fn obf_ranges_near_u32_max_random_within_bounds() {
+        let h1_min = u32::MAX - 10;
+        let h1_max = u32::MAX;
+        let h2_min = u32::MAX - 30;
+        let h2_max = u32::MAX - 21;
+        let h3_min = u32::MAX - 50;
+        let h3_max = u32::MAX - 41;
+        let h4_min = u32::MAX - 70;
+        let h4_max = u32::MAX - 61;
+        let obf = ObfuscationRanges::new(
+            h1_min, h1_max,
+            h2_min, h2_max,
+            h3_min, h3_max,
+            h4_min, h4_max,
+        )
+        .unwrap();
+        let mut rng = OsRng;
+        for _ in 0..10_000 {
+            let t1 = obf.random_h1(&mut rng);
+            assert!(t1 >= h1_min && t1 <= h1_max);
+            let t2 = obf.random_h2(&mut rng);
+            assert!(t2 >= h2_min && t2 <= h2_max);
+            let t3 = obf.random_h3(&mut rng);
+            assert!(t3 >= h3_min && t3 <= h3_max);
+            let t4 = obf.random_h4(&mut rng);
+            assert!(t4 >= h4_min && t4 <= h4_max);
+        }
+    }
+
+    #[test]
+    fn obf_ranges_near_u32_max_overlap_rejected() {
+        let h1_min = u32::MAX - 10;
+        let h1_max = u32::MAX;
+        let h2_min = u32::MAX - 5;
+        let h2_max = u32::MAX - 1;
+        let h3_min = u32::MAX - 30;
+        let h3_max = u32::MAX - 21;
+        let h4_min = u32::MAX - 50;
+        let h4_max = u32::MAX - 41;
+        let res = ObfuscationRanges::new(
+            h1_min, h1_max,
+            h2_min, h2_max,
+            h3_min, h3_max,
+            h4_min, h4_max,
+        );
+        assert!(res.is_err());
     }
 }

@@ -37,6 +37,7 @@ use std::thread::JoinHandle;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
+use crate::noise::handshake::ObfuscationRanges;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
@@ -334,7 +335,9 @@ impl Device {
             keepalive,
             next_index,
             None,
-        );
+            0, 0, 0, 0, 0, 0, 0, 0,
+        )
+        .expect("default obfuscation ranges must not conflict");
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 
@@ -610,6 +613,8 @@ impl Device {
                     let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
+                        ObfuscationRanges::default(),
+                        &mut OsRng,
                         Some(addr.as_socket().unwrap().ip()),
                         packet,
                         &mut t.dst_buf,

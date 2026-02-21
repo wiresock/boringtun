@@ -73,16 +73,67 @@ int check_base64_encoded_x25519_key(const char *key);
 /// to be stored then `log_func` needs to create a copy, e.g. `strcpy`.
 bool set_logging_function(void (*log_func)(const char *));
 
-// Allocate a new tunnel
+/// Allocate a new tunnel, returning NULL on failure.
+///
+/// Keys must be valid base64-encoded 32-byte keys.
+/// `preshared_key` may be NULL if no PSK is used.
+///
+/// ## Amnezia obfuscation tag ranges (H1-H4)
+///
+/// Each WireGuard packet type has an associated 4-byte "message type" tag.
+/// The h1-h4 start/end pairs let you override these tags with inclusive
+/// ranges [start, end].  On outgoing packets a value is chosen uniformly
+/// at random from the range; on incoming packets any value within the range
+/// is accepted for that packet type.
+///
+/// **Sentinel rules for each (start, end) pair:**
+///
+/// | start | end   | Resolved range                              |
+/// |-------|-------|---------------------------------------------|
+/// | 0     | 0     | Default WireGuard constant (1, 2, 3, or 4)  |
+/// | S > 0 | 0     | Fixed value [S, S]  (back-compat shorthand) |
+/// | S     | E >= S| Custom inclusive range [S, E]                |
+/// | S     | E < S | **Invalid** - returns NULL                   |
+///
+/// **Non-overlap requirement:**
+///
+/// The four resolved ranges must not overlap (including at boundaries).
+/// For example H1=[10, 20] and H4=[20, 30] is rejected because value 20
+/// belongs to both.  On conflict the function returns NULL.
+///
+/// **Quick-start examples:**
+///
+///   // Standard WireGuard (no obfuscation):
+///   new_tunnel(priv, pub, NULL, 25, idx, 0,0, 0,0, 0,0, 0,0);
+///
+///   // Fixed Amnezia-style tags (single values):
+///   new_tunnel(priv, pub, NULL, 25, idx, 10,10, 20,20, 30,30, 40,40);
+///
+///   // Random tags from non-overlapping ranges:
+///   new_tunnel(priv, pub, NULL, 25, idx, 100,199, 200,299, 300,399, 400,499);
+///
 struct wireguard_tunnel *new_tunnel(const char *static_private,
                                     const char *server_static_public,
                                     const char *preshared_key,
-                                    uint16_t keep_alive,  // Keep alive interval in seconds
-                                    uint32_t index,       // The 24bit index prefix to be used for session indexes
-                                    uint32_t obf_init,    // The 32bit obfuscation init value
-                                    uint32_t obf_resp,    // The 32bit obfuscation response value
-                                    uint32_t obf_cookie,  // The 32bit obfuscation cookie value
-                                    uint32_t obf_data);   // The 32bit obfuscation data value
+                                    uint16_t keep_alive,       // Keep alive interval in seconds
+                                    uint32_t index,            // The 24bit index prefix for session indexes
+                                    uint32_t h1_init_start,    // H1 (handshake init) inclusive range start
+                                    uint32_t h1_init_end,      // H1 (handshake init) inclusive range end
+                                    uint32_t h2_resp_start,    // H2 (handshake resp) inclusive range start
+                                    uint32_t h2_resp_end,      // H2 (handshake resp) inclusive range end
+                                    uint32_t h3_cookie_start,  // H3 (cookie reply)   inclusive range start
+                                    uint32_t h3_cookie_end,    // H3 (cookie reply)   inclusive range end
+                                    uint32_t h4_data_start,    // H4 (transport data) inclusive range start
+                                    uint32_t h4_data_end);     // H4 (transport data) inclusive range end
+
+// Returns a pointer to the last error message from new_tunnel, or NULL if
+// no error is stored.  The pointer is valid until the next call to
+// new_tunnel on the same thread, or until freed with last_tunnel_error_free.
+const char *last_tunnel_error();
+
+// Frees the last error string stored by new_tunnel.  After this call
+// last_tunnel_error will return NULL until the next failure.
+void last_tunnel_error_free();
 
 // Deallocate the tunnel
 void tunnel_free(struct wireguard_tunnel *);
