@@ -34,7 +34,11 @@ thread_local! {
 
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
-        *e.borrow_mut() = CString::new(msg).ok();
+        *e.borrow_mut() = Some(
+            CString::new(msg).unwrap_or_else(|_| {
+                CString::new("Invalid error message (contains null byte)").unwrap()
+            }),
+        );
     });
 }
 

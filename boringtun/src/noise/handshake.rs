@@ -317,8 +317,18 @@ impl TagRange {
         if self.start == self.end {
             return self.start;
         }
-        let range_size = (self.end - self.start) as u64 + 1;
-        self.start + (rng.next_u64() % range_size) as u32
+        // Special-case the full u32 range to avoid a 2^32-sized modulus.
+        if self.start == 0 && self.end == u32::MAX {
+            return rng.next_u32();
+        }
+        let range_size = (u64::from(self.end) - u64::from(self.start)) + 1;
+        let threshold = u64::MAX - (u64::MAX % range_size);
+        loop {
+            let val = rng.next_u64();
+            if val < threshold {
+                return self.start + (val % range_size) as u32;
+            }
+        }
     }
 
     /// Returns `true` if `self` and `other` overlap (inclusive boundaries).
