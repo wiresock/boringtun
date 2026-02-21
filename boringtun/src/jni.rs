@@ -161,6 +161,7 @@ pub unsafe extern "C" fn create_new_tunnel(
         preshared_key,
         keep_alive as u16,
         index as u32,
+        0, 0, 0, 0, 0, 0, 0, 0,
     );
 
     if tunnel.is_null() {
