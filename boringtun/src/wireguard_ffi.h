@@ -126,6 +126,15 @@ struct wireguard_tunnel *new_tunnel(const char *static_private,
                                     uint32_t h4_data_start,    // H4 (transport data) inclusive range start
                                     uint32_t h4_data_end);     // H4 (transport data) inclusive range end
 
+// Returns a pointer to the last error message from new_tunnel, or NULL if
+// no error is stored.  The pointer is valid until the next call to
+// new_tunnel on the same thread, or until freed with last_tunnel_error_free.
+const char *last_tunnel_error();
+
+// Frees the last error string stored by new_tunnel.  After this call
+// last_tunnel_error will return NULL until the next failure.
+void last_tunnel_error_free();
+
 // Deallocate the tunnel
 void tunnel_free(struct wireguard_tunnel *);
 

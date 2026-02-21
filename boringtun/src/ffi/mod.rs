@@ -28,6 +28,39 @@ use std::sync::Once;
 
 static PANIC_HOOK: Once = Once::new();
 
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<Option<CString>> = std::cell::RefCell::new(None);
+}
+
+fn set_last_error(msg: &str) {
+    LAST_ERROR.with(|e| {
+        *e.borrow_mut() = CString::new(msg).ok();
+    });
+}
+
+/// Returns a pointer to the last error message from `new_tunnel`, or NULL if
+/// no error is stored.  The string is valid until the next call to
+/// `new_tunnel` on the same thread, or until freed with
+/// `last_tunnel_error_free`.
+#[no_mangle]
+pub extern "C" fn last_tunnel_error() -> *const c_char {
+    LAST_ERROR.with(|e| {
+        match *e.borrow() {
+            Some(ref s) => s.as_ptr(),
+            None => ptr::null(),
+        }
+    })
+}
+
+/// Frees the last error string stored by `new_tunnel`.  After this call,
+/// `last_tunnel_error` will return NULL until the next failure.
+#[no_mangle]
+pub extern "C" fn last_tunnel_error_free() {
+    LAST_ERROR.with(|e| {
+        *e.borrow_mut() = None;
+    });
+}
+
 #[allow(non_camel_case_types)]
 #[repr(C)]
 /// Indicates the operation required from the caller
@@ -317,7 +350,11 @@ pub unsafe extern "C" fn new_tunnel(
         h4_data_end,
     ) {
         Ok(t) => Box::new(Mutex::new(t)),
-        Err(_) => return ptr::null_mut(),
+        Err(e) => {
+            tracing::error!(message = "Failed to create tunnel", error = %e);
+            set_last_error(&e);
+            return ptr::null_mut();
+        }
     };
 
     PANIC_HOOK.call_once(|| {
