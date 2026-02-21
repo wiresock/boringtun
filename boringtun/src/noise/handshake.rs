@@ -294,26 +294,121 @@ enum HandshakeState {
     Expired,
 }
 
-/// Represents an obfuscation mechanism used to disguise network traffic.
-/// This structure contains obfuscation parameters used for initializing,
-/// responding, managing cookies, and processing data.
-///
-/// # Traits
-/// - `Copy`: Allows bitwise copying of the structure.
-/// - `Clone`: Provides explicit duplication.
-/// - `PartialEq` / `Eq`: Enables equality comparisons.
-///
-/// # Fields
-/// - `obf_init`: Initial obfuscation value used during handshake.
-/// - `obf_resp`: Response obfuscation value used in challenge-response mechanisms.
-/// - `obf_cookie`: Unique obfuscation value used to track session state.
-/// - `obf_data`: Obfuscation key used to encrypt/decrypt transmitted data.
+/// An inclusive range `[start..=end]` of obfuscation tag values for a packet type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Obfuscation {
-    pub(super) obf_init: u32,
-    pub(super) obf_resp: u32,
-    pub(super) obf_cookie: u32,
-    pub(super) obf_data: u32,
+pub struct TagRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl TagRange {
+    /// Returns `true` if `value` falls within `[start..=end]`.
+    pub fn contains(&self, value: u32) -> bool {
+        value >= self.start && value <= self.end
+    }
+
+    /// Returns a uniformly random value from `[start..=end]`.
+    /// If `start == end` the result is always that value.
+    pub fn random(&self) -> u32 {
+        if self.start == self.end {
+            return self.start;
+        }
+        use rand_core::{OsRng, RngCore};
+        let range_size = (self.end - self.start) as u64 + 1;
+        self.start + (OsRng.next_u64() % range_size) as u32
+    }
+
+    /// Returns `true` if `self` and `other` overlap (inclusive boundaries).
+    pub fn overlaps(&self, other: &TagRange) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
+/// Non-overlapping inclusive tag ranges for the four WireGuard packet types.
+///
+/// * H1 – handshake initiation
+/// * H2 – handshake response
+/// * H3 – cookie reply
+/// * H4 – data
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ObfuscationRanges {
+    pub h1_init: TagRange,
+    pub h2_resp: TagRange,
+    pub h3_cookie: TagRange,
+    pub h4_data: TagRange,
+}
+
+impl Default for ObfuscationRanges {
+    fn default() -> Self {
+        ObfuscationRanges {
+            h1_init: TagRange { start: HANDSHAKE_INIT, end: HANDSHAKE_INIT },
+            h2_resp: TagRange { start: HANDSHAKE_RESP, end: HANDSHAKE_RESP },
+            h3_cookie: TagRange { start: COOKIE_REPLY, end: COOKIE_REPLY },
+            h4_data: TagRange { start: DATA, end: DATA },
+        }
+    }
+}
+
+impl ObfuscationRanges {
+    /// Construct and validate obfuscation ranges from raw start/end pairs.
+    ///
+    /// `(0, 0)` → default WireGuard constant for that packet type.
+    /// `(start, 0)` where `start != 0` → `[start..=start]` (back-compat convenience).
+    /// Otherwise `start <= end` is required.
+    ///
+    /// All four ranges must be non-overlapping.
+    pub fn new(
+        h1_start: u32, h1_end: u32,
+        h2_start: u32, h2_end: u32,
+        h3_start: u32, h3_end: u32,
+        h4_start: u32, h4_end: u32,
+    ) -> Result<Self, String> {
+        let resolve = |start: u32, end: u32, default: u32| -> Result<TagRange, String> {
+            match (start, end) {
+                (0, 0) => Ok(TagRange { start: default, end: default }),
+                (s, 0) => Ok(TagRange { start: s, end: s }),
+                (s, e) if s <= e => Ok(TagRange { start: s, end: e }),
+                (s, e) => Err(format!("Invalid range: start ({s}) > end ({e})")),
+            }
+        };
+
+        let h1 = resolve(h1_start, h1_end, HANDSHAKE_INIT)?;
+        let h2 = resolve(h2_start, h2_end, HANDSHAKE_RESP)?;
+        let h3 = resolve(h3_start, h3_end, COOKIE_REPLY)?;
+        let h4 = resolve(h4_start, h4_end, DATA)?;
+
+        let ranges = [("H1", h1), ("H2", h2), ("H3", h3), ("H4", h4)];
+        for i in 0..ranges.len() {
+            for j in (i + 1)..ranges.len() {
+                let (name_a, a) = &ranges[i];
+                let (name_b, b) = &ranges[j];
+                if a.overlaps(b) {
+                    let overlap_start = a.start.max(b.start);
+                    let overlap_end = a.end.min(b.end);
+                    return Err(format!(
+                        "{name_a} [{}..{}] overlaps {name_b} [{}..{}] at {overlap_start}..{overlap_end}",
+                        a.start, a.end, b.start, b.end,
+                    ));
+                }
+            }
+        }
+
+        Ok(ObfuscationRanges {
+            h1_init: h1,
+            h2_resp: h2,
+            h3_cookie: h3,
+            h4_data: h4,
+        })
+    }
+
+    pub fn matches_h1(&self, v: u32) -> bool { self.h1_init.contains(v) }
+    pub fn matches_h2(&self, v: u32) -> bool { self.h2_resp.contains(v) }
+    pub fn matches_h3(&self, v: u32) -> bool { self.h3_cookie.contains(v) }
+    pub fn matches_h4(&self, v: u32) -> bool { self.h4_data.contains(v) }
+    pub fn random_h1(&self) -> u32 { self.h1_init.random() }
+    pub fn random_h2(&self) -> u32 { self.h2_resp.random() }
+    pub fn random_h3(&self) -> u32 { self.h3_cookie.random() }
+    pub fn random_h4(&self) -> u32 { self.h4_data.random() }
 }
 
 pub struct Handshake {
@@ -330,8 +425,8 @@ pub struct Handshake {
     // TODO: make TimeStamper a singleton
     stamper: TimeStamper,
     pub(super) last_rtt: Option<u32>,
-    // Packet type obfuscation parameters
-    pub(super) obf: Obfuscation,
+    // Packet type obfuscation ranges
+    pub(super) obf: ObfuscationRanges,
 }
 
 #[derive(Default)]
@@ -438,10 +533,7 @@ impl Handshake {
         peer_static_public: x25519::PublicKey,
         global_idx: u32,
         preshared_key: Option<[u8; 32]>,
-        obf_init: u32,
-        obf_resp: u32,
-        obf_cookie: u32,
-        obf_data: u32,
+        obf: ObfuscationRanges,
     ) -> Handshake {
         let params = NoiseParams::new(
             static_private,
@@ -449,13 +541,6 @@ impl Handshake {
             peer_static_public,
             preshared_key,
         );
-
-        let obf = Obfuscation {
-            obf_init: if obf_init == 0 { HANDSHAKE_INIT } else { obf_init },
-            obf_resp: if obf_resp == 0 { HANDSHAKE_RESP } else { obf_resp },
-            obf_cookie: if obf_cookie == 0 { COOKIE_REPLY } else { obf_cookie },
-            obf_data: if obf_data == 0 { DATA } else { obf_data },
-        };
 
         Handshake {
             params,
@@ -767,8 +852,7 @@ impl Handshake {
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
-        // message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
-        message_type.copy_from_slice(&self.obf.obf_init.to_le_bytes());
+        message_type.copy_from_slice(&self.obf.random_h1().to_le_bytes());
         // msg.sender_index = little_endian(initiator.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
@@ -855,8 +939,7 @@ impl Handshake {
         let local_index = self.inc_index();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
-        // message_type.copy_from_slice(&super::HANDSHAKE_RESP.to_le_bytes());
-        message_type.copy_from_slice(&self.obf.obf_resp.to_le_bytes());
+        message_type.copy_from_slice(&self.obf.random_h2().to_le_bytes());
         // msg.sender_index = little_endian(responder.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)

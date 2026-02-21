@@ -1,4 +1,4 @@
-use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24, Obfuscation};
+use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24, ObfuscationRanges};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
 use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
 
@@ -114,7 +114,7 @@ impl RateLimiter {
 
     pub(crate) fn format_cookie_reply<'a>(
         &self,
-        obf: Obfuscation,
+        obf: ObfuscationRanges,
         idx: u32,
         cookie: Cookie,
         mac1: &[u8],
@@ -131,7 +131,7 @@ impl RateLimiter {
 
         // msg.message_type = 3
         // msg.reserved_zero = { 0, 0, 0 }
-        message_type.copy_from_slice(&obf.obf_cookie.to_le_bytes());
+        message_type.copy_from_slice(&obf.random_h3().to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
         receiver_index.copy_from_slice(&idx.to_le_bytes());
         nonce.copy_from_slice(&self.nonce()[..]);
@@ -153,7 +153,7 @@ impl RateLimiter {
     /// Verify the MAC fields on the datagram, and apply rate limiting if needed
     pub fn verify_packet<'a, 'b>(
         &self,
-        obf: Obfuscation,
+        obf: ObfuscationRanges,
         src_addr: Option<IpAddr>,
         src: &'a [u8],
         dst: &'b mut [u8],

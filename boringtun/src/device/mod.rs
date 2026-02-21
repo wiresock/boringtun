@@ -334,7 +334,9 @@ impl Device {
             keepalive,
             next_index,
             None,
-        );
+            0, 0, 0, 0, 0, 0, 0, 0,
+        )
+        .expect("default obfuscation ranges must not conflict");
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 

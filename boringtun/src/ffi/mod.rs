@@ -247,10 +247,14 @@ pub unsafe extern "C" fn new_tunnel(
     preshared_key: *const c_char,
     keep_alive: u16,
     index: u32,
-    obf_init: u32,
-    obf_resp: u32,
-    obf_cookie: u32,
-    obf_data: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
 ) -> *mut Mutex<Tunn> {
     let c_str = CStr::from_ptr(static_private);
     let static_private = match c_str.to_str() {
@@ -296,18 +300,25 @@ pub unsafe extern "C" fn new_tunnel(
         Some(keep_alive)
     };
 
-    let tunnel = Box::new(Mutex::new(Tunn::new(
+    let tunnel = match Tunn::new(
         private_key,
         public_key,
         preshared_key,
         keep_alive,
         index,
         None,
-        obf_init,
-        obf_resp,
-        obf_cookie,
-        obf_data,
-    )));
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+    ) {
+        Ok(t) => Box::new(Mutex::new(t)),
+        Err(_) => return ptr::null_mut(),
+    };
 
     PANIC_HOOK.call_once(|| {
         // FFI won't properly unwind on panic, but it will if we cause a segmentation fault

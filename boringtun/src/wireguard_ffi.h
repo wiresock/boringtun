@@ -75,14 +75,18 @@ bool set_logging_function(void (*log_func)(const char *));
 
 // Allocate a new tunnel
 struct wireguard_tunnel *new_tunnel(const char *static_private,
-                                    const char *server_static_public,
-                                    const char *preshared_key,
-                                    uint16_t keep_alive,  // Keep alive interval in seconds
-                                    uint32_t index,       // The 24bit index prefix to be used for session indexes
-                                    uint32_t obf_init,    // The 32bit obfuscation init value
-                                    uint32_t obf_resp,    // The 32bit obfuscation response value
-                                    uint32_t obf_cookie,  // The 32bit obfuscation cookie value
-                                    uint32_t obf_data);   // The 32bit obfuscation data value
+const char *server_static_public,
+const char *preshared_key,
+uint16_t keep_alive,  // Keep alive interval in seconds
+uint32_t index,       // The 24bit index prefix to be used for session indexes
+uint32_t h1_init_start,   // H1 (handshake init) range start
+uint32_t h1_init_end,     // H1 (handshake init) range end
+uint32_t h2_resp_start,   // H2 (handshake response) range start
+uint32_t h2_resp_end,     // H2 (handshake response) range end
+uint32_t h3_cookie_start, // H3 (cookie reply) range start
+uint32_t h3_cookie_end,   // H3 (cookie reply) range end
+uint32_t h4_data_start,   // H4 (data) range start
+uint32_t h4_data_end);    // H4 (data) range end
 
 // Deallocate the tunnel
 void tunnel_free(struct wireguard_tunnel *);
