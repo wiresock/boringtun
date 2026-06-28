@@ -254,9 +254,132 @@ pub(crate) fn fingerprint_of_capture(blob: &[u8]) -> Fingerprint {
 
 mod tests {
     use super::*;
+    use crate::noise::quic::profiles::{BrowserProfile, Profile};
+    use crate::noise::quic::tls::generate_client_hello;
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
     const CHROME_147: &[u8] = include_bytes!("testdata/chrome_147_initial.bin");
     const FIREFOX_149: &[u8] = include_bytes!("testdata/firefox_149_initial.bin");
+
+    /// Transport-parameter ids with the RFC 9000 §18.1 GREASE pattern removed
+    /// (those carry a per-connection-random id and cannot be compared directly).
+    fn non_grease_tp(fp: &Fingerprint) -> Vec<u64> {
+        let mut v: Vec<u64> = fp
+            .transport_param_ids
+            .iter()
+            .copied()
+            .filter(|id| id % 31 != 27)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Assert that a freshly generated ClientHello reproduces the real browser
+    /// capture's fingerprint for every field that is not per-connection random.
+    fn assert_matches_capture(browser: BrowserProfile, capture: &[u8]) {
+        let cap = fingerprint_of_capture(capture);
+        let profile = Profile::for_browser(browser);
+        let scid = if browser == BrowserProfile::Firefox {
+            vec![0x11, 0x22, 0x33]
+        } else {
+            vec![]
+        };
+
+        // A few seeds, since extension/TP order and GREASE are randomized.
+        for seed in 0..8u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let ch = generate_client_hello(&profile, "example.com", &scid, &mut rng);
+            let gen = parse_clienthello(&ch);
+
+            assert_eq!(
+                gen.cipher_suites, cap.cipher_suites,
+                "cipher suites (seed {seed})"
+            );
+            assert_eq!(
+                gen.supported_groups, cap.supported_groups,
+                "supported_groups"
+            );
+            assert_eq!(
+                gen.key_share_groups, cap.key_share_groups,
+                "key_share groups"
+            );
+            assert_eq!(
+                gen.signature_algorithms, cap.signature_algorithms,
+                "signature_algorithms"
+            );
+            assert_eq!(
+                gen.supported_versions, cap.supported_versions,
+                "supported_versions"
+            );
+            assert_eq!(gen.alpn, cap.alpn, "alpn");
+            assert_eq!(
+                gen.legacy_session_id_len, cap.legacy_session_id_len,
+                "session id"
+            );
+            assert_eq!(gen.extension_set(), cap.extension_set(), "extension set");
+            assert_eq!(
+                non_grease_tp(&gen),
+                non_grease_tp(&cap),
+                "transport-param ids"
+            );
+            assert_eq!(gen.sni.as_deref(), Some("example.com"), "SNI");
+        }
+    }
+
+    #[test]
+    fn generated_chrome_clienthello_matches_capture_fingerprint() {
+        assert_matches_capture(BrowserProfile::Chrome, CHROME_147);
+    }
+
+    #[test]
+    fn generated_firefox_clienthello_matches_capture_fingerprint() {
+        assert_matches_capture(BrowserProfile::Firefox, FIREFOX_149);
+    }
+
+    /// curl has no capture ground truth, but its single-CRYPTO-frame ClientHello
+    /// fits one Initial — exercise the whole generate -> Initial -> decrypt ->
+    /// parse pipeline and confirm the declared curl fingerprint.
+    #[test]
+    fn generated_curl_clienthello_roundtrips_through_initial() {
+        use crate::noise::quic::initial::{build_client_initial, InitialParams};
+
+        let profile = Profile::for_browser(BrowserProfile::Curl);
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let ch = generate_client_hello(&profile, "example.com", &[], &mut rng);
+
+        let dcid = [0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89];
+        let packet = build_client_initial(&InitialParams {
+            dcid: &dcid,
+            scid: &[],
+            packet_number: 0,
+            pn_len: 1,
+            crypto_payload: &ch,
+            target_size: profile.packet_target,
+        });
+        assert_eq!(packet.len(), profile.packet_target);
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        blob.extend_from_slice(&packet);
+        let fp = fingerprint_of_capture(&blob);
+
+        assert_eq!(fp.cipher_suites, vec![0x1301, 0x1302, 0x1303]);
+        assert_eq!(fp.supported_groups, vec![0x001d, 0x0017, 0x0018]);
+        assert_eq!(fp.key_share_groups, vec![0x001d]);
+        assert_eq!(
+            fp.signature_algorithms,
+            vec![0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806]
+        );
+        assert_eq!(fp.supported_versions, vec![0x0304]);
+        assert_eq!(fp.alpn, vec!["h3".to_string()]);
+        assert_eq!(fp.sni.as_deref(), Some("example.com"));
+        assert_eq!(
+            fp.extension_set(),
+            vec![0x0000, 0x000a, 0x000d, 0x0010, 0x001b, 0x002b, 0x002d, 0x0033, 0x0039, 0xfe0d]
+        );
+    }
 
     /// Decrypt the real Chrome 147 Initial with our own Initial crypto and
     /// confirm the documented fingerprint (captures/README.md).
