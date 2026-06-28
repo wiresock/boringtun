@@ -269,6 +269,82 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
                                     uint16_t junk_packet_delay_ms,
                                     uint8_t imitation_protocol,
                                     const char *imitation_domain);
+
+// Browser fingerprint selector for QUIC protocol imitation. DEFAULT keeps the
+// lightweight QUIC-shaped junk; the others emit a full browser-fingerprinted
+// QUIC Initial (requires the library to be built with the `quic-imitation`
+// feature; otherwise the configuration is accepted and DEFAULT behavior is
+// used). Only meaningful when imitation_protocol is QUIC.
+enum wireguard_amnezia_browser_profile {
+    WIREGUARD_AMNEZIA_BROWSER_DEFAULT = 0,
+    WIREGUARD_AMNEZIA_BROWSER_CHROME = 1,
+    WIREGUARD_AMNEZIA_BROWSER_FIREFOX = 2,
+    WIREGUARD_AMNEZIA_BROWSER_CURL = 3,
+    WIREGUARD_AMNEZIA_BROWSER_RANDOM = 4,
+};
+
+/// Allocates a new tunnel with AmneziaWG S1-S4 junk prefix handling and a
+/// browser-fingerprinted QUIC Initial imitation.
+///
+/// `imitation_browser` uses enum wireguard_amnezia_browser_profile and is only
+/// meaningful when imitation_protocol is QUIC. With a non-DEFAULT browser, the
+/// pre-handshake phase emits the standalone browser QUIC Initial(s) (two for
+/// Chrome/Firefox, one for curl) carrying a ClientHello whose SNI is
+/// imitation_domain (a random host is generated when NULL/invalid).
+struct wireguard_tunnel *new_tunnel_with_amnezia_imitation_browser(
+                                    const char *static_private,
+                                    const char *server_static_public,
+                                    const char *preshared_key,
+                                    uint16_t keep_alive,
+                                    uint32_t index,
+                                    uint32_t h1_init_start,
+                                    uint32_t h1_init_end,
+                                    uint32_t h2_resp_start,
+                                    uint32_t h2_resp_end,
+                                    uint32_t h3_cookie_start,
+                                    uint32_t h3_cookie_end,
+                                    uint32_t h4_data_start,
+                                    uint32_t h4_data_end,
+                                    uint16_t s1_init_junk,
+                                    uint16_t s2_response_junk,
+                                    uint16_t s3_cookie_junk,
+                                    uint16_t s4_transport_junk,
+                                    uint8_t imitation_protocol,
+                                    const char *imitation_domain,
+                                    uint8_t imitation_browser);
+
+/// Allocates a new tunnel with AmneziaWG pre-handshake junk packets, S1-S4 junk
+/// prefix handling, and a browser-fingerprinted QUIC Initial imitation.
+///
+/// As new_tunnel_with_amnezia_imitation_browser plus the Jc/Jmin/Jmax/Jd
+/// pre-handshake junk knobs. When a QUIC browser is selected the standalone
+/// browser Initial(s) are emitted before the handshake regardless of Jc; output
+/// buffers must fit them (up to 1252 bytes).
+struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation_browser(
+                                    const char *static_private,
+                                    const char *server_static_public,
+                                    const char *preshared_key,
+                                    uint16_t keep_alive,
+                                    uint32_t index,
+                                    uint32_t h1_init_start,
+                                    uint32_t h1_init_end,
+                                    uint32_t h2_resp_start,
+                                    uint32_t h2_resp_end,
+                                    uint32_t h3_cookie_start,
+                                    uint32_t h3_cookie_end,
+                                    uint32_t h4_data_start,
+                                    uint32_t h4_data_end,
+                                    uint16_t s1_init_junk,
+                                    uint16_t s2_response_junk,
+                                    uint16_t s3_cookie_junk,
+                                    uint16_t s4_transport_junk,
+                                    uint16_t junk_packet_count,
+                                    uint16_t junk_packet_size_min,
+                                    uint16_t junk_packet_size_max,
+                                    uint16_t junk_packet_delay_ms,
+                                    uint8_t imitation_protocol,
+                                    const char *imitation_domain,
+                                    uint8_t imitation_browser);
 // Returns a pointer to the last error message from any tunnel constructor, or
 // NULL if no error is stored. The pointer is valid until the next constructor
 // call on the same thread, or until freed with last_tunnel_error_free.

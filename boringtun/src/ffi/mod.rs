@@ -7,7 +7,7 @@
 
 //! C bindings for the BoringTun library
 use super::noise::{Tunn, TunnResult};
-use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
+use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationBrowser, AmneziaImitationProtocol};
 use crate::x25519::{PublicKey, StaticSecret};
 use base64::{decode, encode};
 use hex::encode as encode_hex;
@@ -561,6 +561,16 @@ unsafe fn parse_amnezia_imitation(
     Some((imitation_protocol, imitation_domain))
 }
 
+fn parse_amnezia_browser(imitation_browser: u8) -> Option<AmneziaImitationBrowser> {
+    match AmneziaImitationBrowser::try_from(imitation_browser) {
+        Ok(browser) => Some(browser),
+        Err(_) => {
+            set_last_error("Invalid Amnezia imitation browser");
+            None
+        }
+    }
+}
+
 /// Allocate a new tunnel with Amnezia S1-S4 junk prefix handling and protocol-shaped junk.
 /// Keys must be valid base64 encoded 32-byte keys.
 #[no_mangle]
@@ -682,6 +692,154 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation(
     )
 }
 
+/// Allocate a new tunnel with Amnezia S1-S4 junk prefix handling and a
+/// browser-fingerprinted QUIC Initial imitation.
+///
+/// `imitation_browser` selects the QUIC ClientHello fingerprint (see
+/// `enum wireguard_amnezia_browser_profile`); it is only meaningful when
+/// `imitation_protocol` is QUIC. Browser imitation requires the library to be
+/// built with the `quic-imitation` feature; otherwise the configuration is
+/// accepted but the lightweight QUIC-shaped junk is emitted instead.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_imitation_browser(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+    imitation_browser: u8,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(imitation_browser) = parse_amnezia_browser(imitation_browser) else {
+        return ptr::null_mut();
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_protocol_imitation_browser(
+            imitation_protocol,
+            imitation_domain,
+            imitation_browser,
+        ),
+    )
+}
+
+/// Allocate a new tunnel with Amnezia pre-handshake junk, S1-S4 junk prefix
+/// handling, and a browser-fingerprinted QUIC Initial imitation.
+///
+/// As `new_tunnel_with_amnezia_imitation_browser`, plus the Jc/Jmin/Jmax/Jd
+/// pre-handshake junk knobs. When a QUIC browser is selected, the standalone
+/// browser Initial(s) are emitted before the handshake regardless of Jc.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation_browser(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    junk_packet_count: u16,
+    junk_packet_size_min: u16,
+    junk_packet_size_max: u16,
+    junk_packet_delay_ms: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+    imitation_browser: u8,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(imitation_browser) = parse_amnezia_browser(imitation_browser) else {
+        return ptr::null_mut();
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_pre_handshake_junk(
+            junk_packet_count,
+            junk_packet_size_min,
+            junk_packet_size_max,
+            junk_packet_delay_ms,
+        )
+        .with_protocol_imitation_browser(
+            imitation_protocol,
+            imitation_domain,
+            imitation_browser,
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +851,28 @@ mod tests {
             .to_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn browser_parser_accepts_known_values_and_rejects_others() {
+        last_tunnel_error_free();
+        assert_eq!(
+            parse_amnezia_browser(0),
+            Some(AmneziaImitationBrowser::Default)
+        );
+        assert_eq!(
+            parse_amnezia_browser(1),
+            Some(AmneziaImitationBrowser::Chrome)
+        );
+        assert_eq!(
+            parse_amnezia_browser(4),
+            Some(AmneziaImitationBrowser::Random)
+        );
+        assert!(last_tunnel_error().is_null());
+
+        assert_eq!(parse_amnezia_browser(99), None);
+        assert_eq!(last_error_string(), "Invalid Amnezia imitation browser");
+        last_tunnel_error_free();
     }
 
     #[test]
