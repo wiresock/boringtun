@@ -6,6 +6,7 @@ pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
 
+mod quic;
 mod session;
 mod timers;
 
