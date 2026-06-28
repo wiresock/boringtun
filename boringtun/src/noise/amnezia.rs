@@ -107,7 +107,10 @@ impl AmneziaPreHandshakeJunk {
             (packet_size_min, packet_size_max)
         } else if packet_size_min == 0 && packet_size_max == 0 {
             (DEFAULT_JUNK_PACKET_SIZE_MIN, DEFAULT_JUNK_PACKET_SIZE_MAX)
-        } else if packet_size_min <= packet_size_max && packet_size_max <= MAX_JUNK_PACKET_SIZE {
+        } else if packet_size_min > 0
+            && packet_size_min <= packet_size_max
+            && packet_size_max <= MAX_JUNK_PACKET_SIZE
+        {
             (packet_size_min, packet_size_max)
         } else {
             (DEFAULT_JUNK_PACKET_SIZE_MIN, DEFAULT_JUNK_PACKET_SIZE_MAX)
@@ -1076,6 +1079,20 @@ mod tests {
         let packet = cfg.fill_pre_handshake_junk(&mut buffer, &mut rng).unwrap();
 
         assert_eq!(packet.len(), 42);
+    }
+
+    #[test]
+    fn pre_handshake_junk_rejects_zero_min_packet_size() {
+        let cfg = AmneziaConfig::new(0, 0, 0, 0).with_pre_handshake_junk(1, 0, 10, 0);
+
+        assert_eq!(
+            cfg.pre_handshake_junk.packet_size_min,
+            DEFAULT_JUNK_PACKET_SIZE_MIN
+        );
+        assert_eq!(
+            cfg.pre_handshake_junk.packet_size_max,
+            DEFAULT_JUNK_PACKET_SIZE_MAX
+        );
     }
 
     #[test]

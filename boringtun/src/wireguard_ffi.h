@@ -166,15 +166,18 @@ struct wireguard_tunnel *new_tunnel_with_amnezia(
 ///
 /// Jc/Jmin/Jmax/Jd configure standalone junk packets emitted before each
 /// handshake initiation:
-///   Jc: number of junk packets
-///   Jmin/Jmax: random junk packet size bounds for random junk
+///   Jc: number of junk packets; values above 128 disable standalone junk
+///   Jmin/Jmax: random junk packet size bounds for random junk. When junk is
+///     enabled, both zero values or invalid ranges fall back to 50..1000 bytes;
+///     valid custom ranges require 1 <= Jmin <= Jmax <= 1280.
 ///   Jd: delay in milliseconds after each junk packet before the next packet
+///     or handshake initiation; values above 200 are treated as zero delay.
 ///
 /// BoringTun returns one UDP datagram per API call. After a call returns a junk
 /// packet, call wireguard_tick() periodically to emit the remaining junk packets
 /// and the delayed handshake initiation.
-/// Output buffers used with wireguard_force_handshake() and wireguard_tick()
-/// must also fit standalone junk packets (up to 1280 bytes).
+/// Output buffers used with wireguard_write(), wireguard_force_handshake(), and
+/// wireguard_tick() must also fit standalone junk packets (up to 1280 bytes).
 struct wireguard_tunnel *new_tunnel_with_amnezia_junk(
                                     const char *static_private,
                                     const char *server_static_public,
@@ -240,7 +243,8 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_imitation(
 /// When imitation is enabled, standalone pre-handshake junk packets use
 /// protocol-appropriate sizes instead of Jmin/Jmax. S1-S4 padding still uses the
 /// configured S sizes. The imitation_protocol and imitation_domain rules are the
-/// same as new_tunnel_with_amnezia_imitation.
+/// same as new_tunnel_with_amnezia_imitation. The Jc/Jd bounds and output buffer
+/// requirements are the same as new_tunnel_with_amnezia_junk.
 struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
                                     const char *static_private,
                                     const char *server_static_public,
