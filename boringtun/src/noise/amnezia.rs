@@ -53,7 +53,7 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
 
 /// Browser fingerprint for QUIC protocol imitation. `Default` keeps the
 /// lightweight QUIC-shaped junk; the others emit a full browser-fingerprinted
-/// QUIC Initial (requires the `quic-imitation` feature at runtime).
+/// QUIC Initial (needs the `quic-imitation` feature, which is on by default).
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum AmneziaImitationBrowser {
@@ -265,11 +265,10 @@ impl AmneziaConfig {
         self
     }
 
-    /// True when a full browser-fingerprinted QUIC Initial should be emitted for
-    /// pre-handshake junk (QUIC protocol + a non-`Default` browser, with the
     /// True when a full protocol-natural imitation sequence should be emitted
-    /// for the pre-handshake phase: DNS/SIP/STUN always, QUIC when a browser is
-    /// selected (and the `quic-imitation` feature is available).
+    /// for the pre-handshake phase: DNS/SIP/STUN always, QUIC only when a
+    /// non-`Default` browser is selected (and the `quic-imitation` feature is
+    /// available).
     pub(crate) fn has_imitation_sequence(&self) -> bool {
         match self.imitation.protocol {
             AmneziaImitationProtocol::Dns

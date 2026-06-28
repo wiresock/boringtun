@@ -55,8 +55,9 @@
 //!
 //! # Build
 //!
-//! Compiled into release builds only behind the `quic-imitation` Cargo feature
-//! (which also pulls in `aes`); always available under `cfg(test)`.
+//! Gated behind the `quic-imitation` Cargo feature (which also pulls in `aes`).
+//! That feature is **on by default**; opt out with `--no-default-features`.
+//! Always available under `cfg(test)`.
 
 // Items are reachable from the `amnezia` runtime path only with the
 // `quic-imitation` feature; under a plain `cargo test` some are exercised only
