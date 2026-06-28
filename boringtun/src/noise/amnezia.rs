@@ -51,7 +51,7 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AmneziaImitation {
-    pub protocol: AmneziaImitationProtocol,
+    pub(crate) protocol: AmneziaImitationProtocol,
     domain: Option<String>,
 }
 
@@ -74,20 +74,20 @@ impl AmneziaImitation {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AmneziaConfig {
-    pub init_packet_junk_size: u16,
-    pub response_packet_junk_size: u16,
-    pub cookie_packet_junk_size: u16,
-    pub transport_packet_junk_size: u16,
-    pub pre_handshake_junk: AmneziaPreHandshakeJunk,
-    pub imitation: AmneziaImitation,
+    pub(crate) init_packet_junk_size: u16,
+    pub(crate) response_packet_junk_size: u16,
+    pub(crate) cookie_packet_junk_size: u16,
+    pub(crate) transport_packet_junk_size: u16,
+    pub(crate) pre_handshake_junk: AmneziaPreHandshakeJunk,
+    pub(crate) imitation: AmneziaImitation,
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct AmneziaPreHandshakeJunk {
-    pub packet_count: u16,
-    pub packet_size_min: u16,
-    pub packet_size_max: u16,
-    pub packet_delay_ms: u16,
+    pub(crate) packet_count: u16,
+    pub(crate) packet_size_min: u16,
+    pub(crate) packet_size_max: u16,
+    pub(crate) packet_delay_ms: u16,
 }
 
 impl AmneziaPreHandshakeJunk {
