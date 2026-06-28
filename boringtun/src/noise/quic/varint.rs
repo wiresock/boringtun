@@ -4,6 +4,9 @@
 //! QUIC variable-length integer encoding (RFC 9000 §16).
 
 /// Number of bytes the variable-length encoding of `value` occupies.
+///
+/// # Panics
+/// Panics if `value >= 2^62` (unrepresentable), so this agrees with [`write`].
 pub(crate) fn size(value: u64) -> usize {
     if value < (1 << 6) {
         1
@@ -12,6 +15,7 @@ pub(crate) fn size(value: u64) -> usize {
     } else if value < (1 << 30) {
         4
     } else {
+        assert!(value < (1 << 62), "value exceeds QUIC varint range");
         8
     }
 }

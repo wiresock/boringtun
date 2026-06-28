@@ -205,12 +205,14 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk(
 // non-NONE protocol emits a standalone, protocol-natural datagram sequence
 // before the handshake initiation: DNS sends A/AAAA/HTTPS queries; SIP sends an
 // INVITE then a matching CANCEL; STUN sends two ICE Binding Requests (the second
-// with USE-CANDIDATE) carrying MESSAGE-INTEGRITY and FINGERPRINT. QUIC emits the
-// lightweight shaped junk unless a browser is selected (see
-// new_tunnel_with_amnezia_imitation_browser and wireguard_amnezia_browser_profile),
-// in which case it sends full browser-fingerprinted QUIC Initial(s). The caller
-// must drain these via wireguard_write()/wireguard_tick() (one datagram per
-// call) as for any pre-handshake junk.
+// with USE-CANDIDATE) carrying MESSAGE-INTEGRITY and FINGERPRINT. QUIC sends full
+// browser-fingerprinted QUIC Initial(s); the browser defaults to curl when none
+// is given (see new_tunnel_with_amnezia_imitation_browser and
+// wireguard_amnezia_browser_profile). (If the library is built with
+// --no-default-features, i.e. without the quic-imitation feature, QUIC instead
+// emits lightweight QUIC-shaped junk.) The caller must drain these via
+// wireguard_write()/wireguard_tick() (one datagram per call) as for any
+// pre-handshake junk.
 enum wireguard_amnezia_imitation_protocol {
     WIREGUARD_AMNEZIA_IMITATION_NONE = 0,
     WIREGUARD_AMNEZIA_IMITATION_DNS = 1,
