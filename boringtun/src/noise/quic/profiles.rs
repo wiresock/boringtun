@@ -3,13 +3,14 @@
 
 //! Browser TLS ClientHello fingerprint profiles, ported from wiresock's
 //! `netlib/src/quic/quic_sni_generator.h` and calibrated against the real
-//! Chrome 147 / Firefox 149 captures in `captures/README.md`.
+//! Chrome 147 / Firefox 149 captures (the fixtures under `testdata/`; see
+//! `testdata/README.md` for provenance).
 //!
 //! Constant fields (cipher suites, groups, signature algorithms, extension set,
 //! transport-parameter ids) match the captured browser exactly; per-connection
 //! fields (client random, key-share keys, GREASE, connection ids, extension and
-//! transport-parameter ordering) are randomized at build time, as real browsers
-//! do.
+//! transport-parameter ordering) are randomized per generated ClientHello via
+//! the caller-supplied RNG, as real browsers do.
 
 /// Selectable browser fingerprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

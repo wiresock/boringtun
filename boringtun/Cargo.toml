@@ -63,9 +63,9 @@ etherparse = "0.13"
 tracing-subscriber = "0.3"
 criterion = { version = "0.3.5", features = ["html_reports"] }
 # AES-128 block cipher for QUIC Initial header protection (RFC 9001 §5.4).
-# Only the test-only QUIC imitation work-in-progress uses it; a `quic-imitation`
-# feature will promote it to an optional runtime dependency when the
-# pre-handshake path consumes the generator (Phase C).
+# At runtime `aes` is the optional dependency above, enabled by the
+# `quic-imitation` feature. This dev-dependency makes it available for a plain
+# `cargo test` (which compiles the `cfg(test)` quic module without the feature).
 aes = "0.8"
 
 [lib]
