@@ -606,12 +606,16 @@ impl Tunn {
         }
 
         if pending.remaining == 0 {
-            let force_resend = self
-                .pending_amnezia_junk
-                .take()
-                .map(|pending| pending.force_resend)
-                .unwrap_or(false);
-            return self.format_handshake_initiation_now(dst, force_resend);
+            let force_resend = pending.force_resend;
+            // Keep `pending_amnezia_junk` until the initiation is actually emitted.
+            // If `format_handshake_initiation_now` fails (e.g. the S1 prefix pushes
+            // the packet over `dst` capacity), the caller can retry with a larger
+            // buffer and resend only the initiation instead of replaying all junk.
+            let result = self.format_handshake_initiation_now(dst, force_resend);
+            if !matches!(result, TunnResult::Err(_)) {
+                self.pending_amnezia_junk = None;
+            }
+            return result;
         }
 
         let packet = match self
@@ -941,6 +945,16 @@ mod tests {
         (my_tun, their_tun)
     }
 
+    fn create_two_tuns_and_handshake_with_amnezia(amnezia: AmneziaConfig) -> (Tunn, Tunn) {
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let init = create_handshake_init(&mut my_tun);
+        let resp = create_handshake_response(&mut their_tun, &init);
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        (my_tun, their_tun)
+    }
+
     fn create_ipv4_udp_packet() -> Vec<u8> {
         let header =
             etherparse::PacketBuilder::ipv4([192, 168, 1, 2], [192, 168, 1, 3], 5).udp(5678, 23);
@@ -1116,6 +1130,60 @@ mod tests {
     }
 
     #[test]
+    fn amnezia_full_handshake_and_data_for_each_imitation_protocol() {
+        use amnezia::AmneziaImitationProtocol as P;
+
+        for protocol in [P::None, P::Dns, P::Quic, P::Sip, P::Stun] {
+            let amnezia = AmneziaConfig::new(5, 7, 11, 13)
+                .with_protocol_imitation(protocol, Some("example.com".to_owned()));
+            let (mut my_tun, mut their_tun) = create_two_tuns_with_amnezia(amnezia);
+
+            // Full handshake: every packet type carries a protocol-shaped S-prefix
+            // and must still be stripped and parsed by the peer.
+            let init = create_handshake_init(&mut my_tun);
+            assert_eq!(init.len(), HANDSHAKE_INIT_SZ + 5, "protocol={protocol:?}");
+            let resp = create_handshake_response(&mut their_tun, &init);
+            assert_eq!(resp.len(), HANDSHAKE_RESP_SZ + 7, "protocol={protocol:?}");
+            let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+            assert_eq!(
+                keepalive.len(),
+                DATA_OVERHEAD_SZ + 13,
+                "protocol={protocol:?}"
+            );
+            parse_keepalive(&mut their_tun, &keepalive);
+
+            // Data packet round-trips through the real decapsulate path.
+            let sent_packet_buf = create_ipv4_udp_packet();
+            let mut my_dst = [0u8; 2048];
+            let mut their_dst = [0u8; 2048];
+            let data = unwrap_network_packet(my_tun.encapsulate(&sent_packet_buf, &mut my_dst));
+            let recv = their_tun.decapsulate(None, &data, &mut their_dst);
+            let recv_packet_buf = if let TunnResult::WriteToTunnelV4(recv, _addr) = recv {
+                recv
+            } else {
+                panic!("expected WriteToTunnelV4 for protocol={protocol:?}, got {recv:?}");
+            };
+            assert_eq!(sent_packet_buf, recv_packet_buf, "protocol={protocol:?}");
+        }
+    }
+
+    #[test]
+    fn amnezia_encapsulate_errors_when_dst_cannot_hold_s4_prefix() {
+        // Establish a session, then try to send into a buffer that comfortably
+        // fits the base transport packet but not the configured 600-byte S4
+        // prefix.
+        let (mut my_tun, _their_tun) =
+            create_two_tuns_and_handshake_with_amnezia(AmneziaConfig::new(0, 0, 0, 600));
+
+        let sent_packet_buf = create_ipv4_udp_packet();
+        let mut dst = vec![0u8; 256];
+        assert!(matches!(
+            my_tun.encapsulate(&sent_packet_buf, &mut dst),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+    }
+
+    #[test]
     fn amnezia_pre_handshake_junk_precedes_handshake_initiation() {
         let amnezia = AmneziaConfig::new(5, 0, 0, 0).with_pre_handshake_junk(2, 10, 20, 0);
         let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
@@ -1156,6 +1224,39 @@ mod tests {
             u32::from_le_bytes(init[..4].try_into().unwrap()),
             HANDSHAKE_INIT
         );
+    }
+
+    #[test]
+    fn amnezia_init_buffer_too_small_preserves_pending_without_junk_replay() {
+        // S1 = 64 so the handshake initiation needs HANDSHAKE_INIT_SZ + 64 bytes,
+        // while a single pre-handshake junk packet is only 10..=20 bytes.
+        let amnezia = AmneziaConfig::new(64, 0, 0, 0).with_pre_handshake_junk(1, 10, 20, 0);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut big = vec![0u8; 2048];
+
+        // First call drains the single junk packet.
+        let junk = unwrap_network_packet(my_tun.format_handshake_initiation(&mut big, true));
+        assert!((10..=20).contains(&junk.len()));
+
+        // Retry the (now due) initiation into a buffer that fits the base
+        // WireGuard packet but not the S1 prefix: prepend_outbound must reject it
+        // and the pending junk state must survive so we don't replay junk.
+        let mut small = vec![0u8; HANDSHAKE_INIT_SZ + 16];
+        assert!(matches!(
+            my_tun.update_timers(&mut small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+        assert!(my_tun.pending_amnezia_junk.is_some());
+
+        // Retrying with a large enough buffer emits the initiation directly,
+        // without re-emitting any junk packets.
+        let init = unwrap_network_packet(my_tun.update_timers(&mut big));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ + 64);
+        assert_eq!(
+            u32::from_le_bytes(init[64..68].try_into().unwrap()),
+            HANDSHAKE_INIT
+        );
+        assert!(my_tun.pending_amnezia_junk.is_none());
     }
 
     #[test]

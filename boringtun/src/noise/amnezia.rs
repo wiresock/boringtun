@@ -22,6 +22,8 @@ const SIP_JUNK_SIZE_MIN: usize = 200;
 const SIP_JUNK_SIZE_MAX: usize = 1200;
 const STUN_JUNK_SIZE_MIN: usize = 28;
 const STUN_JUNK_SIZE_MAX: usize = 100;
+/// RFC 5389 STUN magic cookie, present at bytes 4..8 of every STUN message.
+const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -148,6 +150,14 @@ enum PacketKind {
 }
 
 impl AmneziaConfig {
+    /// Create a config with the AmneziaWG S1-S4 junk prefix sizes.
+    ///
+    /// `s1`/`s2`/`s3`/`s4` are the number of junk bytes prepended to handshake
+    /// initiation, handshake response, cookie reply, and transport-data packets
+    /// respectively. They are used verbatim and are not clamped: callers must
+    /// size their output buffers to fit the base WireGuard packet plus the
+    /// configured prefix, otherwise `prepend_outbound` (and therefore
+    /// `Tunn::encapsulate`) returns [`WireGuardError::DestinationBufferTooSmall`].
     pub fn new(s1: u16, s2: u16, s3: u16, s4: u16) -> Self {
         Self {
             init_packet_junk_size: s1,
@@ -480,10 +490,7 @@ fn fill_stun(dst: &mut [u8], rng: &mut impl RngCore) {
         dst[3] = len as u8;
     }
     if size >= 8 {
-        dst[4] = 0x21;
-        dst[5] = 0x12;
-        dst[6] = 0xa4;
-        dst[7] = 0x42;
+        dst[4..8].copy_from_slice(&STUN_MAGIC_COOKIE);
     }
     if size > 8 {
         for byte in &mut dst[8..size.min(20)] {
@@ -833,6 +840,8 @@ fn write_dns_opt_padding(
         0x000cu16
     };
 
+    // EDNS(0) OPT pseudo-record: root NAME (0x00), TYPE=OPT (0x0029),
+    // CLASS=requestor UDP payload size (0x1000), TTL=0 (extended RCODE/flags).
     dst[*pos] = 0x00;
     dst[*pos + 1] = 0x00;
     dst[*pos + 2] = 0x29;
@@ -935,6 +944,77 @@ mod tests {
         cfg.prepend_outbound(obf, &mut buffer, packet_size, &mut rng)
             .unwrap()
             .to_vec()
+    }
+
+    fn expected_junk(cfg: &AmneziaConfig, tag: u32) -> usize {
+        let size = match tag {
+            HANDSHAKE_INIT => cfg.init_packet_junk_size,
+            HANDSHAKE_RESP => cfg.response_packet_junk_size,
+            COOKIE_REPLY => cfg.cookie_packet_junk_size,
+            DATA => cfg.transport_packet_junk_size,
+            _ => unreachable!(),
+        };
+        size as usize
+    }
+
+    /// For every packet kind, S-size combination, and imitation protocol, a
+    /// packet that is prefixed by `prepend_outbound` must be recovered exactly
+    /// by `strip_inbound`. This is the core invariant the wire protocol relies
+    /// on, and it exercises every protocol-shaped filler against the stripper.
+    #[test]
+    fn prepend_then_strip_roundtrips_across_configs_and_protocols() {
+        use AmneziaImitationProtocol::*;
+
+        let obf = ObfuscationRanges::default();
+        let kinds: [(u32, usize); 4] = [
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ),
+            (DATA, DATA_OVERHEAD_SZ + 48),
+        ];
+        let bases = [
+            AmneziaConfig::new(7, 11, 13, 17),
+            AmneziaConfig::new(1, 1, 1, 1),
+            AmneziaConfig::new(64, 0, 0, 200),
+        ];
+
+        for base in bases {
+            for protocol in [None, Dns, Quic, Sip, Stun] {
+                let cfg = base
+                    .clone()
+                    .with_protocol_imitation(protocol, Some("example.com".to_owned()));
+                let mut rng = ChaCha8Rng::seed_from_u64(0xA53);
+
+                for &(tag, base_size) in &kinds {
+                    let mut original = vec![0u8; base_size];
+                    write_tag(&mut original, tag);
+                    for (i, byte) in original[4..].iter_mut().enumerate() {
+                        *byte = (i as u8) ^ 0x5a;
+                    }
+
+                    let mut buffer = vec![0u8; base_size + 1280];
+                    buffer[..base_size].copy_from_slice(&original);
+                    let padded = cfg
+                        .prepend_outbound(obf, &mut buffer, base_size, &mut rng)
+                        .unwrap()
+                        .to_vec();
+
+                    let junk = expected_junk(&cfg, tag);
+                    assert_eq!(
+                        padded.len(),
+                        base_size + junk,
+                        "unexpected padded size: protocol={protocol:?} tag={tag} junk={junk}"
+                    );
+
+                    let stripped = cfg.strip_inbound(obf, &padded);
+                    assert_eq!(
+                        stripped,
+                        original.as_slice(),
+                        "roundtrip mismatch: protocol={protocol:?} tag={tag} junk={junk}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
