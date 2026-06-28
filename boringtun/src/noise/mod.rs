@@ -6,10 +6,10 @@ pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
 
-// QUIC Initial imitation generator. Built and validated bottom-up; kept
-// test-only until the pre-handshake path consumes it (Phase C), at which point
-// it moves behind a `quic-imitation` feature so release builds opt in.
-#[cfg(test)]
+// QUIC Initial imitation generator. Compiled into release builds only behind the
+// `quic-imitation` feature (which also pulls in `aes`); always available under
+// test so its known-answer and capture-parity tests run with a plain `cargo test`.
+#[cfg(any(test, feature = "quic-imitation"))]
 mod quic;
 mod session;
 mod timers;
@@ -90,6 +90,9 @@ pub struct Tunn {
 }
 
 struct PendingAmneziaJunk {
+    /// Pre-generated standalone datagrams (browser QUIC Initials), emitted one
+    /// per call before the random/protocol junk and the handshake initiation.
+    quic_initials: VecDeque<Vec<u8>>,
     remaining: u16,
     last_packet_at: Option<Instant>,
 }
@@ -553,9 +556,21 @@ impl Tunn {
             self.timers.clear();
         }
 
-        if self.amnezia.pre_handshake_junk.is_enabled() {
+        if self.amnezia.pre_handshake_junk.is_enabled() || self.amnezia.has_quic_browser_imitation()
+        {
+            let quic_initials = self
+                .amnezia
+                .pre_handshake_quic_initials(&mut self.handshake.rng);
+            // A configured browser QUIC sequence replaces the random/protocol
+            // junk; otherwise emit the configured Jc count.
+            let remaining = if quic_initials.is_empty() {
+                self.amnezia.pre_handshake_junk.packet_count
+            } else {
+                0
+            };
             self.pending_amnezia_junk = Some(PendingAmneziaJunk {
-                remaining: self.amnezia.pre_handshake_junk.packet_count,
+                quic_initials,
+                remaining,
                 last_packet_at: None,
             });
             return self.advance_amnezia_junk(dst);
@@ -600,12 +615,38 @@ impl Tunn {
             .last_packet_at
             .map(|last| last.elapsed() >= delay)
             .unwrap_or(true);
+        let has_queued_datagram = !pending.quic_initials.is_empty();
+        let remaining = pending.remaining;
+        // `pending` (immutable borrow) ends here; the rest reborrows as needed.
 
         if !delay_elapsed {
             return TunnResult::Done;
         }
 
-        if pending.remaining == 0 {
+        // Emit any pre-generated standalone datagrams (browser QUIC Initials)
+        // first, one per call.
+        if has_queued_datagram {
+            let pending = self
+                .pending_amnezia_junk
+                .as_mut()
+                .expect("pending checked above");
+            // Check capacity before dequeuing so a too-small buffer can be
+            // retried without losing the datagram.
+            let size = pending
+                .quic_initials
+                .front()
+                .expect("queue checked non-empty above")
+                .len();
+            if dst.len() < size {
+                return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+            }
+            let datagram = pending.quic_initials.pop_front().unwrap();
+            pending.last_packet_at = Some(Instant::now());
+            dst[..size].copy_from_slice(&datagram);
+            return TunnResult::WriteToNetwork(&mut dst[..size]);
+        }
+
+        if remaining == 0 {
             // The initiation was deliberately deferred behind the junk packets, so
             // it must be emitted now: force the (re)format. A previous attempt may
             // have already moved the handshake into `InitSent` before
@@ -1263,6 +1304,38 @@ mod tests {
             HANDSHAKE_INIT
         );
         assert!(my_tun.pending_amnezia_junk.is_none());
+    }
+
+    #[test]
+    fn amnezia_quic_browser_imitation_emits_chrome_initials_before_handshake() {
+        let amnezia = AmneziaConfig::new(0, 0, 0, 0).with_protocol_imitation_browser(
+            amnezia::AmneziaImitationProtocol::Quic,
+            None,
+            amnezia::AmneziaImitationBrowser::Chrome,
+        );
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = vec![0u8; 2048];
+
+        // Chrome opens with two QUIC Initials carrying the split ClientHello.
+        let p1 = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        assert_eq!(p1.len(), 1250);
+        let p2 = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert_eq!(p2.len(), 1250);
+
+        // Then the real handshake initiation follows.
+        let init = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ);
+        assert_eq!(
+            u32::from_le_bytes(init[..4].try_into().unwrap()),
+            HANDSHAKE_INIT
+        );
+
+        // The two emitted datagrams reassemble to a real Chrome ClientHello.
+        let fp = quic::fingerprint::fingerprint_of_packets(&[p1, p2]);
+        assert_eq!(fp.cipher_suites, vec![0x1301, 0x1302, 0x1303]);
+        assert_eq!(fp.supported_groups, vec![0x11ec, 0x001d, 0x0017, 0x0018]);
+        assert_eq!(fp.alpn, vec!["h3".to_string()]);
+        assert!(fp.sni.is_some(), "imitation carries a generated SNI");
     }
 
     #[test]

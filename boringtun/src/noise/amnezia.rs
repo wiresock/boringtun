@@ -51,22 +51,86 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
     }
 }
 
+/// Browser fingerprint for QUIC protocol imitation. `Default` keeps the
+/// lightweight QUIC-shaped junk; the others emit a full browser-fingerprinted
+/// QUIC Initial (requires the `quic-imitation` feature at runtime).
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub enum AmneziaImitationBrowser {
+    #[default]
+    Default = 0,
+    Chrome = 1,
+    Firefox = 2,
+    Curl = 3,
+    Random = 4,
+}
+
+impl TryFrom<u8> for AmneziaImitationBrowser {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Default),
+            1 => Ok(Self::Chrome),
+            2 => Ok(Self::Firefox),
+            3 => Ok(Self::Curl),
+            4 => Ok(Self::Random),
+            _ => Err(()),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "quic-imitation"))]
+impl AmneziaImitationBrowser {
+    /// Map to a QUIC generator profile, or `None` for `Default` (no full
+    /// browser imitation).
+    fn to_quic(self) -> Option<crate::noise::quic::profiles::BrowserProfile> {
+        use crate::noise::quic::profiles::BrowserProfile;
+        match self {
+            AmneziaImitationBrowser::Default => None,
+            AmneziaImitationBrowser::Chrome => Some(BrowserProfile::Chrome),
+            AmneziaImitationBrowser::Firefox => Some(BrowserProfile::Firefox),
+            AmneziaImitationBrowser::Curl => Some(BrowserProfile::Curl),
+            AmneziaImitationBrowser::Random => Some(BrowserProfile::Random),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AmneziaImitation {
     pub(crate) protocol: AmneziaImitationProtocol,
     domain: Option<String>,
+    pub(crate) browser: AmneziaImitationBrowser,
 }
 
 impl AmneziaImitation {
-    pub fn new(protocol: AmneziaImitationProtocol, domain: Option<String>) -> Self {
+    pub fn new(
+        protocol: AmneziaImitationProtocol,
+        domain: Option<String>,
+        browser: AmneziaImitationBrowser,
+    ) -> Self {
+        // DNS and SIP use the domain for protocol payloads; QUIC uses it as the
+        // ClientHello SNI under browser imitation. Invalid hosts are dropped.
         let domain = match protocol {
-            AmneziaImitationProtocol::Dns | AmneziaImitationProtocol::Sip => {
+            AmneziaImitationProtocol::Dns
+            | AmneziaImitationProtocol::Sip
+            | AmneziaImitationProtocol::Quic => {
                 domain.filter(|domain| is_valid_imitation_host(domain))
             }
             _ => None,
         };
+        // Browser only applies to QUIC.
+        let browser = if protocol == AmneziaImitationProtocol::Quic {
+            browser
+        } else {
+            AmneziaImitationBrowser::Default
+        };
 
-        Self { protocol, domain }
+        Self {
+            protocol,
+            domain,
+            browser,
+        }
     }
 
     fn domain(&self) -> Option<&str> {
@@ -186,8 +250,64 @@ impl AmneziaConfig {
         protocol: AmneziaImitationProtocol,
         domain: Option<String>,
     ) -> Self {
-        self.imitation = AmneziaImitation::new(protocol, domain);
+        self.imitation = AmneziaImitation::new(protocol, domain, AmneziaImitationBrowser::Default);
         self
+    }
+
+    /// As [`with_protocol_imitation`], plus a browser fingerprint for QUIC.
+    pub fn with_protocol_imitation_browser(
+        mut self,
+        protocol: AmneziaImitationProtocol,
+        domain: Option<String>,
+        browser: AmneziaImitationBrowser,
+    ) -> Self {
+        self.imitation = AmneziaImitation::new(protocol, domain, browser);
+        self
+    }
+
+    /// True when a full browser-fingerprinted QUIC Initial should be emitted for
+    /// pre-handshake junk (QUIC protocol + a non-`Default` browser, with the
+    /// `quic-imitation` feature available).
+    pub(crate) fn has_quic_browser_imitation(&self) -> bool {
+        #[cfg(any(test, feature = "quic-imitation"))]
+        {
+            self.imitation.protocol == AmneziaImitationProtocol::Quic
+                && self.imitation.browser.to_quic().is_some()
+        }
+        #[cfg(not(any(test, feature = "quic-imitation")))]
+        {
+            false
+        }
+    }
+
+    /// Generate the standalone browser QUIC Initial datagram(s) for the
+    /// pre-handshake phase, or an empty queue when browser imitation is not
+    /// configured/compiled.
+    pub(crate) fn pre_handshake_quic_initials(
+        &self,
+        rng: &mut impl RngCore,
+    ) -> std::collections::VecDeque<Vec<u8>> {
+        #[cfg(any(test, feature = "quic-imitation"))]
+        {
+            if self.imitation.protocol == AmneziaImitationProtocol::Quic {
+                if let Some(browser) = self.imitation.browser.to_quic() {
+                    let owned_sni;
+                    let sni = match self.imitation.domain() {
+                        Some(domain) => domain,
+                        None => {
+                            owned_sni = random_imitation_domain(rng);
+                            &owned_sni
+                        }
+                    };
+                    return crate::noise::quic::generator::generate_client_initials(
+                        browser, sni, rng,
+                    )
+                    .into();
+                }
+            }
+        }
+        let _ = rng;
+        std::collections::VecDeque::new()
     }
 
     fn inbound_junk_size(&self, kind: PacketKind) -> usize {
@@ -385,6 +505,21 @@ impl AmneziaConfig {
             ),
         }
     }
+}
+
+/// Generate a plausible random SNI host name when no domain is configured for
+/// QUIC browser imitation.
+#[cfg(any(test, feature = "quic-imitation"))]
+fn random_imitation_domain(rng: &mut impl RngCore) -> String {
+    const TLDS: [&str; 4] = ["com", "net", "org", "io"];
+    let label_len = 7 + (rng.next_u32() % 10) as usize; // 7..=16 chars
+    let mut host = String::with_capacity(label_len + 4);
+    for _ in 0..label_len {
+        host.push((b'a' + (rng.next_u32() % 26) as u8) as char);
+    }
+    host.push('.');
+    host.push_str(TLDS[(rng.next_u32() as usize) % TLDS.len()]);
+    host
 }
 
 fn random_usize_inclusive(min: usize, max: usize, rng: &mut impl RngCore) -> usize {

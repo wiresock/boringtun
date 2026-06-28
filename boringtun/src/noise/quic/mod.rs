@@ -25,4 +25,4 @@ pub(crate) mod tls;
 pub(crate) mod varint;
 
 #[cfg(test)]
-mod fingerprint;
+pub(crate) mod fingerprint;
