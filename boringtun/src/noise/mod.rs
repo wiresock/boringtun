@@ -1134,6 +1134,25 @@ mod tests {
     }
 
     #[test]
+    fn amnezia_pending_junk_completes_after_expired_handshake_state() {
+        let amnezia = AmneziaConfig::new(0, 0, 0, 0).with_pre_handshake_junk(1, 10, 20, 0);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = vec![0u8; 2048];
+
+        my_tun.handshake.set_expired();
+
+        let junk = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        assert!((10..=20).contains(&junk.len()));
+
+        let init = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ);
+        assert_eq!(
+            u32::from_le_bytes(init[..4].try_into().unwrap()),
+            HANDSHAKE_INIT
+        );
+    }
+
+    #[test]
     fn amnezia_pre_handshake_junk_uses_protocol_imitation() {
         let amnezia = AmneziaConfig::new(0, 0, 0, 0)
             .with_pre_handshake_junk(1, 10, 20, 0)

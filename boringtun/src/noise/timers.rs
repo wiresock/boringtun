@@ -184,12 +184,12 @@ impl Tunn {
 
         self.update_session_timers(now);
 
-        if self.handshake.is_expired() {
-            return TunnResult::Err(WireGuardError::ConnectionExpired);
-        }
-
         if self.pending_amnezia_junk.is_some() {
             return self.advance_amnezia_junk(dst);
+        }
+
+        if self.handshake.is_expired() {
+            return TunnResult::Err(WireGuardError::ConnectionExpired);
         }
 
         // Load timers only once:

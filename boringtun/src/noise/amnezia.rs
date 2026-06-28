@@ -107,7 +107,7 @@ impl AmneziaPreHandshakeJunk {
             (packet_size_min, packet_size_max)
         } else if packet_size_min == 0 && packet_size_max == 0 {
             (DEFAULT_JUNK_PACKET_SIZE_MIN, DEFAULT_JUNK_PACKET_SIZE_MAX)
-        } else if packet_size_min < packet_size_max && packet_size_max <= MAX_JUNK_PACKET_SIZE {
+        } else if packet_size_min <= packet_size_max && packet_size_max <= MAX_JUNK_PACKET_SIZE {
             (packet_size_min, packet_size_max)
         } else {
             (DEFAULT_JUNK_PACKET_SIZE_MIN, DEFAULT_JUNK_PACKET_SIZE_MAX)
@@ -470,8 +470,10 @@ fn fill_stun(dst: &mut [u8], rng: &mut impl RngCore) {
         dst[6] = 0xa4;
         dst[7] = 0x42;
     }
-    for byte in &mut dst[8..size.min(20)] {
-        *byte = random_byte(rng);
+    if size > 8 {
+        for byte in &mut dst[8..size.min(20)] {
+            *byte = random_byte(rng);
+        }
     }
     if attr_len >= 4 {
         let value_len = value_len as u16;
@@ -483,8 +485,10 @@ fn fill_stun(dst: &mut [u8], rng: &mut impl RngCore) {
             *byte = 0x20 + (random_byte(rng) % 0x5f);
         }
     }
-    for byte in &mut dst[20 + attr_len..] {
-        *byte = random_byte(rng);
+    if size >= 20 + attr_len {
+        for byte in &mut dst[20 + attr_len..] {
+            *byte = random_byte(rng);
+        }
     }
 }
 
@@ -666,8 +670,10 @@ fn fill_dns_minimal_root_query(dst: &mut [u8], rng: &mut impl RngCore) {
         dst[5] = 0x01;
     }
     let header_tail_end = dst.len().min(12);
-    for byte in &mut dst[6..header_tail_end] {
-        *byte = 0x00;
+    if header_tail_end > 6 {
+        for byte in &mut dst[6..header_tail_end] {
+            *byte = 0x00;
+        }
     }
     if dst.len() > 12 {
         dst[12] = 0x00;
@@ -684,8 +690,10 @@ fn fill_dns_minimal_root_query(dst: &mut [u8], rng: &mut impl RngCore) {
     if dst.len() > 16 {
         dst[16] = 0x01;
     }
-    for byte in &mut dst[17..] {
-        *byte = 0x00;
+    if dst.len() > 17 {
+        for byte in &mut dst[17..] {
+            *byte = 0x00;
+        }
     }
 }
 
@@ -1055,5 +1063,29 @@ mod tests {
         assert_eq!(&prefix[..2], &[0x00, 0x01]);
         assert_eq!(&prefix[4..8], &[0x21, 0x12, 0xa4, 0x42]);
         assert_eq!(u16::from_be_bytes([prefix[2], prefix[3]]) % 4, 0);
+    }
+
+    #[test]
+    fn pre_handshake_junk_allows_fixed_packet_size() {
+        let cfg = AmneziaConfig::new(0, 0, 0, 0).with_pre_handshake_junk(1, 42, 42, 0);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let mut buffer = vec![0u8; 128];
+
+        let packet = cfg.fill_pre_handshake_junk(&mut buffer, &mut rng).unwrap();
+
+        assert_eq!(packet.len(), 42);
+    }
+
+    #[test]
+    fn protocol_imitation_fillers_tolerate_tiny_buffers() {
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+
+        for size in 0..32 {
+            let mut stun = vec![0u8; size];
+            fill_stun(&mut stun, &mut rng);
+
+            let mut dns = vec![0u8; size];
+            fill_dns_minimal_root_query(&mut dns, &mut rng);
+        }
     }
 }

@@ -136,6 +136,12 @@ struct wireguard_tunnel *new_tunnel(const char *static_private,
 ///   S4: transport-data junk
 ///
 /// Passing zero for all S-values gives the same packet sizes as new_tunnel().
+///
+/// Callers must size output buffers for the configured prefixes. For example,
+/// handshake initiation may require 148 + S1 bytes, handshake response 92 + S2
+/// bytes, cookie reply 64 + S3 bytes, and transport packets their encrypted
+/// WireGuard size + S4 bytes. If the destination buffer is too small, the
+/// operation returns WIREGUARD_ERROR.
 struct wireguard_tunnel *new_tunnel_with_amnezia(
                                     const char *static_private,
                                     const char *server_static_public,
@@ -167,6 +173,8 @@ struct wireguard_tunnel *new_tunnel_with_amnezia(
 /// BoringTun returns one UDP datagram per API call. After a call returns a junk
 /// packet, call wireguard_tick() periodically to emit the remaining junk packets
 /// and the delayed handshake initiation.
+/// Output buffers used with wireguard_force_handshake() and wireguard_tick()
+/// must also fit standalone junk packets (up to 1280 bytes).
 struct wireguard_tunnel *new_tunnel_with_amnezia_junk(
                                     const char *static_private,
                                     const char *server_static_public,
