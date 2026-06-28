@@ -42,6 +42,12 @@ fn set_last_error(msg: &str) {
     });
 }
 
+fn clear_last_error() {
+    LAST_ERROR.with(|e| {
+        *e.borrow_mut() = None;
+    });
+}
+
 /// Returns a pointer to the last error message from any tunnel constructor, or
 /// NULL if no error is stored.  The string is valid until the next constructor
 /// call on the same thread, or until freed with `last_tunnel_error_free`.
@@ -57,9 +63,7 @@ pub extern "C" fn last_tunnel_error() -> *const c_char {
 /// `last_tunnel_error` will return NULL until the next failure.
 #[no_mangle]
 pub extern "C" fn last_tunnel_error_free() {
-    LAST_ERROR.with(|e| {
-        *e.borrow_mut() = None;
-    });
+    clear_last_error();
 }
 
 #[allow(non_camel_case_types)]
@@ -290,6 +294,7 @@ pub unsafe extern "C" fn new_tunnel(
     h4_data_start: u32,
     h4_data_end: u32,
 ) -> *mut Mutex<Tunn> {
+    clear_last_error();
     new_tunnel_with_amnezia(
         static_private,
         server_static_public,
@@ -329,13 +334,19 @@ unsafe fn new_tunnel_with_amnezia_config(
 ) -> *mut Mutex<Tunn> {
     let c_str = CStr::from_ptr(static_private);
     let static_private = match c_str.to_str() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid static private key: not UTF-8");
+            return ptr::null_mut();
+        }
         Ok(string) => string,
     };
 
     let c_str = CStr::from_ptr(server_static_public);
     let server_static_public = match c_str.to_str() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid server static public key: not UTF-8");
+            return ptr::null_mut();
+        }
         Ok(string) => string,
     };
 
@@ -348,20 +359,28 @@ unsafe fn new_tunnel_with_amnezia_config(
             if let Ok(key) = string.parse::<KeyBytes>() {
                 Some(key.0)
             } else {
+                set_last_error("Invalid preshared key");
                 return null_mut();
             }
         } else {
+            set_last_error("Invalid preshared key: not UTF-8");
             return null_mut();
         }
     };
 
     let private_key = match static_private.parse::<KeyBytes>() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid static private key");
+            return ptr::null_mut();
+        }
         Ok(key) => StaticSecret::from(key.0),
     };
 
     let public_key = match server_static_public.parse::<KeyBytes>() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid server static public key");
+            return ptr::null_mut();
+        }
         Ok(key) => PublicKey::from(key.0),
     };
 
@@ -428,6 +447,7 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia(
     s3_cookie_junk: u16,
     s4_transport_junk: u16,
 ) -> *mut Mutex<Tunn> {
+    clear_last_error();
     new_tunnel_with_amnezia_config(
         static_private,
         server_static_public,
@@ -477,6 +497,7 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk(
     junk_packet_size_max: u16,
     junk_packet_delay_ms: u16,
 ) -> *mut Mutex<Tunn> {
+    clear_last_error();
     new_tunnel_with_amnezia_config(
         static_private,
         server_static_public,
@@ -558,6 +579,7 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_imitation(
     imitation_protocol: u8,
     imitation_domain: *const c_char,
 ) -> *mut Mutex<Tunn> {
+    clear_last_error();
     let Some((imitation_protocol, imitation_domain)) =
         parse_amnezia_imitation(imitation_protocol, imitation_domain)
     else {
@@ -617,6 +639,7 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation(
     imitation_protocol: u8,
     imitation_domain: *const c_char,
 ) -> *mut Mutex<Tunn> {
+    clear_last_error();
     let Some((imitation_protocol, imitation_domain)) =
         parse_amnezia_imitation(imitation_protocol, imitation_domain)
     else {
@@ -652,6 +675,79 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation(
         .with_protocol_imitation(imitation_protocol, imitation_domain),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn last_error_string() -> String {
+        let error = last_tunnel_error();
+        assert!(!error.is_null());
+        unsafe { CStr::from_ptr(error) }
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn constructor_sets_last_error_for_invalid_utf8_key() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let invalid_private = [0xffu8, 0];
+            let unused_public = CString::new("unused").unwrap();
+            let tunnel = new_tunnel(
+                invalid_private.as_ptr() as *const c_char,
+                unused_public.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Invalid static private key: not UTF-8");
+            last_tunnel_error_free();
+        }
+    }
+
+    #[test]
+    fn constructor_sets_last_error_for_invalid_key_text() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let invalid_private = CString::new("not-a-key").unwrap();
+            let unused_public = CString::new("unused").unwrap();
+            let tunnel = new_tunnel(
+                invalid_private.as_ptr(),
+                unused_public.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Invalid static private key");
+            last_tunnel_error_free();
+        }
+    }
+}
+
 /// Drops the Tunn object
 #[no_mangle]
 pub unsafe extern "C" fn tunnel_free(tunnel: *mut Mutex<Tunn>) {

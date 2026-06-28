@@ -854,8 +854,10 @@ fn write_dns_opt_padding(
 fn is_valid_imitation_host(host: &str) -> bool {
     if host.is_empty()
         || host.len() > 253
-        || host.starts_with(['.', '-'])
-        || host.ends_with(['.', '-'])
+        || host.starts_with('.')
+        || host.starts_with('-')
+        || host.ends_with('.')
+        || host.ends_with('-')
     {
         return false;
     }
