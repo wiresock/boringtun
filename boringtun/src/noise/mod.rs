@@ -87,7 +87,6 @@ pub struct Tunn {
 struct PendingAmneziaJunk {
     remaining: u16,
     last_packet_at: Option<Instant>,
-    force_resend: bool,
 }
 
 type MessageType = u32;
@@ -538,9 +537,6 @@ impl Tunn {
         force_resend: bool,
     ) -> TunnResult<'a> {
         if self.pending_amnezia_junk.is_some() {
-            if let Some(pending) = &mut self.pending_amnezia_junk {
-                pending.force_resend |= force_resend;
-            }
             return self.advance_amnezia_junk(dst);
         }
 
@@ -556,7 +552,6 @@ impl Tunn {
             self.pending_amnezia_junk = Some(PendingAmneziaJunk {
                 remaining: self.amnezia.pre_handshake_junk.packet_count,
                 last_packet_at: None,
-                force_resend,
             });
             return self.advance_amnezia_junk(dst);
         }
@@ -606,13 +601,16 @@ impl Tunn {
         }
 
         if pending.remaining == 0 {
-            let force_resend = pending.force_resend;
-            // Keep `pending_amnezia_junk` until the initiation is actually emitted.
-            // If `format_handshake_initiation_now` fails (e.g. the S1 prefix pushes
-            // the packet over `dst` capacity), the caller can retry with a larger
-            // buffer and resend only the initiation instead of replaying all junk.
-            let result = self.format_handshake_initiation_now(dst, force_resend);
-            if !matches!(result, TunnResult::Err(_)) {
+            // The initiation was deliberately deferred behind the junk packets, so
+            // it must be emitted now: force the (re)format. A previous attempt may
+            // have already moved the handshake into `InitSent` before
+            // `write_to_network` failed on an oversized prefix, and a non-forced
+            // retry would otherwise hit the `is_in_progress()` guard, return `Done`,
+            // and silently drop the initiation. Clear the pending state only once
+            // the initiation packet is actually written to the network, so a retry
+            // with a larger buffer resends only the initiation, never the junk.
+            let result = self.format_handshake_initiation_now(dst, true);
+            if matches!(result, TunnResult::WriteToNetwork(_)) {
                 self.pending_amnezia_junk = None;
             }
             return result;
@@ -1234,8 +1232,11 @@ mod tests {
         let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
         let mut big = vec![0u8; 2048];
 
-        // First call drains the single junk packet.
-        let junk = unwrap_network_packet(my_tun.format_handshake_initiation(&mut big, true));
+        // First call drains the single junk packet. Use the non-forced path
+        // (the one `encapsulate` uses): the failed initiation below moves the
+        // handshake into `InitSent`, and a non-forced retry must still re-emit
+        // the initiation rather than returning `Done` and dropping it.
+        let junk = unwrap_network_packet(my_tun.format_handshake_initiation(&mut big, false));
         assert!((10..=20).contains(&junk.len()));
 
         // Retry the (now due) initiation into a buffer that fits the base
