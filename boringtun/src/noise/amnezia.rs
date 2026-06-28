@@ -240,6 +240,18 @@ impl AmneziaConfig {
         }
 
         let junk_size = self.inbound_junk_size(PacketKind::TransportData);
+        if junk_size == 0 {
+            return packet;
+        }
+
+        if packet.len() >= DATA_OVERHEAD_SZ
+            && Self::read_tag(packet, 0)
+                .map(|tag| Self::tag_matches(obf, PacketKind::TransportData, tag))
+                .unwrap_or(false)
+        {
+            return packet;
+        }
+
         if packet.len() >= junk_size + DATA_OVERHEAD_SZ {
             if Self::read_tag(packet, junk_size)
                 .map(|tag| Self::tag_matches(obf, PacketKind::TransportData, tag))
@@ -964,6 +976,19 @@ mod tests {
         write_tag(&mut resp[cfg.response_packet_junk_size as usize..], DATA);
 
         assert_eq!(cfg.strip_inbound(obf, &resp).len(), resp.len());
+    }
+
+    #[test]
+    fn leaves_unpadded_transport_unchanged_when_payload_at_s4_looks_like_h4() {
+        let obf = ObfuscationRanges::default();
+        let cfg = AmneziaConfig::new(0, 0, 0, 17);
+        let mut data = vec![0xaa; DATA_OVERHEAD_SZ + 32];
+        write_tag(&mut data, DATA);
+        write_tag(&mut data[cfg.transport_packet_junk_size as usize..], DATA);
+
+        let stripped = cfg.strip_inbound(obf, &data);
+
+        assert_eq!(stripped, data.as_slice());
     }
 
     #[test]
