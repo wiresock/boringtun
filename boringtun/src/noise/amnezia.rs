@@ -267,47 +267,70 @@ impl AmneziaConfig {
 
     /// True when a full browser-fingerprinted QUIC Initial should be emitted for
     /// pre-handshake junk (QUIC protocol + a non-`Default` browser, with the
-    /// `quic-imitation` feature available).
-    pub(crate) fn has_quic_browser_imitation(&self) -> bool {
-        #[cfg(any(test, feature = "quic-imitation"))]
-        {
-            self.imitation.protocol == AmneziaImitationProtocol::Quic
-                && self.imitation.browser.to_quic().is_some()
-        }
-        #[cfg(not(any(test, feature = "quic-imitation")))]
-        {
-            false
+    /// True when a full protocol-natural imitation sequence should be emitted
+    /// for the pre-handshake phase: DNS/SIP/STUN always, QUIC when a browser is
+    /// selected (and the `quic-imitation` feature is available).
+    pub(crate) fn has_imitation_sequence(&self) -> bool {
+        match self.imitation.protocol {
+            AmneziaImitationProtocol::Dns
+            | AmneziaImitationProtocol::Sip
+            | AmneziaImitationProtocol::Stun => true,
+            AmneziaImitationProtocol::Quic => {
+                #[cfg(any(test, feature = "quic-imitation"))]
+                {
+                    self.imitation.browser.to_quic().is_some()
+                }
+                #[cfg(not(any(test, feature = "quic-imitation")))]
+                {
+                    false
+                }
+            }
+            AmneziaImitationProtocol::None => false,
         }
     }
 
-    /// Generate the standalone browser QUIC Initial datagram(s) for the
-    /// pre-handshake phase, or an empty queue when browser imitation is not
-    /// configured/compiled.
-    pub(crate) fn pre_handshake_quic_initials(
+    /// The configured imitation host, or a generated random one (DNS query name
+    /// / SIP URI host / QUIC SNI).
+    fn imitation_host(&self, rng: &mut impl RngCore) -> String {
+        self.imitation
+            .domain()
+            .map(str::to_owned)
+            .unwrap_or_else(|| random_imitation_domain(rng))
+    }
+
+    /// Generate the standalone imitation datagram sequence for the pre-handshake
+    /// phase (DNS A/AAAA/HTTPS, SIP INVITE+CANCEL, STUN two Binding Requests, or
+    /// the browser QUIC Initials), or an empty queue when none applies.
+    pub(crate) fn pre_handshake_imitation_datagrams(
         &self,
         rng: &mut impl RngCore,
     ) -> std::collections::VecDeque<Vec<u8>> {
-        #[cfg(any(test, feature = "quic-imitation"))]
-        {
-            if self.imitation.protocol == AmneziaImitationProtocol::Quic {
-                if let Some(browser) = self.imitation.browser.to_quic() {
-                    let owned_sni;
-                    let sni = match self.imitation.domain() {
-                        Some(domain) => domain,
-                        None => {
-                            owned_sni = random_imitation_domain(rng);
-                            &owned_sni
-                        }
-                    };
-                    return crate::noise::quic::generator::generate_client_initials(
-                        browser, sni, rng,
-                    )
-                    .into();
+        use crate::noise::imitation::{dns, sip, stun};
+
+        let datagrams = match self.imitation.protocol {
+            AmneziaImitationProtocol::Dns => dns::generate(&self.imitation_host(rng), rng),
+            AmneziaImitationProtocol::Sip => sip::generate(&self.imitation_host(rng), rng),
+            AmneziaImitationProtocol::Stun => stun::generate(rng),
+            AmneziaImitationProtocol::Quic => {
+                #[cfg(any(test, feature = "quic-imitation"))]
+                {
+                    match self.imitation.browser.to_quic() {
+                        Some(browser) => crate::noise::quic::generator::generate_client_initials(
+                            browser,
+                            &self.imitation_host(rng),
+                            rng,
+                        ),
+                        None => Vec::new(),
+                    }
+                }
+                #[cfg(not(any(test, feature = "quic-imitation")))]
+                {
+                    Vec::new()
                 }
             }
-        }
-        let _ = rng;
-        std::collections::VecDeque::new()
+            AmneziaImitationProtocol::None => Vec::new(),
+        };
+        datagrams.into()
     }
 
     fn inbound_junk_size(&self, kind: PacketKind) -> usize {
@@ -507,9 +530,8 @@ impl AmneziaConfig {
     }
 }
 
-/// Generate a plausible random SNI host name when no domain is configured for
-/// QUIC browser imitation.
-#[cfg(any(test, feature = "quic-imitation"))]
+/// Generate a plausible random host name when no domain is configured for an
+/// imitation that needs one (DNS query name, SIP URI host, QUIC SNI).
 fn random_imitation_domain(rng: &mut impl RngCore) -> String {
     const TLDS: [&str; 4] = ["com", "net", "org", "io"];
     let label_len = 7 + (rng.next_u32() % 10) as usize; // 7..=16 chars

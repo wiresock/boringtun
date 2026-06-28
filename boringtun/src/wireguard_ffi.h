@@ -201,6 +201,16 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk(
                                     uint16_t junk_packet_size_max,
                                     uint16_t junk_packet_delay_ms);
 
+// Protocol imitation selector. Beyond shaping the S1-S4 junk prefixes, a
+// non-NONE protocol emits a standalone, protocol-natural datagram sequence
+// before the handshake initiation: DNS sends A/AAAA/HTTPS queries; SIP sends an
+// INVITE then a matching CANCEL; STUN sends two ICE Binding Requests (the second
+// with USE-CANDIDATE) carrying MESSAGE-INTEGRITY and FINGERPRINT. QUIC emits the
+// lightweight shaped junk unless a browser is selected (see
+// new_tunnel_with_amnezia_imitation_browser and wireguard_amnezia_browser_profile),
+// in which case it sends full browser-fingerprinted QUIC Initial(s). The caller
+// must drain these via wireguard_write()/wireguard_tick() (one datagram per
+// call) as for any pre-handshake junk.
 enum wireguard_amnezia_imitation_protocol {
     WIREGUARD_AMNEZIA_IMITATION_NONE = 0,
     WIREGUARD_AMNEZIA_IMITATION_DNS = 1,
@@ -209,13 +219,14 @@ enum wireguard_amnezia_imitation_protocol {
     WIREGUARD_AMNEZIA_IMITATION_STUN = 4,
 };
 
-/// Allocates a new tunnel with AmneziaWG S1-S4 junk prefix handling and
-/// protocol-shaped junk bytes.
+/// Allocates a new tunnel with AmneziaWG S1-S4 junk prefix handling and protocol
+/// imitation.
 ///
-/// `imitation_protocol` uses enum wireguard_amnezia_imitation_protocol values.
-/// `imitation_domain` may be NULL. It is currently used for DNS and SIP padding
-/// when it is a valid LDH host name; invalid values are ignored and protocol
-/// defaults are used.
+/// `imitation_protocol` uses enum wireguard_amnezia_imitation_protocol values
+/// and, for DNS/SIP/STUN, also triggers the pre-handshake imitation sequence
+/// described on that enum. `imitation_domain` may be NULL; it is the DNS query
+/// name / SIP URI host / QUIC SNI when valid (LDH host name), and a random host
+/// is generated otherwise.
 struct wireguard_tunnel *new_tunnel_with_amnezia_imitation(
                                     const char *static_private,
                                     const char *server_static_public,

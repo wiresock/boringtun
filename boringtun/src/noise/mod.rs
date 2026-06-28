@@ -4,6 +4,7 @@
 pub mod amnezia;
 pub mod errors;
 pub mod handshake;
+mod imitation;
 pub mod rate_limiter;
 
 // QUIC Initial imitation generator. Compiled into release builds only behind the
@@ -90,9 +91,10 @@ pub struct Tunn {
 }
 
 struct PendingAmneziaJunk {
-    /// Pre-generated standalone datagrams (browser QUIC Initials), emitted one
-    /// per call before the random/protocol junk and the handshake initiation.
-    quic_initials: VecDeque<Vec<u8>>,
+    /// Pre-generated standalone imitation datagrams (DNS/SIP/STUN sequence or
+    /// browser QUIC Initials), emitted one per call before any random/protocol
+    /// junk and the handshake initiation.
+    imitation_datagrams: VecDeque<Vec<u8>>,
     remaining: u16,
     last_packet_at: Option<Instant>,
 }
@@ -556,20 +558,19 @@ impl Tunn {
             self.timers.clear();
         }
 
-        if self.amnezia.pre_handshake_junk.is_enabled() || self.amnezia.has_quic_browser_imitation()
-        {
-            let quic_initials = self
+        if self.amnezia.pre_handshake_junk.is_enabled() || self.amnezia.has_imitation_sequence() {
+            let imitation_datagrams = self
                 .amnezia
-                .pre_handshake_quic_initials(&mut self.handshake.rng);
-            // A configured browser QUIC sequence replaces the random/protocol
+                .pre_handshake_imitation_datagrams(&mut self.handshake.rng);
+            // A protocol-natural imitation sequence replaces the random/protocol
             // junk; otherwise emit the configured Jc count.
-            let remaining = if quic_initials.is_empty() {
+            let remaining = if imitation_datagrams.is_empty() {
                 self.amnezia.pre_handshake_junk.packet_count
             } else {
                 0
             };
             self.pending_amnezia_junk = Some(PendingAmneziaJunk {
-                quic_initials,
+                imitation_datagrams,
                 remaining,
                 last_packet_at: None,
             });
@@ -615,7 +616,7 @@ impl Tunn {
             .last_packet_at
             .map(|last| last.elapsed() >= delay)
             .unwrap_or(true);
-        let has_queued_datagram = !pending.quic_initials.is_empty();
+        let has_queued_datagram = !pending.imitation_datagrams.is_empty();
         let remaining = pending.remaining;
         // `pending` (immutable borrow) ends here; the rest reborrows as needed.
 
@@ -623,8 +624,8 @@ impl Tunn {
             return TunnResult::Done;
         }
 
-        // Emit any pre-generated standalone datagrams (browser QUIC Initials)
-        // first, one per call.
+        // Emit any pre-generated standalone imitation datagrams (DNS/SIP/STUN or
+        // browser QUIC Initials) first, one per call.
         if has_queued_datagram {
             let pending = self
                 .pending_amnezia_junk
@@ -633,14 +634,14 @@ impl Tunn {
             // Check capacity before dequeuing so a too-small buffer can be
             // retried without losing the datagram.
             let size = pending
-                .quic_initials
+                .imitation_datagrams
                 .front()
                 .expect("queue checked non-empty above")
                 .len();
             if dst.len() < size {
                 return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
             }
-            let datagram = pending.quic_initials.pop_front().unwrap();
+            let datagram = pending.imitation_datagrams.pop_front().unwrap();
             pending.last_packet_at = Some(Instant::now());
             dst[..size].copy_from_slice(&datagram);
             return TunnResult::WriteToNetwork(&mut dst[..size]);
@@ -1182,9 +1183,26 @@ mod tests {
                 .with_protocol_imitation(protocol, Some("example.com".to_owned()));
             let (mut my_tun, mut their_tun) = create_two_tuns_with_amnezia(amnezia);
 
+            // DNS/SIP/STUN protocol imitation emits a standalone pre-handshake
+            // sequence before the initiation (QUIC needs a browser, not set here).
+            let pre_handshake_count = match protocol {
+                P::Dns => 3,
+                P::Sip | P::Stun => 2,
+                _ => 0,
+            };
+            let mut dst = vec![0u8; 2048];
+            let mut result = my_tun.format_handshake_initiation(&mut dst, false);
+            for _ in 0..pre_handshake_count {
+                assert!(
+                    matches!(result, TunnResult::WriteToNetwork(_)),
+                    "expected pre-handshake datagram for protocol={protocol:?}"
+                );
+                result = my_tun.update_timers(&mut dst);
+            }
+            let init = unwrap_network_packet(result);
+
             // Full handshake: every packet type carries a protocol-shaped S-prefix
             // and must still be stripped and parsed by the peer.
-            let init = create_handshake_init(&mut my_tun);
             assert_eq!(init.len(), HANDSHAKE_INIT_SZ + 5, "protocol={protocol:?}");
             let resp = create_handshake_response(&mut their_tun, &init);
             assert_eq!(resp.len(), HANDSHAKE_RESP_SZ + 7, "protocol={protocol:?}");
@@ -1336,6 +1354,49 @@ mod tests {
         assert_eq!(fp.supported_groups, vec![0x11ec, 0x001d, 0x0017, 0x0018]);
         assert_eq!(fp.alpn, vec!["h3".to_string()]);
         assert!(fp.sni.is_some(), "imitation carries a generated SNI");
+    }
+
+    #[test]
+    fn amnezia_dns_sip_stun_imitation_emit_sequence_before_handshake() {
+        use amnezia::AmneziaImitationProtocol as P;
+
+        for (protocol, count) in [(P::Dns, 3usize), (P::Sip, 2), (P::Stun, 2)] {
+            let amnezia = AmneziaConfig::new(0, 0, 0, 0)
+                .with_protocol_imitation(protocol, Some("example.com".to_owned()));
+            let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+            let mut dst = vec![0u8; 2048];
+
+            let mut datagrams = vec![unwrap_network_packet(
+                my_tun.format_handshake_initiation(&mut dst, false),
+            )];
+            for _ in 1..count {
+                datagrams.push(unwrap_network_packet(my_tun.update_timers(&mut dst)));
+            }
+            assert_eq!(datagrams.len(), count, "protocol={protocol:?}");
+
+            // The handshake initiation follows the imitation sequence.
+            let init = unwrap_network_packet(my_tun.update_timers(&mut dst));
+            assert_eq!(init.len(), HANDSHAKE_INIT_SZ, "protocol={protocol:?}");
+            assert_eq!(
+                u32::from_le_bytes(init[..4].try_into().unwrap()),
+                HANDSHAKE_INIT
+            );
+
+            // Spot-check the protocol shape of the first emitted datagram.
+            match protocol {
+                P::Dns => assert_eq!(&datagrams[0][2..4], &[0x01, 0x00], "DNS RD flag"),
+                P::Stun => {
+                    assert_eq!(&datagrams[0][0..2], &[0x00, 0x01], "STUN Binding Request");
+                    assert_eq!(
+                        &datagrams[0][4..8],
+                        &[0x21, 0x12, 0xa4, 0x42],
+                        "magic cookie"
+                    );
+                }
+                P::Sip => assert!(datagrams[0].starts_with(b"INVITE sip:"), "SIP INVITE"),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
