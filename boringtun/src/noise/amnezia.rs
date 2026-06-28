@@ -254,7 +254,7 @@ impl AmneziaConfig {
         self
     }
 
-    /// As [`with_protocol_imitation`], plus a browser fingerprint for QUIC.
+    /// As [`Self::with_protocol_imitation`], plus a browser fingerprint for QUIC.
     pub fn with_protocol_imitation_browser(
         mut self,
         protocol: AmneziaImitationProtocol,
