@@ -20,3 +20,6 @@
 pub(crate) mod crypto;
 pub(crate) mod initial;
 pub(crate) mod varint;
+
+#[cfg(test)]
+mod fingerprint;
