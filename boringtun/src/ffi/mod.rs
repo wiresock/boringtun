@@ -332,6 +332,15 @@ unsafe fn new_tunnel_with_amnezia_config(
     h4_data_end: u32,
     amnezia: AmneziaConfig,
 ) -> *mut Mutex<Tunn> {
+    if static_private.is_null() {
+        set_last_error("Missing static private key");
+        return ptr::null_mut();
+    }
+    if server_static_public.is_null() {
+        set_last_error("Missing server static public key");
+        return ptr::null_mut();
+    }
+
     let c_str = CStr::from_ptr(static_private);
     let static_private = match c_str.to_str() {
         Err(_) => {
@@ -687,6 +696,34 @@ mod tests {
             .to_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn constructor_sets_last_error_for_null_required_key() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let unused_public = CString::new("unused").unwrap();
+            let tunnel = new_tunnel(
+                ptr::null(),
+                unused_public.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Missing static private key");
+            last_tunnel_error_free();
+        }
     }
 
     #[test]

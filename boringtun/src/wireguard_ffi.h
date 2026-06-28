@@ -211,7 +211,8 @@ enum wireguard_amnezia_imitation_protocol {
 ///
 /// `imitation_protocol` uses enum wireguard_amnezia_imitation_protocol values.
 /// `imitation_domain` may be NULL. It is currently used for DNS and SIP padding
-/// when it is a valid LDH host name; invalid values fall back to synthetic names.
+/// when it is a valid LDH host name; invalid values are ignored and protocol
+/// defaults are used.
 struct wireguard_tunnel *new_tunnel_with_amnezia_imitation(
                                     const char *static_private,
                                     const char *server_static_public,
@@ -238,7 +239,8 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_imitation(
 ///
 /// When imitation is enabled, standalone pre-handshake junk packets use
 /// protocol-appropriate sizes instead of Jmin/Jmax. S1-S4 padding still uses the
-/// configured S sizes.
+/// configured S sizes. The imitation_protocol and imitation_domain rules are the
+/// same as new_tunnel_with_amnezia_imitation.
 struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
                                     const char *static_private,
                                     const char *server_static_public,
