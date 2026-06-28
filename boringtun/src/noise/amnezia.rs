@@ -51,9 +51,10 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
     }
 }
 
-/// Browser fingerprint for QUIC protocol imitation. `Default` keeps the
-/// lightweight QUIC-shaped junk; the others emit a full browser-fingerprinted
-/// QUIC Initial (needs the `quic-imitation` feature, which is on by default).
+/// Browser fingerprint for QUIC protocol imitation. All variants emit a full
+/// browser-fingerprinted QUIC Initial (needs the `quic-imitation` feature, which
+/// is on by default); `Default` resolves to curl, matching wgbooster's default
+/// browser when a domain is set but `Ib` is omitted.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum AmneziaImitationBrowser {
@@ -82,16 +83,19 @@ impl TryFrom<u8> for AmneziaImitationBrowser {
 
 #[cfg(any(test, feature = "quic-imitation"))]
 impl AmneziaImitationBrowser {
-    /// Map to a QUIC generator profile, or `None` for `Default` (no full
-    /// browser imitation).
-    fn to_quic(self) -> Option<crate::noise::quic::profiles::BrowserProfile> {
+    /// Map to a QUIC generator profile. `Default` resolves to curl, matching
+    /// wgbooster's default browser when a domain is set but no `Ib` is given —
+    /// so an omitted browser still produces a full QUIC Initial rather than the
+    /// lightweight QUIC-shaped junk.
+    fn to_quic(self) -> crate::noise::quic::profiles::BrowserProfile {
         use crate::noise::quic::profiles::BrowserProfile;
         match self {
-            AmneziaImitationBrowser::Default => None,
-            AmneziaImitationBrowser::Chrome => Some(BrowserProfile::Chrome),
-            AmneziaImitationBrowser::Firefox => Some(BrowserProfile::Firefox),
-            AmneziaImitationBrowser::Curl => Some(BrowserProfile::Curl),
-            AmneziaImitationBrowser::Random => Some(BrowserProfile::Random),
+            AmneziaImitationBrowser::Default | AmneziaImitationBrowser::Curl => {
+                BrowserProfile::Curl
+            }
+            AmneziaImitationBrowser::Chrome => BrowserProfile::Chrome,
+            AmneziaImitationBrowser::Firefox => BrowserProfile::Firefox,
+            AmneziaImitationBrowser::Random => BrowserProfile::Random,
         }
     }
 }
@@ -109,14 +113,15 @@ impl AmneziaImitation {
         domain: Option<String>,
         browser: AmneziaImitationBrowser,
     ) -> Self {
-        // DNS and SIP use the domain for protocol payloads; QUIC uses it as the
-        // ClientHello SNI under browser imitation. Invalid hosts are dropped.
+        // DNS QNAMEs and SIP URIs need a strict LDH host (the latter is spliced
+        // into text headers, so this also prevents injection). The QUIC SNI is a
+        // length-prefixed TLS extension, so it accepts UTF-8/IDN like wgbooster.
+        // Invalid hosts are dropped (a random one is generated at emit time).
         let domain = match protocol {
-            AmneziaImitationProtocol::Dns
-            | AmneziaImitationProtocol::Sip
-            | AmneziaImitationProtocol::Quic => {
+            AmneziaImitationProtocol::Dns | AmneziaImitationProtocol::Sip => {
                 domain.filter(|domain| is_valid_imitation_host(domain))
             }
+            AmneziaImitationProtocol::Quic => domain.filter(|domain| is_valid_quic_sni(domain)),
             _ => None,
         };
         // Browser only applies to QUIC.
@@ -266,24 +271,15 @@ impl AmneziaConfig {
     }
 
     /// True when a full protocol-natural imitation sequence should be emitted
-    /// for the pre-handshake phase: DNS/SIP/STUN always, QUIC only when a
-    /// non-`Default` browser is selected (and the `quic-imitation` feature is
-    /// available).
+    /// for the pre-handshake phase: DNS/SIP/STUN always, QUIC whenever the
+    /// `quic-imitation` feature is available (an omitted browser defaults to
+    /// curl, matching wgbooster).
     pub(crate) fn has_imitation_sequence(&self) -> bool {
         match self.imitation.protocol {
             AmneziaImitationProtocol::Dns
             | AmneziaImitationProtocol::Sip
             | AmneziaImitationProtocol::Stun => true,
-            AmneziaImitationProtocol::Quic => {
-                #[cfg(any(test, feature = "quic-imitation"))]
-                {
-                    self.imitation.browser.to_quic().is_some()
-                }
-                #[cfg(not(any(test, feature = "quic-imitation")))]
-                {
-                    false
-                }
-            }
+            AmneziaImitationProtocol::Quic => cfg!(any(test, feature = "quic-imitation")),
             AmneziaImitationProtocol::None => false,
         }
     }
@@ -298,38 +294,52 @@ impl AmneziaConfig {
     }
 
     /// Generate the standalone imitation datagram sequence for the pre-handshake
-    /// phase (DNS A/AAAA/HTTPS, SIP INVITE+CANCEL, STUN two Binding Requests, or
-    /// the browser QUIC Initials), or an empty queue when none applies.
+    /// phase, each paired with the delay to wait *before* emitting it. Imitation
+    /// ignores the generic Jd delay and uses protocol-natural timing (the first
+    /// datagram always has zero delay): DNS sends A+AAAA in parallel then HTTPS
+    /// after 15 ms; SIP waits 20 ms before the CANCEL; STUN waits 15 ms before
+    /// the nomination check; QUIC Initials go back-to-back.
     pub(crate) fn pre_handshake_imitation_datagrams(
         &self,
         rng: &mut impl RngCore,
-    ) -> std::collections::VecDeque<Vec<u8>> {
+    ) -> std::collections::VecDeque<(Duration, Vec<u8>)> {
         use crate::noise::imitation::{dns, sip, stun};
 
-        let datagrams = match self.imitation.protocol {
-            AmneziaImitationProtocol::Dns => dns::generate(&self.imitation_host(rng), rng),
-            AmneziaImitationProtocol::Sip => sip::generate(&self.imitation_host(rng), rng),
-            AmneziaImitationProtocol::Stun => stun::generate(rng),
+        let (datagrams, delays_ms): (Vec<Vec<u8>>, &[u16]) = match self.imitation.protocol {
+            AmneziaImitationProtocol::Dns => {
+                (dns::generate(&self.imitation_host(rng), rng), &[0, 0, 15])
+            }
+            AmneziaImitationProtocol::Sip => {
+                (sip::generate(&self.imitation_host(rng), rng), &[0, 20])
+            }
+            AmneziaImitationProtocol::Stun => (stun::generate(rng), &[0, 15]),
             AmneziaImitationProtocol::Quic => {
                 #[cfg(any(test, feature = "quic-imitation"))]
                 {
-                    match self.imitation.browser.to_quic() {
-                        Some(browser) => crate::noise::quic::generator::generate_client_initials(
-                            browser,
-                            &self.imitation_host(rng),
-                            rng,
-                        ),
-                        None => Vec::new(),
-                    }
+                    let browser = self.imitation.browser.to_quic();
+                    let datagrams = crate::noise::quic::generator::generate_client_initials(
+                        browser,
+                        &self.imitation_host(rng),
+                        rng,
+                    );
+                    (datagrams, &[])
                 }
                 #[cfg(not(any(test, feature = "quic-imitation")))]
                 {
-                    Vec::new()
+                    (Vec::new(), &[])
                 }
             }
-            AmneziaImitationProtocol::None => Vec::new(),
+            AmneziaImitationProtocol::None => (Vec::new(), &[]),
         };
-        datagrams.into()
+
+        datagrams
+            .into_iter()
+            .enumerate()
+            .map(|(i, datagram)| {
+                let ms = delays_ms.get(i).copied().unwrap_or(0);
+                (Duration::from_millis(ms as u64), datagram)
+            })
+            .collect()
     }
 
     fn inbound_junk_size(&self, kind: PacketKind) -> usize {
@@ -1031,6 +1041,14 @@ fn write_dns_opt_padding(
     true
 }
 
+/// Permissive validation for a QUIC ClientHello SNI: unlike DNS QNAMEs and SIP
+/// URIs, the SNI is a length-prefixed TLS extension, so UTF-8/IDN host names are
+/// accepted (matching wgbooster). Only emptiness, the 253-byte RFC 1035 bound,
+/// and control bytes (which never appear in a real SNI) are rejected.
+fn is_valid_quic_sni(host: &str) -> bool {
+    !host.is_empty() && host.len() <= 253 && !host.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
 fn is_valid_imitation_host(host: &str) -> bool {
     if host.is_empty()
         || host.len() > 253
@@ -1340,6 +1358,46 @@ mod tests {
         let packet = cfg.fill_pre_handshake_junk(&mut buffer, &mut rng).unwrap();
 
         assert_eq!(packet.len(), 42);
+    }
+
+    #[test]
+    fn quic_sni_accepts_utf8_idn_while_dns_sip_require_ldh() {
+        // QUIC SNI is a length-prefixed TLS extension: UTF-8/IDN accepted.
+        assert!(is_valid_quic_sni("xn--nxasmq6b.com"));
+        assert!(is_valid_quic_sni("пример.рф"));
+        assert!(!is_valid_quic_sni(""));
+        assert!(!is_valid_quic_sni("bad\r\nhost"));
+        assert!(!is_valid_quic_sni(&"a".repeat(254)));
+
+        // A non-ASCII domain is kept for QUIC but dropped for DNS/SIP (strict).
+        let quic = AmneziaImitation::new(
+            AmneziaImitationProtocol::Quic,
+            Some("пример.рф".to_owned()),
+            AmneziaImitationBrowser::Default,
+        );
+        assert_eq!(quic.domain(), Some("пример.рф"));
+        let dns = AmneziaImitation::new(
+            AmneziaImitationProtocol::Dns,
+            Some("пример.рф".to_owned()),
+            AmneziaImitationBrowser::Default,
+        );
+        assert_eq!(dns.domain(), None);
+    }
+
+    #[test]
+    fn quic_default_browser_emits_single_curl_initial() {
+        let cfg = AmneziaConfig::new(0, 0, 0, 0).with_protocol_imitation(
+            AmneziaImitationProtocol::Quic,
+            Some("example.com".to_owned()),
+        );
+        assert!(cfg.has_imitation_sequence());
+
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let seq = cfg.pre_handshake_imitation_datagrams(&mut rng);
+        // Omitted browser -> curl -> one Initial, back-to-back (zero delay).
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0].0, Duration::from_millis(0));
+        assert_eq!(seq[0].1.len(), 1250);
     }
 
     #[test]

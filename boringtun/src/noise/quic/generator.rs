@@ -24,16 +24,15 @@ fn rand_bytes(n: usize, rng: &mut impl RngCore) -> Vec<u8> {
     v
 }
 
-/// Resolve `Random` to a concrete browser for this connection.
+/// Resolve `Random` to a concrete browser for this connection (Chrome, Firefox,
+/// or curl, matching wgbooster's three-way random selection).
 fn resolve(browser: BrowserProfile, rng: &mut impl RngCore) -> BrowserProfile {
     match browser {
-        BrowserProfile::Random => {
-            if rng.next_u64() & 1 == 0 {
-                BrowserProfile::Chrome
-            } else {
-                BrowserProfile::Firefox
-            }
-        }
+        BrowserProfile::Random => match rng.next_u32() % 3 {
+            0 => BrowserProfile::Chrome,
+            1 => BrowserProfile::Firefox,
+            _ => BrowserProfile::Curl,
+        },
         other => other,
     }
 }
@@ -149,18 +148,31 @@ mod tests {
     }
 
     #[test]
-    fn random_resolves_to_a_real_browser_fingerprint() {
-        for seed in 0..8u64 {
+    fn random_resolves_to_chrome_firefox_or_curl() {
+        let mut seen_curl = false;
+        let mut seen_two_packet = false;
+        for seed in 0..32u64 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
             let packets = generate_client_initials(BrowserProfile::Random, "example.com", &mut rng);
-            assert_eq!(packets.len(), 2);
+            assert!(packets.len() == 1 || packets.len() == 2);
             let fp = fingerprint_of_packets(&packets);
-            let is_chrome = fp.cipher_suites == vec![0x1301, 0x1302, 0x1303];
+            // curl shares Chrome's cipher list but advertises only X25519 in
+            // key_share and fits a single Initial.
+            let is_chrome = fp.cipher_suites == vec![0x1301, 0x1302, 0x1303]
+                && fp.key_share_groups == vec![0x11ec, 0x001d];
             let is_firefox = fp.cipher_suites == vec![0x1301, 0x1303, 0x1302];
+            let is_curl = fp.key_share_groups == vec![0x001d];
             assert!(
-                is_chrome || is_firefox,
-                "random must be a real browser (seed {seed})"
+                is_chrome || is_firefox || is_curl,
+                "random must be a real profile (seed {seed})"
             );
+            seen_curl |= is_curl;
+            seen_two_packet |= packets.len() == 2;
         }
+        assert!(seen_curl, "random should sometimes pick curl");
+        assert!(
+            seen_two_packet,
+            "random should sometimes pick Chrome/Firefox"
+        );
     }
 }

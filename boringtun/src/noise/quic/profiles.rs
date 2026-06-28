@@ -18,7 +18,7 @@ pub(crate) enum BrowserProfile {
     Chrome,
     Firefox,
     Curl,
-    /// Alternates between Chrome and Firefox per generated connection.
+    /// Picks Chrome, Firefox, or curl per generated connection.
     Random,
 }
 

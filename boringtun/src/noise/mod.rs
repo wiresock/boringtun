@@ -92,9 +92,10 @@ pub struct Tunn {
 
 struct PendingAmneziaJunk {
     /// Pre-generated standalone imitation datagrams (DNS/SIP/STUN sequence or
-    /// browser QUIC Initials), emitted one per call before any random/protocol
-    /// junk and the handshake initiation.
-    imitation_datagrams: VecDeque<Vec<u8>>,
+    /// browser QUIC Initials), each with the delay to wait before emitting it.
+    /// Emitted one per call before any random/protocol junk and the handshake
+    /// initiation; these use protocol-natural timing, not the Jd delay.
+    imitation_datagrams: VecDeque<(Duration, Vec<u8>)>,
     remaining: u16,
     last_packet_at: Option<Instant>,
 }
@@ -611,12 +612,15 @@ impl Tunn {
             return TunnResult::Done;
         };
 
-        let delay = self.amnezia.pre_handshake_junk.delay();
+        // The next imitation datagram carries its own protocol-natural delay;
+        // random/protocol junk uses the configured Jd delay.
+        let next_datagram_delay = pending.imitation_datagrams.front().map(|(d, _)| *d);
+        let delay = next_datagram_delay.unwrap_or_else(|| self.amnezia.pre_handshake_junk.delay());
         let delay_elapsed = pending
             .last_packet_at
             .map(|last| last.elapsed() >= delay)
             .unwrap_or(true);
-        let has_queued_datagram = !pending.imitation_datagrams.is_empty();
+        let has_queued_datagram = next_datagram_delay.is_some();
         let remaining = pending.remaining;
         // `pending` (immutable borrow) ends here; the rest reborrows as needed.
 
@@ -637,11 +641,12 @@ impl Tunn {
                 .imitation_datagrams
                 .front()
                 .expect("queue checked non-empty above")
+                .1
                 .len();
             if dst.len() < size {
                 return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
             }
-            let datagram = pending.imitation_datagrams.pop_front().unwrap();
+            let (_, datagram) = pending.imitation_datagrams.pop_front().unwrap();
             pending.last_packet_at = Some(Instant::now());
             dst[..size].copy_from_slice(&datagram);
             return TunnResult::WriteToNetwork(&mut dst[..size]);
@@ -1183,12 +1188,15 @@ mod tests {
                 .with_protocol_imitation(protocol, Some("example.com".to_owned()));
             let (mut my_tun, mut their_tun) = create_two_tuns_with_amnezia(amnezia);
 
-            // DNS/SIP/STUN protocol imitation emits a standalone pre-handshake
-            // sequence before the initiation (QUIC needs a browser, not set here).
+            // Each non-None protocol emits a standalone pre-handshake sequence
+            // before the initiation (QUIC's omitted browser defaults to curl = 1
+            // Initial). Sleep past the protocol-natural inter-datagram delays
+            // (max 20 ms) so the queued datagrams become due.
             let pre_handshake_count = match protocol {
                 P::Dns => 3,
                 P::Sip | P::Stun => 2,
-                _ => 0,
+                P::Quic => 1,
+                P::None => 0,
             };
             let mut dst = vec![0u8; 2048];
             let mut result = my_tun.format_handshake_initiation(&mut dst, false);
@@ -1197,6 +1205,7 @@ mod tests {
                     matches!(result, TunnResult::WriteToNetwork(_)),
                     "expected pre-handshake datagram for protocol={protocol:?}"
                 );
+                std::thread::sleep(Duration::from_millis(25));
                 result = my_tun.update_timers(&mut dst);
             }
             let init = unwrap_network_packet(result);
@@ -1369,7 +1378,9 @@ mod tests {
             let mut datagrams = vec![unwrap_network_packet(
                 my_tun.format_handshake_initiation(&mut dst, false),
             )];
+            // Sleep past the protocol-natural inter-datagram delays (max 20 ms).
             for _ in 1..count {
+                std::thread::sleep(Duration::from_millis(25));
                 datagrams.push(unwrap_network_packet(my_tun.update_timers(&mut dst)));
             }
             assert_eq!(datagrams.len(), count, "protocol={protocol:?}");

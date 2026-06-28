@@ -281,12 +281,13 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
                                     uint8_t imitation_protocol,
                                     const char *imitation_domain);
 
-// Browser fingerprint selector for QUIC protocol imitation. DEFAULT keeps the
-// lightweight QUIC-shaped junk; the others emit a full browser-fingerprinted
-// QUIC Initial. This needs the `quic-imitation` build feature, which is ON BY
-// DEFAULT; if the library is built with that feature disabled
-// (--no-default-features), a non-DEFAULT value is accepted but DEFAULT behavior
-// is used. Only meaningful when imitation_protocol is QUIC.
+// Browser fingerprint selector for QUIC protocol imitation. Every value emits a
+// full browser-fingerprinted QUIC Initial; DEFAULT resolves to CURL (matching
+// wgbooster's default when a domain is set but no browser is given), and RANDOM
+// picks Chrome, Firefox, or curl per connection. Needs the `quic-imitation`
+// build feature (ON BY DEFAULT); if built with --no-default-features the value
+// is accepted but the lightweight QUIC-shaped junk is emitted instead. Only
+// meaningful when imitation_protocol is QUIC.
 enum wireguard_amnezia_browser_profile {
     WIREGUARD_AMNEZIA_BROWSER_DEFAULT = 0,
     WIREGUARD_AMNEZIA_BROWSER_CHROME = 1,
