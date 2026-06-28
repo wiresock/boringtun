@@ -554,10 +554,7 @@ unsafe fn parse_amnezia_imitation(
         let c_str = CStr::from_ptr(imitation_domain);
         match c_str.to_str() {
             Ok(domain) => Some(domain.to_owned()),
-            Err(_) => {
-                set_last_error("Invalid Amnezia imitation domain");
-                return None;
-            }
+            Err(_) => None,
         }
     };
 
@@ -696,6 +693,25 @@ mod tests {
             .to_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn imitation_parser_ignores_non_utf8_domain() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let invalid_domain = [0xffu8, 0];
+            let (protocol, domain) = parse_amnezia_imitation(
+                AmneziaImitationProtocol::Dns as u8,
+                invalid_domain.as_ptr() as *const c_char,
+            )
+            .unwrap();
+
+            assert_eq!(protocol, AmneziaImitationProtocol::Dns);
+            assert_eq!(domain, None);
+            assert!(last_tunnel_error().is_null());
+            last_tunnel_error_free();
+        }
     }
 
     #[test]
