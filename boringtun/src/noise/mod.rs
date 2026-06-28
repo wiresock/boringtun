@@ -1,6 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+pub(crate) mod amnezia;
 pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
@@ -8,6 +9,7 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+use amnezia::AmneziaConfig;
 use handshake::ObfuscationRanges;
 
 use crate::noise::errors::WireGuardError;
@@ -21,6 +23,11 @@ use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(not(feature = "mock-instant"))]
+use crate::sleepyinstant::Instant;
+#[cfg(feature = "mock-instant")]
+use mock_instant::Instant;
 
 /// The default value to use for rate limiting, when no other rate limiter is defined
 const PEER_HANDSHAKE_RATE_LIMIT: u64 = 10;
@@ -72,7 +79,15 @@ pub struct Tunn {
     timers: timers::Timers,
     tx_bytes: usize,
     rx_bytes: usize,
+    amnezia: AmneziaConfig,
+    pending_amnezia_junk: Option<PendingAmneziaJunk>,
     rate_limiter: Arc<RateLimiter>,
+}
+
+struct PendingAmneziaJunk {
+    remaining: u16,
+    last_packet_at: Option<Instant>,
+    force_resend: bool,
 }
 
 type MessageType = u32;
@@ -127,7 +142,10 @@ pub enum Packet<'a> {
 
 impl Tunn {
     #[inline(always)]
-    pub fn parse_incoming_packet(obf: ObfuscationRanges, src: &[u8]) -> Result<Packet, WireGuardError> {
+    pub fn parse_incoming_packet(
+        obf: ObfuscationRanges,
+        src: &[u8],
+    ) -> Result<Packet<'_>, WireGuardError> {
         if src.len() < 4 {
             return Err(WireGuardError::InvalidPacket);
         }
@@ -143,23 +161,29 @@ impl Tunn {
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
             }),
-            (v, HANDSHAKE_RESP_SZ) if obf.matches_h2(v) => Packet::HandshakeResponse(HandshakeResponse {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                    .expect("length already checked above"),
-                encrypted_nothing: &src[44..60],
-            }),
-            (v, COOKIE_REPLY_SZ) if obf.matches_h3(v) => Packet::PacketCookieReply(PacketCookieReply {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                nonce: &src[8..32],
-                encrypted_cookie: &src[32..64],
-            }),
-            (v, DATA_OVERHEAD_SZ..=std::usize::MAX) if obf.matches_h4(v) => Packet::PacketData(PacketData {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
-                encrypted_encapsulated_packet: &src[16..],
-            }),
+            (v, HANDSHAKE_RESP_SZ) if obf.matches_h2(v) => {
+                Packet::HandshakeResponse(HandshakeResponse {
+                    sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                    receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
+                    unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
+                        .expect("length already checked above"),
+                    encrypted_nothing: &src[44..60],
+                })
+            }
+            (v, COOKIE_REPLY_SZ) if obf.matches_h3(v) => {
+                Packet::PacketCookieReply(PacketCookieReply {
+                    receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                    nonce: &src[8..32],
+                    encrypted_cookie: &src[32..64],
+                })
+            }
+            (v, DATA_OVERHEAD_SZ..=std::usize::MAX) if obf.matches_h4(v) => {
+                Packet::PacketData(PacketData {
+                    receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                    counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
+                    encrypted_encapsulated_packet: &src[16..],
+                })
+            }
             _ => return Err(WireGuardError::InvalidPacket),
         })
     }
@@ -209,13 +233,54 @@ impl Tunn {
         h4_data_start: u32,
         h4_data_end: u32,
     ) -> Result<Self, String> {
+        Self::new_with_amnezia(
+            static_private,
+            peer_static_public,
+            preshared_key,
+            persistent_keepalive,
+            index,
+            rate_limiter,
+            h1_init_start,
+            h1_init_end,
+            h2_resp_start,
+            h2_resp_end,
+            h3_cookie_start,
+            h3_cookie_end,
+            h4_data_start,
+            h4_data_end,
+            AmneziaConfig::default(),
+        )
+    }
+
+    /// Create a new tunnel with Amnezia S1-S4 junk prefix handling.
+    pub fn new_with_amnezia(
+        static_private: x25519::StaticSecret,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+        index: u32,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        h1_init_start: u32,
+        h1_init_end: u32,
+        h2_resp_start: u32,
+        h2_resp_end: u32,
+        h3_cookie_start: u32,
+        h3_cookie_end: u32,
+        h4_data_start: u32,
+        h4_data_end: u32,
+        amnezia: AmneziaConfig,
+    ) -> Result<Self, String> {
         let static_public = x25519::PublicKey::from(&static_private);
 
         let obf = ObfuscationRanges::new(
-            h1_init_start, h1_init_end,
-            h2_resp_start, h2_resp_end,
-            h3_cookie_start, h3_cookie_end,
-            h4_data_start, h4_data_end,
+            h1_init_start,
+            h1_init_end,
+            h2_resp_start,
+            h2_resp_end,
+            h3_cookie_start,
+            h3_cookie_end,
+            h4_data_start,
+            h4_data_end,
         )?;
 
         Ok(Tunn {
@@ -231,6 +296,8 @@ impl Tunn {
             current: Default::default(),
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
+            amnezia,
+            pending_amnezia_junk: None,
 
             packet_queue: VecDeque::new(),
             timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
@@ -257,6 +324,7 @@ impl Tunn {
         for s in &mut self.sessions {
             *s = None;
         }
+        self.pending_amnezia_junk = None;
     }
 
     /// Encapsulate a single packet from the tunnel interface.
@@ -269,14 +337,16 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, src, dst);
+            let packet =
+                session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, src, dst);
+            let packet_size = packet.len();
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += src.len();
-            return TunnResult::WriteToNetwork(packet);
+            return self.write_to_network(dst, packet_size);
         }
 
         // If there is no session, queue the packet for future retry
@@ -302,15 +372,20 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
+        let datagram = self.amnezia.strip_inbound(self.handshake.obf, datagram);
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self
-            .rate_limiter
-            .verify_packet(self.handshake.obf, &mut self.handshake.rng, src_addr, datagram, &mut cookie)
-        {
+        let packet = match self.rate_limiter.verify_packet(
+            self.handshake.obf,
+            &mut self.handshake.rng,
+            src_addr,
+            datagram,
+            &mut cookie,
+        ) {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
-                dst[..cookie.len()].copy_from_slice(cookie);
-                return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
+                let packet_size = cookie.len();
+                dst[..packet_size].copy_from_slice(cookie);
+                return self.write_to_network(dst, packet_size);
             }
             Err(TunnResult::Err(e)) => return TunnResult::Err(e),
             _ => unreachable!(),
@@ -344,6 +419,7 @@ impl Tunn {
         );
 
         let (packet, session) = self.handshake.receive_handshake_initialization(p, dst)?;
+        let packet_size = packet.len();
 
         // Store new session in ring buffer
         let index = session.local_index();
@@ -355,7 +431,7 @@ impl Tunn {
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
 
-        Ok(TunnResult::WriteToNetwork(packet))
+        Ok(self.write_to_network(dst, packet_size))
     }
 
     fn handle_handshake_response<'a>(
@@ -371,7 +447,9 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, &[], dst);
+        let keepalive_packet =
+            session.format_packet_data(self.handshake.obf, &mut self.handshake.rng, &[], dst);
+        let keepalive_packet_size = keepalive_packet.len();
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -383,7 +461,7 @@ impl Tunn {
 
         tracing::debug!("Sending keepalive");
 
-        Ok(TunnResult::WriteToNetwork(keepalive_packet)) // Send a keepalive as a response
+        Ok(self.write_to_network(dst, keepalive_packet_size)) // Send a keepalive as a response
     }
 
     fn handle_cookie_reply<'a>(
@@ -453,6 +531,13 @@ impl Tunn {
         dst: &'a mut [u8],
         force_resend: bool,
     ) -> TunnResult<'a> {
+        if self.pending_amnezia_junk.is_some() {
+            if let Some(pending) = &mut self.pending_amnezia_junk {
+                pending.force_resend |= force_resend;
+            }
+            return self.advance_amnezia_junk(dst);
+        }
+
         if self.handshake.is_in_progress() && !force_resend {
             return TunnResult::Done;
         }
@@ -461,20 +546,82 @@ impl Tunn {
             self.timers.clear();
         }
 
+        if self.amnezia.pre_handshake_junk.is_enabled() {
+            self.pending_amnezia_junk = Some(PendingAmneziaJunk {
+                remaining: self.amnezia.pre_handshake_junk.packet_count,
+                last_packet_at: None,
+                force_resend,
+            });
+            return self.advance_amnezia_junk(dst);
+        }
+
+        self.format_handshake_initiation_now(dst, force_resend)
+    }
+
+    fn format_handshake_initiation_now<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+        force_resend: bool,
+    ) -> TunnResult<'a> {
+        if self.handshake.is_in_progress() && !force_resend {
+            return TunnResult::Done;
+        }
+
         let starting_new_handshake = !self.handshake.is_in_progress();
 
         match self.handshake.format_handshake_initiation(dst) {
             Ok(packet) => {
+                let packet_size = packet.len();
                 tracing::debug!("Sending handshake_initiation");
 
                 if starting_new_handshake {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                TunnResult::WriteToNetwork(packet)
+                self.write_to_network(dst, packet_size)
             }
             Err(e) => TunnResult::Err(e),
         }
+    }
+
+    fn advance_amnezia_junk<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        let Some(pending) = self.pending_amnezia_junk.as_ref() else {
+            return TunnResult::Done;
+        };
+
+        let delay = self.amnezia.pre_handshake_junk.delay();
+        let delay_elapsed = pending
+            .last_packet_at
+            .map(|last| last.elapsed() >= delay)
+            .unwrap_or(true);
+
+        if !delay_elapsed {
+            return TunnResult::Done;
+        }
+
+        if pending.remaining == 0 {
+            let force_resend = self
+                .pending_amnezia_junk
+                .take()
+                .map(|pending| pending.force_resend)
+                .unwrap_or(false);
+            return self.format_handshake_initiation_now(dst, force_resend);
+        }
+
+        let packet = match self
+            .amnezia
+            .fill_pre_handshake_junk(dst, &mut self.handshake.rng)
+        {
+            Ok(packet) => packet,
+            Err(e) => return TunnResult::Err(e),
+        };
+
+        if let Some(pending) = &mut self.pending_amnezia_junk {
+            pending.remaining -= 1;
+            pending.last_packet_at = Some(Instant::now());
+        }
+
+        TunnResult::WriteToNetwork(packet)
     }
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
@@ -558,6 +705,18 @@ impl Tunn {
         self.packet_queue.pop_front()
     }
 
+    fn write_to_network<'a>(&mut self, dst: &'a mut [u8], packet_size: usize) -> TunnResult<'a> {
+        match self.amnezia.prepend_outbound(
+            self.handshake.obf,
+            dst,
+            packet_size,
+            &mut self.handshake.rng,
+        ) {
+            Ok(packet) => TunnResult::WriteToNetwork(packet),
+            Err(e) => TunnResult::Err(e),
+        }
+    }
+
     fn estimate_loss(&self) -> f32 {
         let session_idx = self.current;
 
@@ -610,6 +769,7 @@ mod tests {
 
     use super::*;
     use rand_core::{OsRng, RngCore};
+    use std::convert::TryInto;
 
     fn create_two_tuns() -> (Tunn, Tunn) {
         let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
@@ -620,11 +780,91 @@ mod tests {
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let their_idx = OsRng.next_u32();
 
-        let my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None,
-            0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        let my_tun = Tunn::new(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            my_idx,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
 
-        let their_tun = Tunn::new(their_secret_key, my_public_key, None, None, their_idx, None,
-            0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        let their_tun = Tunn::new(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            their_idx,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+
+        (my_tun, their_tun)
+    }
+
+    fn create_two_tuns_with_amnezia(amnezia: AmneziaConfig) -> (Tunn, Tunn) {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
+        let my_idx = OsRng.next_u32();
+
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+        let their_idx = OsRng.next_u32();
+
+        let my_tun = Tunn::new_with_amnezia(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            my_idx,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            amnezia.clone(),
+        )
+        .unwrap();
+
+        let their_tun = Tunn::new_with_amnezia(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            their_idx,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            amnezia,
+        )
+        .unwrap();
 
         (my_tun, their_tun)
     }
@@ -674,6 +914,15 @@ mod tests {
         let mut dst = vec![0u8; 2048];
         let keepalive = tun.decapsulate(None, keepalive, &mut dst);
         assert!(matches!(keepalive, TunnResult::Done));
+    }
+
+    fn unwrap_network_packet(result: TunnResult) -> Vec<u8> {
+        assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+        if let TunnResult::WriteToNetwork(sent) = result {
+            sent.to_vec()
+        } else {
+            unreachable!();
+        }
     }
 
     fn create_two_tuns_and_handshake() -> (Tunn, Tunn) {
@@ -812,6 +1061,98 @@ mod tests {
         assert_eq!(sent_packet_buf, recv_packet_buf);
     }
 
+    #[test]
+    fn amnezia_s1_to_s4_full_handshake_and_data() {
+        let amnezia = AmneziaConfig::new(5, 7, 11, 13);
+        let (mut my_tun, mut their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let init = create_handshake_init(&mut my_tun);
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ + 5);
+        assert_eq!(
+            u32::from_le_bytes(init[5..9].try_into().unwrap()),
+            HANDSHAKE_INIT
+        );
+
+        let resp = create_handshake_response(&mut their_tun, &init);
+        assert_eq!(resp.len(), HANDSHAKE_RESP_SZ + 7);
+        assert_eq!(
+            u32::from_le_bytes(resp[7..11].try_into().unwrap()),
+            HANDSHAKE_RESP
+        );
+
+        let keepalive = parse_handshake_resp(&mut my_tun, &resp);
+        assert_eq!(keepalive.len(), DATA_OVERHEAD_SZ + 13);
+        assert_eq!(
+            u32::from_le_bytes(keepalive[13..17].try_into().unwrap()),
+            DATA
+        );
+        parse_keepalive(&mut their_tun, &keepalive);
+
+        let sent_packet_buf = create_ipv4_udp_packet();
+        let mut my_dst = [0u8; 2048];
+        let mut their_dst = [0u8; 2048];
+        let data = my_tun.encapsulate(&sent_packet_buf, &mut my_dst);
+        assert!(matches!(data, TunnResult::WriteToNetwork(_)));
+        let data = if let TunnResult::WriteToNetwork(sent) = data {
+            sent
+        } else {
+            unreachable!();
+        };
+        assert_eq!(u32::from_le_bytes(data[13..17].try_into().unwrap()), DATA);
+
+        let data = their_tun.decapsulate(None, data, &mut their_dst);
+        assert!(matches!(data, TunnResult::WriteToTunnelV4(..)));
+        let recv_packet_buf = if let TunnResult::WriteToTunnelV4(recv, _addr) = data {
+            recv
+        } else {
+            unreachable!();
+        };
+        assert_eq!(sent_packet_buf, recv_packet_buf);
+    }
+
+    #[test]
+    fn amnezia_pre_handshake_junk_precedes_handshake_initiation() {
+        let amnezia = AmneziaConfig::new(5, 0, 0, 0).with_pre_handshake_junk(2, 10, 20, 0);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = vec![0u8; 2048];
+
+        let junk1 = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        assert!((10..=20).contains(&junk1.len()));
+        assert!(matches!(
+            Tunn::parse_incoming_packet(my_tun.handshake.obf, &junk1),
+            Err(WireGuardError::InvalidPacket)
+        ));
+
+        let junk2 = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert!((10..=20).contains(&junk2.len()));
+
+        let init = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ + 5);
+        assert_eq!(
+            u32::from_le_bytes(init[5..9].try_into().unwrap()),
+            HANDSHAKE_INIT
+        );
+    }
+
+    #[test]
+    fn amnezia_pre_handshake_junk_uses_protocol_imitation() {
+        let amnezia = AmneziaConfig::new(0, 0, 0, 0)
+            .with_pre_handshake_junk(1, 10, 20, 0)
+            .with_protocol_imitation(amnezia::AmneziaImitationProtocol::Quic, None);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = vec![0u8; 2048];
+
+        let junk = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        assert!((1200..=1252).contains(&junk.len()));
+        assert_eq!(junk[0] & 0xc0, 0xc0);
+
+        let init = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ);
+        assert_eq!(
+            u32::from_le_bytes(init[..4].try_into().unwrap()),
+            HANDSHAKE_INIT
+        );
+    }
+
     // ---- ObfuscationRanges unit tests ----
 
     use crate::noise::handshake::{ObfuscationRanges, TagRange};
@@ -854,7 +1195,10 @@ mod tests {
         let msg = result.unwrap_err();
         assert!(msg.contains("H1"), "Error should mention H1: {msg}");
         assert!(msg.contains("H4"), "Error should mention H4: {msg}");
-        assert!(msg.contains("overlaps"), "Error should mention overlaps: {msg}");
+        assert!(
+            msg.contains("overlaps"),
+            "Error should mention overlaps: {msg}"
+        );
     }
 
     #[test]
@@ -928,13 +1272,25 @@ mod tests {
         let mut rng = OsRng;
         for _ in 0..1000 {
             let v = obf.random_h1(&mut rng);
-            assert!(v >= 100 && v <= 200, "H1 random {v} out of range [100..200]");
+            assert!(
+                v >= 100 && v <= 200,
+                "H1 random {v} out of range [100..200]"
+            );
             let v = obf.random_h2(&mut rng);
-            assert!(v >= 300 && v <= 400, "H2 random {v} out of range [300..400]");
+            assert!(
+                v >= 300 && v <= 400,
+                "H2 random {v} out of range [300..400]"
+            );
             let v = obf.random_h3(&mut rng);
-            assert!(v >= 500 && v <= 600, "H3 random {v} out of range [500..600]");
+            assert!(
+                v >= 500 && v <= 600,
+                "H3 random {v} out of range [500..600]"
+            );
             let v = obf.random_h4(&mut rng);
-            assert!(v >= 700 && v <= 800, "H4 random {v} out of range [700..800]");
+            assert!(
+                v >= 700 && v <= 800,
+                "H4 random {v} out of range [700..800]"
+            );
         }
     }
 
@@ -961,10 +1317,40 @@ mod tests {
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let their_idx = OsRng.next_u32();
 
-        let mut my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None,
-            100, 200, 300, 400, 500, 600, 700, 800).unwrap();
-        let mut their_tun = Tunn::new(their_secret_key, my_public_key, None, None, their_idx, None,
-            100, 200, 300, 400, 500, 600, 700, 800).unwrap();
+        let mut my_tun = Tunn::new(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            my_idx,
+            None,
+            100,
+            200,
+            300,
+            400,
+            500,
+            600,
+            700,
+            800,
+        )
+        .unwrap();
+        let mut their_tun = Tunn::new(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            their_idx,
+            None,
+            100,
+            200,
+            300,
+            400,
+            500,
+            600,
+            700,
+            800,
+        )
+        .unwrap();
 
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
@@ -983,10 +1369,7 @@ mod tests {
         let h4_min = u32::MAX - 70;
         let h4_max = u32::MAX - 61;
         let obf = ObfuscationRanges::new(
-            h1_min, h1_max,
-            h2_min, h2_max,
-            h3_min, h3_max,
-            h4_min, h4_max,
+            h1_min, h1_max, h2_min, h2_max, h3_min, h3_max, h4_min, h4_max,
         )
         .unwrap();
         let mut rng = OsRng;
@@ -1013,10 +1396,7 @@ mod tests {
         let h4_min = u32::MAX - 50;
         let h4_max = u32::MAX - 41;
         let res = ObfuscationRanges::new(
-            h1_min, h1_max,
-            h2_min, h2_max,
-            h3_min, h3_max,
-            h4_min, h4_max,
+            h1_min, h1_max, h2_min, h2_max, h3_min, h3_max, h4_min, h4_max,
         );
         assert!(res.is_err());
     }

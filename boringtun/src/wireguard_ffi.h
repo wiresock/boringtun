@@ -126,6 +126,135 @@ struct wireguard_tunnel *new_tunnel(const char *static_private,
                                     uint32_t h4_data_start,    // H4 (transport data) inclusive range start
                                     uint32_t h4_data_end);     // H4 (transport data) inclusive range end
 
+/// Allocates a new tunnel with AmneziaWG S1-S4 junk prefix handling.
+///
+/// This preserves the H1-H4 tag range behavior from new_tunnel() and additionally
+/// configures byte prefixes for each WireGuard packet type:
+///   S1: handshake initiation junk
+///   S2: handshake response junk
+///   S3: cookie reply junk
+///   S4: transport-data junk
+///
+/// Passing zero for all S-values gives the same packet sizes as new_tunnel().
+struct wireguard_tunnel *new_tunnel_with_amnezia(
+                                    const char *static_private,
+                                    const char *server_static_public,
+                                    const char *preshared_key,
+                                    uint16_t keep_alive,
+                                    uint32_t index,
+                                    uint32_t h1_init_start,
+                                    uint32_t h1_init_end,
+                                    uint32_t h2_resp_start,
+                                    uint32_t h2_resp_end,
+                                    uint32_t h3_cookie_start,
+                                    uint32_t h3_cookie_end,
+                                    uint32_t h4_data_start,
+                                    uint32_t h4_data_end,
+                                    uint16_t s1_init_junk,
+                                    uint16_t s2_response_junk,
+                                    uint16_t s3_cookie_junk,
+                                    uint16_t s4_transport_junk);
+
+/// Allocates a new tunnel with AmneziaWG pre-handshake junk packets and S1-S4
+/// junk prefix handling.
+///
+/// Jc/Jmin/Jmax/Jd configure standalone junk packets emitted before each
+/// handshake initiation:
+///   Jc: number of junk packets
+///   Jmin/Jmax: random junk packet size bounds for random junk
+///   Jd: delay in milliseconds after each junk packet before the next packet
+///
+/// BoringTun returns one UDP datagram per API call. After a call returns a junk
+/// packet, call wireguard_tick() periodically to emit the remaining junk packets
+/// and the delayed handshake initiation.
+struct wireguard_tunnel *new_tunnel_with_amnezia_junk(
+                                    const char *static_private,
+                                    const char *server_static_public,
+                                    const char *preshared_key,
+                                    uint16_t keep_alive,
+                                    uint32_t index,
+                                    uint32_t h1_init_start,
+                                    uint32_t h1_init_end,
+                                    uint32_t h2_resp_start,
+                                    uint32_t h2_resp_end,
+                                    uint32_t h3_cookie_start,
+                                    uint32_t h3_cookie_end,
+                                    uint32_t h4_data_start,
+                                    uint32_t h4_data_end,
+                                    uint16_t s1_init_junk,
+                                    uint16_t s2_response_junk,
+                                    uint16_t s3_cookie_junk,
+                                    uint16_t s4_transport_junk,
+                                    uint16_t junk_packet_count,
+                                    uint16_t junk_packet_size_min,
+                                    uint16_t junk_packet_size_max,
+                                    uint16_t junk_packet_delay_ms);
+
+enum wireguard_amnezia_imitation_protocol {
+    WIREGUARD_AMNEZIA_IMITATION_NONE = 0,
+    WIREGUARD_AMNEZIA_IMITATION_DNS = 1,
+    WIREGUARD_AMNEZIA_IMITATION_QUIC = 2,
+    WIREGUARD_AMNEZIA_IMITATION_SIP = 3,
+    WIREGUARD_AMNEZIA_IMITATION_STUN = 4,
+};
+
+/// Allocates a new tunnel with AmneziaWG S1-S4 junk prefix handling and
+/// protocol-shaped junk bytes.
+///
+/// `imitation_protocol` uses enum wireguard_amnezia_imitation_protocol values.
+/// `imitation_domain` may be NULL. It is currently used for DNS and SIP padding
+/// when it is a valid LDH host name; invalid values fall back to synthetic names.
+struct wireguard_tunnel *new_tunnel_with_amnezia_imitation(
+                                    const char *static_private,
+                                    const char *server_static_public,
+                                    const char *preshared_key,
+                                    uint16_t keep_alive,
+                                    uint32_t index,
+                                    uint32_t h1_init_start,
+                                    uint32_t h1_init_end,
+                                    uint32_t h2_resp_start,
+                                    uint32_t h2_resp_end,
+                                    uint32_t h3_cookie_start,
+                                    uint32_t h3_cookie_end,
+                                    uint32_t h4_data_start,
+                                    uint32_t h4_data_end,
+                                    uint16_t s1_init_junk,
+                                    uint16_t s2_response_junk,
+                                    uint16_t s3_cookie_junk,
+                                    uint16_t s4_transport_junk,
+                                    uint8_t imitation_protocol,
+                                    const char *imitation_domain);
+
+/// Allocates a new tunnel with AmneziaWG pre-handshake junk packets, S1-S4 junk
+/// prefix handling, and protocol-shaped junk bytes.
+///
+/// When imitation is enabled, standalone pre-handshake junk packets use
+/// protocol-appropriate sizes instead of Jmin/Jmax. S1-S4 padding still uses the
+/// configured S sizes.
+struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
+                                    const char *static_private,
+                                    const char *server_static_public,
+                                    const char *preshared_key,
+                                    uint16_t keep_alive,
+                                    uint32_t index,
+                                    uint32_t h1_init_start,
+                                    uint32_t h1_init_end,
+                                    uint32_t h2_resp_start,
+                                    uint32_t h2_resp_end,
+                                    uint32_t h3_cookie_start,
+                                    uint32_t h3_cookie_end,
+                                    uint32_t h4_data_start,
+                                    uint32_t h4_data_end,
+                                    uint16_t s1_init_junk,
+                                    uint16_t s2_response_junk,
+                                    uint16_t s3_cookie_junk,
+                                    uint16_t s4_transport_junk,
+                                    uint16_t junk_packet_count,
+                                    uint16_t junk_packet_size_min,
+                                    uint16_t junk_packet_size_max,
+                                    uint16_t junk_packet_delay_ms,
+                                    uint8_t imitation_protocol,
+                                    const char *imitation_domain);
 // Returns a pointer to the last error message from new_tunnel, or NULL if
 // no error is stored.  The pointer is valid until the next call to
 // new_tunnel on the same thread, or until freed with last_tunnel_error_free.

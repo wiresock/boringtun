@@ -7,6 +7,7 @@
 
 //! C bindings for the BoringTun library
 use super::noise::{Tunn, TunnResult};
+use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
 use crate::x25519::{PublicKey, StaticSecret};
 use base64::{decode, encode};
 use hex::encode as encode_hex;
@@ -17,6 +18,7 @@ use tracing;
 use tracing_subscriber::fmt;
 
 use crate::serialization::KeyBytes;
+use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::io::{Error, ErrorKind, Write};
 use std::os::raw::c_char;
@@ -34,11 +36,9 @@ thread_local! {
 
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
-        *e.borrow_mut() = Some(
-            CString::new(msg).unwrap_or_else(|_| {
-                CString::new("Invalid error message (contains null byte)").unwrap()
-            }),
-        );
+        *e.borrow_mut() = Some(CString::new(msg).unwrap_or_else(|_| {
+            CString::new("Invalid error message (contains null byte)").unwrap()
+        }));
     });
 }
 
@@ -48,11 +48,9 @@ fn set_last_error(msg: &str) {
 /// `last_tunnel_error_free`.
 #[no_mangle]
 pub extern "C" fn last_tunnel_error() -> *const c_char {
-    LAST_ERROR.with(|e| {
-        match *e.borrow() {
-            Some(ref s) => s.as_ptr(),
-            None => ptr::null(),
-        }
+    LAST_ERROR.with(|e| match *e.borrow() {
+        Some(ref s) => s.as_ptr(),
+        None => ptr::null(),
     })
 }
 
@@ -293,6 +291,43 @@ pub unsafe extern "C" fn new_tunnel(
     h4_data_start: u32,
     h4_data_end: u32,
 ) -> *mut Mutex<Tunn> {
+    new_tunnel_with_amnezia(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
+unsafe fn new_tunnel_with_amnezia_config(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    amnezia: AmneziaConfig,
+) -> *mut Mutex<Tunn> {
     let c_str = CStr::from_ptr(static_private);
     let static_private = match c_str.to_str() {
         Err(_) => return ptr::null_mut(),
@@ -337,7 +372,7 @@ pub unsafe extern "C" fn new_tunnel(
         Some(keep_alive)
     };
 
-    let tunnel = match Tunn::new(
+    let tunnel = match Tunn::new_with_amnezia(
         private_key,
         public_key,
         preshared_key,
@@ -352,6 +387,7 @@ pub unsafe extern "C" fn new_tunnel(
         h3_cookie_end,
         h4_data_start,
         h4_data_end,
+        amnezia,
     ) {
         Ok(t) => Box::new(Mutex::new(t)),
         Err(e) => {
@@ -371,6 +407,252 @@ pub unsafe extern "C" fn new_tunnel(
     Box::into_raw(tunnel)
 }
 
+/// Allocate a new tunnel with Amnezia S1-S4 junk prefix handling.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+) -> *mut Mutex<Tunn> {
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        ),
+    )
+}
+
+/// Allocate a new tunnel with Amnezia pre-handshake junk and S1-S4 junk prefix handling.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_junk(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    junk_packet_count: u16,
+    junk_packet_size_min: u16,
+    junk_packet_size_max: u16,
+    junk_packet_delay_ms: u16,
+) -> *mut Mutex<Tunn> {
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_pre_handshake_junk(
+            junk_packet_count,
+            junk_packet_size_min,
+            junk_packet_size_max,
+            junk_packet_delay_ms,
+        ),
+    )
+}
+
+unsafe fn parse_amnezia_imitation(
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+) -> Option<(AmneziaImitationProtocol, Option<String>)> {
+    let imitation_protocol = match AmneziaImitationProtocol::try_from(imitation_protocol) {
+        Ok(protocol) => protocol,
+        Err(_) => {
+            set_last_error("Invalid Amnezia imitation protocol");
+            return None;
+        }
+    };
+
+    let imitation_domain = if imitation_domain.is_null() {
+        None
+    } else {
+        let c_str = CStr::from_ptr(imitation_domain);
+        match c_str.to_str() {
+            Ok(domain) => Some(domain.to_owned()),
+            Err(_) => {
+                set_last_error("Invalid Amnezia imitation domain");
+                return None;
+            }
+        }
+    };
+
+    Some((imitation_protocol, imitation_domain))
+}
+
+/// Allocate a new tunnel with Amnezia S1-S4 junk prefix handling and protocol-shaped junk.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_imitation(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+) -> *mut Mutex<Tunn> {
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_protocol_imitation(imitation_protocol, imitation_domain),
+    )
+}
+
+/// Allocate a new tunnel with Amnezia pre-handshake junk, S1-S4 junk prefix
+/// handling, and protocol-shaped junk.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    junk_packet_count: u16,
+    junk_packet_size_min: u16,
+    junk_packet_size_max: u16,
+    junk_packet_delay_ms: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+) -> *mut Mutex<Tunn> {
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_pre_handshake_junk(
+            junk_packet_count,
+            junk_packet_size_min,
+            junk_packet_size_max,
+            junk_packet_delay_ms,
+        )
+        .with_protocol_imitation(imitation_protocol, imitation_domain),
+    )
+}
 /// Drops the Tunn object
 #[no_mangle]
 pub unsafe extern "C" fn tunnel_free(tunnel: *mut Mutex<Tunn>) {

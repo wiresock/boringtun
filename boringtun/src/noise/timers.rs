@@ -135,6 +135,7 @@ impl Tunn {
         self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
             self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
+        self.pending_amnezia_junk = None;
     }
 
     // We don't really clear the timers, but we set them to the current time to
@@ -145,6 +146,7 @@ impl Tunn {
         }
 
         self.packet_queue.clear();
+        self.pending_amnezia_junk = None;
 
         self.timers.clear();
     }
@@ -182,6 +184,14 @@ impl Tunn {
 
         self.update_session_timers(now);
 
+        if self.handshake.is_expired() {
+            return TunnResult::Err(WireGuardError::ConnectionExpired);
+        }
+
+        if self.pending_amnezia_junk.is_some() {
+            return self.advance_amnezia_junk(dst);
+        }
+
         // Load timers only once:
         let session_established = self.timers[TimeSessionEstablished];
         let handshake_started = self.timers[TimeLastHandshakeStarted];
@@ -192,10 +202,6 @@ impl Tunn {
         let persistent_keepalive = self.timers.persistent_keepalive;
 
         {
-            if self.handshake.is_expired() {
-                return TunnResult::Err(WireGuardError::ConnectionExpired);
-            }
-
             // Clear cookie after COOKIE_EXPIRATION_TIME
             if self.handshake.has_cookie()
                 && now - self.timers[TimeCookieReceived] >= COOKIE_EXPIRATION_TIME
