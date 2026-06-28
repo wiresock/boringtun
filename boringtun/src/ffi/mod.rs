@@ -42,10 +42,9 @@ fn set_last_error(msg: &str) {
     });
 }
 
-/// Returns a pointer to the last error message from `new_tunnel`, or NULL if
-/// no error is stored.  The string is valid until the next call to
-/// `new_tunnel` on the same thread, or until freed with
-/// `last_tunnel_error_free`.
+/// Returns a pointer to the last error message from any tunnel constructor, or
+/// NULL if no error is stored.  The string is valid until the next constructor
+/// call on the same thread, or until freed with `last_tunnel_error_free`.
 #[no_mangle]
 pub extern "C" fn last_tunnel_error() -> *const c_char {
     LAST_ERROR.with(|e| match *e.borrow() {
@@ -54,7 +53,7 @@ pub extern "C" fn last_tunnel_error() -> *const c_char {
     })
 }
 
-/// Frees the last error string stored by `new_tunnel`.  After this call,
+/// Frees the last error string stored by a tunnel constructor.  After this call,
 /// `last_tunnel_error` will return NULL until the next failure.
 #[no_mangle]
 pub extern "C" fn last_tunnel_error_free() {

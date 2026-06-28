@@ -263,12 +263,12 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
                                     uint16_t junk_packet_delay_ms,
                                     uint8_t imitation_protocol,
                                     const char *imitation_domain);
-// Returns a pointer to the last error message from new_tunnel, or NULL if
-// no error is stored.  The pointer is valid until the next call to
-// new_tunnel on the same thread, or until freed with last_tunnel_error_free.
+// Returns a pointer to the last error message from any tunnel constructor, or
+// NULL if no error is stored. The pointer is valid until the next constructor
+// call on the same thread, or until freed with last_tunnel_error_free.
 const char *last_tunnel_error();
 
-// Frees the last error string stored by new_tunnel.  After this call
+// Frees the last error string stored by a tunnel constructor. After this call
 // last_tunnel_error will return NULL until the next failure.
 void last_tunnel_error_free();
 
