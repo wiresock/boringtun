@@ -17,6 +17,8 @@ pub(crate) enum BrowserProfile {
     Chrome,
     Firefox,
     Curl,
+    /// Alternates between Chrome and Firefox per generated connection.
+    Random,
 }
 
 /// X25519MLKEM768 post-quantum hybrid key-exchange codepoint (IANA-registered,
@@ -85,11 +87,16 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
+    /// Build a concrete profile. `Random` must be resolved by the caller before
+    /// reaching here (the generator does so per connection).
     pub(crate) fn for_browser(browser: BrowserProfile) -> Profile {
         match browser {
             BrowserProfile::Chrome => chrome(),
             BrowserProfile::Firefox => firefox(),
             BrowserProfile::Curl => curl(),
+            BrowserProfile::Random => {
+                unreachable!("BrowserProfile::Random must be resolved before for_browser")
+            }
         }
     }
 }

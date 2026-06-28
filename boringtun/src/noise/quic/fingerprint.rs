@@ -244,9 +244,15 @@ pub(crate) fn split_records(blob: &[u8]) -> Vec<&[u8]> {
 /// ClientHello (≈1.4 KB with an MLKEM768 key share) across two Initial packets;
 /// the CRYPTO stream is reassembled by offset across all of them.
 pub(crate) fn fingerprint_of_capture(blob: &[u8]) -> Fingerprint {
+    fingerprint_of_packets(&split_records(blob))
+}
+
+/// Decode a set of Initial datagrams (each an owned/borrowed packet) for one
+/// flow into its ClientHello fingerprint.
+pub(crate) fn fingerprint_of_packets<P: AsRef<[u8]>>(packets: &[P]) -> Fingerprint {
     let mut frames = Vec::new();
-    for initial in split_records(blob) {
-        frames.extend_from_slice(&open_initial(initial));
+    for initial in packets {
+        frames.extend_from_slice(&open_initial(initial.as_ref()));
     }
     let ch = reassemble_crypto(&frames);
     parse_clienthello(&ch)
@@ -354,6 +360,7 @@ mod tests {
             dcid: &dcid,
             scid: &[],
             packet_number: 0,
+            crypto_offset: 0,
             pn_len: 1,
             crypto_payload: &ch,
             target_size: profile.packet_target,

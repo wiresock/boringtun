@@ -25,7 +25,11 @@ pub(crate) struct InitialParams<'a> {
     pub packet_number: u32,
     /// Encoded packet-number length in bytes, 1..=4.
     pub pn_len: usize,
-    /// The TLS ClientHello bytes carried in a single CRYPTO frame at offset 0.
+    /// CRYPTO-stream offset of `crypto_payload` (0 for the first fragment; the
+    /// running ClientHello offset for continuation packets).
+    pub crypto_offset: u64,
+    /// The ClientHello fragment carried in a single CRYPTO frame at
+    /// `crypto_offset`.
     pub crypto_payload: &'a [u8],
     /// Target total UDP datagram size (e.g. 1250 for Chrome). PADDING frames
     /// fill the remainder; if the base packet already exceeds the target no
@@ -89,9 +93,9 @@ pub(crate) fn build_client_initial(p: &InitialParams) -> Vec<u8> {
     let keys = crypto::derive_initial_keys(&crypto::INITIAL_SALT_V1, p.dcid);
 
     // Plaintext payload: one CRYPTO frame at offset 0, then PADDING to target.
-    let mut crypto_frame = Vec::with_capacity(p.crypto_payload.len() + 4);
+    let mut crypto_frame = Vec::with_capacity(p.crypto_payload.len() + 8);
     crypto_frame.push(FRAME_CRYPTO);
-    varint::write(&mut crypto_frame, 0); // offset
+    varint::write(&mut crypto_frame, p.crypto_offset);
     varint::write(&mut crypto_frame, p.crypto_payload.len() as u64);
     crypto_frame.extend_from_slice(p.crypto_payload);
 
@@ -226,6 +230,7 @@ mod tests {
                 scid: &scid,
                 packet_number: 2,
                 pn_len: 1,
+                crypto_offset: 0,
                 crypto_payload: &clienthello,
                 target_size: target,
             };
@@ -251,6 +256,7 @@ mod tests {
             scid: &[],
             packet_number: 0,
             pn_len: 1,
+            crypto_offset: 0,
             crypto_payload: &clienthello,
             target_size: 1250,
         };

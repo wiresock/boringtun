@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod crypto;
+pub(crate) mod generator;
 pub(crate) mod initial;
 pub(crate) mod profiles;
 pub(crate) mod tls;
