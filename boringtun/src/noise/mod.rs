@@ -6,6 +6,10 @@ pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
 
+// QUIC Initial imitation generator. Built and validated bottom-up; kept
+// test-only until the pre-handshake path consumes it (Phase C), at which point
+// it moves behind a `quic-imitation` feature so release builds opt in.
+#[cfg(test)]
 mod quic;
 mod session;
 mod timers;
