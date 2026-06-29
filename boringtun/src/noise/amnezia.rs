@@ -1,3 +1,6 @@
+// Copyright (c) 2024 BoringTun contributors. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+
 use super::{
     handshake::ObfuscationRanges, COOKIE_REPLY_SZ, DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ,
     HANDSHAKE_RESP_SZ,
@@ -850,6 +853,8 @@ fn fill_dns_minimal_root_query(dst: &mut [u8], rng: &mut impl RngCore) {
         dst[1] = random_byte(rng);
     }
     if dst.len() >= 4 {
+        // Flags 0x0120 (RD+AD): S-prefix DNS shaping matching wgbooster's
+        // protocol-aware padding (Windows DNS Client); see write_dns_header.
         dst[2] = 0x01;
         dst[3] = 0x20;
     }
@@ -888,6 +893,11 @@ fn fill_dns_minimal_root_query(dst: &mut [u8], rng: &mut impl RngCore) {
 fn write_dns_header(dst: &mut [u8], rng: &mut impl RngCore) -> usize {
     dst[0] = random_byte(rng);
     dst[1] = random_byte(rng);
+    // Flags 0x0120 (RD=1, AD=1): this is the S1-S4 prefix DNS shaping, which
+    // faithfully matches wgbooster's `protocol_aware_padding_generator` (it sets
+    // AD to mimic the Windows DNS Client). The standalone pre-handshake DNS
+    // queries in `imitation::dns` deliberately use 0x0100 (RD only) instead, to
+    // match wgbooster's live-query path (`simulate_browser_dns_resolution`).
     dst[2] = 0x01;
     dst[3] = 0x20;
     dst[4] = 0x00;
