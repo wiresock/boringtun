@@ -7,6 +7,7 @@
 
 //! C bindings for the BoringTun library
 use super::noise::{Tunn, TunnResult};
+use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationBrowser, AmneziaImitationProtocol};
 use crate::x25519::{PublicKey, StaticSecret};
 use base64::{decode, encode};
 use hex::encode as encode_hex;
@@ -17,6 +18,7 @@ use tracing;
 use tracing_subscriber::fmt;
 
 use crate::serialization::KeyBytes;
+use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::io::{Error, ErrorKind, Write};
 use std::os::raw::c_char;
@@ -34,35 +36,34 @@ thread_local! {
 
 fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| {
-        *e.borrow_mut() = Some(
-            CString::new(msg).unwrap_or_else(|_| {
-                CString::new("Invalid error message (contains null byte)").unwrap()
-            }),
-        );
+        *e.borrow_mut() = Some(CString::new(msg).unwrap_or_else(|_| {
+            CString::new("Invalid error message (contains null byte)").unwrap()
+        }));
     });
 }
 
-/// Returns a pointer to the last error message from `new_tunnel`, or NULL if
-/// no error is stored.  The string is valid until the next call to
-/// `new_tunnel` on the same thread, or until freed with
-/// `last_tunnel_error_free`.
-#[no_mangle]
-pub extern "C" fn last_tunnel_error() -> *const c_char {
-    LAST_ERROR.with(|e| {
-        match *e.borrow() {
-            Some(ref s) => s.as_ptr(),
-            None => ptr::null(),
-        }
-    })
-}
-
-/// Frees the last error string stored by `new_tunnel`.  After this call,
-/// `last_tunnel_error` will return NULL until the next failure.
-#[no_mangle]
-pub extern "C" fn last_tunnel_error_free() {
+fn clear_last_error() {
     LAST_ERROR.with(|e| {
         *e.borrow_mut() = None;
     });
+}
+
+/// Returns a pointer to the last error message from any tunnel constructor, or
+/// NULL if no error is stored.  The string is valid until the next constructor
+/// call on the same thread, or until freed with `last_tunnel_error_free`.
+#[no_mangle]
+pub extern "C" fn last_tunnel_error() -> *const c_char {
+    LAST_ERROR.with(|e| match *e.borrow() {
+        Some(ref s) => s.as_ptr(),
+        None => ptr::null(),
+    })
+}
+
+/// Frees the last error string stored by a tunnel constructor.  After this call,
+/// `last_tunnel_error` will return NULL until the next failure.
+#[no_mangle]
+pub extern "C" fn last_tunnel_error_free() {
+    clear_last_error();
 }
 
 #[allow(non_camel_case_types)]
@@ -293,15 +294,68 @@ pub unsafe extern "C" fn new_tunnel(
     h4_data_start: u32,
     h4_data_end: u32,
 ) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    new_tunnel_with_amnezia(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
+unsafe fn new_tunnel_with_amnezia_config(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    amnezia: AmneziaConfig,
+) -> *mut Mutex<Tunn> {
+    if static_private.is_null() {
+        set_last_error("Missing static private key");
+        return ptr::null_mut();
+    }
+    if server_static_public.is_null() {
+        set_last_error("Missing server static public key");
+        return ptr::null_mut();
+    }
+
     let c_str = CStr::from_ptr(static_private);
     let static_private = match c_str.to_str() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid static private key: not UTF-8");
+            return ptr::null_mut();
+        }
         Ok(string) => string,
     };
 
     let c_str = CStr::from_ptr(server_static_public);
     let server_static_public = match c_str.to_str() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid server static public key: not UTF-8");
+            return ptr::null_mut();
+        }
         Ok(string) => string,
     };
 
@@ -314,20 +368,28 @@ pub unsafe extern "C" fn new_tunnel(
             if let Ok(key) = string.parse::<KeyBytes>() {
                 Some(key.0)
             } else {
+                set_last_error("Invalid preshared key");
                 return null_mut();
             }
         } else {
+            set_last_error("Invalid preshared key: not UTF-8");
             return null_mut();
         }
     };
 
     let private_key = match static_private.parse::<KeyBytes>() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid static private key");
+            return ptr::null_mut();
+        }
         Ok(key) => StaticSecret::from(key.0),
     };
 
     let public_key = match server_static_public.parse::<KeyBytes>() {
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            set_last_error("Invalid server static public key");
+            return ptr::null_mut();
+        }
         Ok(key) => PublicKey::from(key.0),
     };
 
@@ -337,7 +399,7 @@ pub unsafe extern "C" fn new_tunnel(
         Some(keep_alive)
     };
 
-    let tunnel = match Tunn::new(
+    let tunnel = match Tunn::new_with_amnezia(
         private_key,
         public_key,
         preshared_key,
@@ -352,6 +414,7 @@ pub unsafe extern "C" fn new_tunnel(
         h3_cookie_end,
         h4_data_start,
         h4_data_end,
+        amnezia,
     ) {
         Ok(t) => Box::new(Mutex::new(t)),
         Err(e) => {
@@ -369,6 +432,631 @@ pub unsafe extern "C" fn new_tunnel(
     });
 
     Box::into_raw(tunnel)
+}
+
+/// Allocate a new tunnel with Amnezia S1-S4 junk prefix handling.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        ),
+    )
+}
+
+/// Allocate a new tunnel with Amnezia pre-handshake junk and S1-S4 junk prefix handling.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_junk(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    junk_packet_count: u16,
+    junk_packet_size_min: u16,
+    junk_packet_size_max: u16,
+    junk_packet_delay_ms: u16,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_pre_handshake_junk(
+            junk_packet_count,
+            junk_packet_size_min,
+            junk_packet_size_max,
+            junk_packet_delay_ms,
+        ),
+    )
+}
+
+unsafe fn parse_amnezia_imitation(
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+) -> Option<(AmneziaImitationProtocol, Option<String>)> {
+    let imitation_protocol = match AmneziaImitationProtocol::try_from(imitation_protocol) {
+        Ok(protocol) => protocol,
+        Err(_) => {
+            set_last_error("Invalid Amnezia imitation protocol");
+            return None;
+        }
+    };
+
+    let imitation_domain = if imitation_domain.is_null() {
+        None
+    } else {
+        let c_str = CStr::from_ptr(imitation_domain);
+        match c_str.to_str() {
+            Ok(domain) => Some(domain.to_owned()),
+            Err(_) => None,
+        }
+    };
+
+    Some((imitation_protocol, imitation_domain))
+}
+
+fn parse_amnezia_browser(imitation_browser: u8) -> Option<AmneziaImitationBrowser> {
+    match AmneziaImitationBrowser::try_from(imitation_browser) {
+        Ok(browser) => Some(browser),
+        Err(_) => {
+            set_last_error("Invalid Amnezia imitation browser");
+            None
+        }
+    }
+}
+
+/// Allocate a new tunnel with Amnezia S1-S4 junk prefix handling and protocol-shaped junk.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_imitation(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_protocol_imitation(imitation_protocol, imitation_domain),
+    )
+}
+
+/// Allocate a new tunnel with Amnezia pre-handshake junk, S1-S4 junk prefix
+/// handling, and protocol-shaped junk.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    junk_packet_count: u16,
+    junk_packet_size_min: u16,
+    junk_packet_size_max: u16,
+    junk_packet_delay_ms: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_pre_handshake_junk(
+            junk_packet_count,
+            junk_packet_size_min,
+            junk_packet_size_max,
+            junk_packet_delay_ms,
+        )
+        .with_protocol_imitation(imitation_protocol, imitation_domain),
+    )
+}
+
+/// Allocate a new tunnel with Amnezia S1-S4 junk prefix handling and a
+/// browser-fingerprinted QUIC Initial imitation.
+///
+/// `imitation_browser` selects the QUIC ClientHello fingerprint (see
+/// `enum wireguard_amnezia_browser_profile`); it is only meaningful when
+/// `imitation_protocol` is QUIC. An omitted/DEFAULT browser resolves to curl, so
+/// a configured QUIC domain always yields a full QUIC Initial.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_imitation_browser(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+    imitation_browser: u8,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+    // The browser is only meaningful for QUIC; for other protocols its value is
+    // ignored (AmneziaImitation::new forces Default), so don't reject an
+    // out-of-range value there — that would be a surprising constructor failure.
+    let imitation_browser = if imitation_protocol == AmneziaImitationProtocol::Quic {
+        let Some(browser) = parse_amnezia_browser(imitation_browser) else {
+            return ptr::null_mut();
+        };
+        browser
+    } else {
+        AmneziaImitationBrowser::Default
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_protocol_imitation_browser(
+            imitation_protocol,
+            imitation_domain,
+            imitation_browser,
+        ),
+    )
+}
+
+/// Allocate a new tunnel with Amnezia pre-handshake junk, S1-S4 junk prefix
+/// handling, and a browser-fingerprinted QUIC Initial imitation.
+///
+/// As `new_tunnel_with_amnezia_imitation_browser`, plus the Jc/Jmin/Jmax/Jd
+/// pre-handshake junk knobs. When a QUIC browser is selected, the standalone
+/// browser Initial(s) are emitted before the handshake regardless of Jc.
+/// Keys must be valid base64 encoded 32-byte keys.
+#[no_mangle]
+pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation_browser(
+    static_private: *const c_char,
+    server_static_public: *const c_char,
+    preshared_key: *const c_char,
+    keep_alive: u16,
+    index: u32,
+    h1_init_start: u32,
+    h1_init_end: u32,
+    h2_resp_start: u32,
+    h2_resp_end: u32,
+    h3_cookie_start: u32,
+    h3_cookie_end: u32,
+    h4_data_start: u32,
+    h4_data_end: u32,
+    s1_init_junk: u16,
+    s2_response_junk: u16,
+    s3_cookie_junk: u16,
+    s4_transport_junk: u16,
+    junk_packet_count: u16,
+    junk_packet_size_min: u16,
+    junk_packet_size_max: u16,
+    junk_packet_delay_ms: u16,
+    imitation_protocol: u8,
+    imitation_domain: *const c_char,
+    imitation_browser: u8,
+) -> *mut Mutex<Tunn> {
+    clear_last_error();
+    let Some((imitation_protocol, imitation_domain)) =
+        parse_amnezia_imitation(imitation_protocol, imitation_domain)
+    else {
+        return ptr::null_mut();
+    };
+    // The browser is only meaningful for QUIC; for other protocols its value is
+    // ignored (AmneziaImitation::new forces Default), so don't reject an
+    // out-of-range value there — that would be a surprising constructor failure.
+    let imitation_browser = if imitation_protocol == AmneziaImitationProtocol::Quic {
+        let Some(browser) = parse_amnezia_browser(imitation_browser) else {
+            return ptr::null_mut();
+        };
+        browser
+    } else {
+        AmneziaImitationBrowser::Default
+    };
+
+    new_tunnel_with_amnezia_config(
+        static_private,
+        server_static_public,
+        preshared_key,
+        keep_alive,
+        index,
+        h1_init_start,
+        h1_init_end,
+        h2_resp_start,
+        h2_resp_end,
+        h3_cookie_start,
+        h3_cookie_end,
+        h4_data_start,
+        h4_data_end,
+        AmneziaConfig::new(
+            s1_init_junk,
+            s2_response_junk,
+            s3_cookie_junk,
+            s4_transport_junk,
+        )
+        .with_pre_handshake_junk(
+            junk_packet_count,
+            junk_packet_size_min,
+            junk_packet_size_max,
+            junk_packet_delay_ms,
+        )
+        .with_protocol_imitation_browser(
+            imitation_protocol,
+            imitation_domain,
+            imitation_browser,
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn last_error_string() -> String {
+        let error = last_tunnel_error();
+        assert!(!error.is_null());
+        unsafe { CStr::from_ptr(error) }
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn browser_parser_accepts_known_values_and_rejects_others() {
+        last_tunnel_error_free();
+        assert_eq!(
+            parse_amnezia_browser(0),
+            Some(AmneziaImitationBrowser::Default)
+        );
+        assert_eq!(
+            parse_amnezia_browser(1),
+            Some(AmneziaImitationBrowser::Chrome)
+        );
+        assert_eq!(
+            parse_amnezia_browser(4),
+            Some(AmneziaImitationBrowser::Random)
+        );
+        assert!(last_tunnel_error().is_null());
+
+        assert_eq!(parse_amnezia_browser(99), None);
+        assert_eq!(last_error_string(), "Invalid Amnezia imitation browser");
+        last_tunnel_error_free();
+    }
+
+    #[test]
+    fn browser_constructor_only_validates_browser_for_quic() {
+        unsafe {
+            let server = CString::new("unused").unwrap();
+
+            // Non-QUIC protocol with an out-of-range browser: the browser is
+            // ignored, so the failure is the (null) key, not the browser value.
+            last_tunnel_error_free();
+            let tunnel = new_tunnel_with_amnezia_imitation_browser(
+                ptr::null(),
+                server.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                AmneziaImitationProtocol::Dns as u8,
+                ptr::null(),
+                99, // invalid browser, must be ignored for DNS
+            );
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Missing static private key");
+
+            // QUIC with an out-of-range browser still fails on the browser.
+            last_tunnel_error_free();
+            let tunnel = new_tunnel_with_amnezia_imitation_browser(
+                ptr::null(),
+                server.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                AmneziaImitationProtocol::Quic as u8,
+                ptr::null(),
+                99,
+            );
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Invalid Amnezia imitation browser");
+            last_tunnel_error_free();
+        }
+    }
+
+    #[test]
+    fn imitation_parser_ignores_non_utf8_domain() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let invalid_domain = [0xffu8, 0];
+            let (protocol, domain) = parse_amnezia_imitation(
+                AmneziaImitationProtocol::Dns as u8,
+                invalid_domain.as_ptr() as *const c_char,
+            )
+            .unwrap();
+
+            assert_eq!(protocol, AmneziaImitationProtocol::Dns);
+            assert_eq!(domain, None);
+            assert!(last_tunnel_error().is_null());
+            last_tunnel_error_free();
+        }
+    }
+
+    #[test]
+    fn constructor_sets_last_error_for_null_required_key() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let unused_public = CString::new("unused").unwrap();
+            let tunnel = new_tunnel(
+                ptr::null(),
+                unused_public.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Missing static private key");
+            last_tunnel_error_free();
+        }
+    }
+
+    #[test]
+    fn constructor_sets_last_error_for_invalid_utf8_key() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let invalid_private = [0xffu8, 0];
+            let unused_public = CString::new("unused").unwrap();
+            let tunnel = new_tunnel(
+                invalid_private.as_ptr() as *const c_char,
+                unused_public.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Invalid static private key: not UTF-8");
+            last_tunnel_error_free();
+        }
+    }
+
+    #[test]
+    fn constructor_sets_last_error_for_invalid_key_text() {
+        unsafe {
+            last_tunnel_error_free();
+
+            let invalid_private = CString::new("not-a-key").unwrap();
+            let unused_public = CString::new("unused").unwrap();
+            let tunnel = new_tunnel(
+                invalid_private.as_ptr(),
+                unused_public.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Invalid static private key");
+            last_tunnel_error_free();
+        }
+    }
 }
 
 /// Drops the Tunn object

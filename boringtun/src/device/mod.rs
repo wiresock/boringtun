@@ -335,7 +335,14 @@ impl Device {
             keepalive,
             next_index,
             None,
-            0, 0, 0, 0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         )
         .expect("default obfuscation ranges must not conflict");
 

@@ -1,7 +1,10 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{HandshakeInit, HandshakeResponse, PacketCookieReply, HANDSHAKE_INIT, HANDSHAKE_RESP, COOKIE_REPLY, DATA};
+use super::{
+    HandshakeInit, HandshakeResponse, PacketCookieReply, COOKIE_REPLY, DATA, HANDSHAKE_INIT,
+    HANDSHAKE_RESP,
+};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
@@ -303,8 +306,12 @@ pub struct TagRange {
 }
 
 impl TagRange {
-    pub fn start(&self) -> u32 { self.start }
-    pub fn end(&self) -> u32 { self.end }
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+    pub fn end(&self) -> u32 {
+        self.end
+    }
 
     /// Returns `true` if `value` falls within `[start..=end]`.
     pub fn contains(&self, value: u32) -> bool {
@@ -354,10 +361,22 @@ pub struct ObfuscationRanges {
 impl Default for ObfuscationRanges {
     fn default() -> Self {
         ObfuscationRanges {
-            h1_init: TagRange { start: HANDSHAKE_INIT, end: HANDSHAKE_INIT },
-            h2_resp: TagRange { start: HANDSHAKE_RESP, end: HANDSHAKE_RESP },
-            h3_cookie: TagRange { start: COOKIE_REPLY, end: COOKIE_REPLY },
-            h4_data: TagRange { start: DATA, end: DATA },
+            h1_init: TagRange {
+                start: HANDSHAKE_INIT,
+                end: HANDSHAKE_INIT,
+            },
+            h2_resp: TagRange {
+                start: HANDSHAKE_RESP,
+                end: HANDSHAKE_RESP,
+            },
+            h3_cookie: TagRange {
+                start: COOKIE_REPLY,
+                end: COOKIE_REPLY,
+            },
+            h4_data: TagRange {
+                start: DATA,
+                end: DATA,
+            },
         }
     }
 }
@@ -371,19 +390,27 @@ impl ObfuscationRanges {
     ///
     /// All four ranges must be non-overlapping.
     pub fn new(
-        h1_start: u32, h1_end: u32,
-        h2_start: u32, h2_end: u32,
-        h3_start: u32, h3_end: u32,
-        h4_start: u32, h4_end: u32,
+        h1_start: u32,
+        h1_end: u32,
+        h2_start: u32,
+        h2_end: u32,
+        h3_start: u32,
+        h3_end: u32,
+        h4_start: u32,
+        h4_end: u32,
     ) -> Result<Self, String> {
-        let resolve = |name: &str, start: u32, end: u32, default: u32| -> Result<TagRange, String> {
-            match (start, end) {
-                (0, 0) => Ok(TagRange { start: default, end: default }),
-                (s, 0) => Ok(TagRange { start: s, end: s }),
-                (s, e) if s <= e => Ok(TagRange { start: s, end: e }),
-                (s, e) => Err(format!("Invalid {name} range: start ({s}) > end ({e})")),
-            }
-        };
+        let resolve =
+            |name: &str, start: u32, end: u32, default: u32| -> Result<TagRange, String> {
+                match (start, end) {
+                    (0, 0) => Ok(TagRange {
+                        start: default,
+                        end: default,
+                    }),
+                    (s, 0) => Ok(TagRange { start: s, end: s }),
+                    (s, e) if s <= e => Ok(TagRange { start: s, end: e }),
+                    (s, e) => Err(format!("Invalid {name} range: start ({s}) > end ({e})")),
+                }
+            };
 
         let h1 = resolve("H1", h1_start, h1_end, HANDSHAKE_INIT)?;
         let h2 = resolve("H2", h2_start, h2_end, HANDSHAKE_RESP)?;
@@ -414,14 +441,30 @@ impl ObfuscationRanges {
         })
     }
 
-    pub fn matches_h1(&self, v: u32) -> bool { self.h1_init.contains(v) }
-    pub fn matches_h2(&self, v: u32) -> bool { self.h2_resp.contains(v) }
-    pub fn matches_h3(&self, v: u32) -> bool { self.h3_cookie.contains(v) }
-    pub fn matches_h4(&self, v: u32) -> bool { self.h4_data.contains(v) }
-    pub fn random_h1(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h1_init.random(rng) }
-    pub fn random_h2(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h2_resp.random(rng) }
-    pub fn random_h3(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h3_cookie.random(rng) }
-    pub fn random_h4(&self, rng: &mut impl rand_core::RngCore) -> u32 { self.h4_data.random(rng) }
+    pub fn matches_h1(&self, v: u32) -> bool {
+        self.h1_init.contains(v)
+    }
+    pub fn matches_h2(&self, v: u32) -> bool {
+        self.h2_resp.contains(v)
+    }
+    pub fn matches_h3(&self, v: u32) -> bool {
+        self.h3_cookie.contains(v)
+    }
+    pub fn matches_h4(&self, v: u32) -> bool {
+        self.h4_data.contains(v)
+    }
+    pub fn random_h1(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h1_init.random(rng)
+    }
+    pub fn random_h2(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h2_resp.random(rng)
+    }
+    pub fn random_h3(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h3_cookie.random(rng)
+    }
+    pub fn random_h4(&self, rng: &mut impl rand_core::RngCore) -> u32 {
+        self.h4_data.random(rng)
+    }
 }
 
 pub struct Handshake {
