@@ -563,16 +563,13 @@ impl Tunn {
             let imitation_datagrams = self
                 .amnezia
                 .pre_handshake_imitation_datagrams(&mut self.handshake.rng);
-            // A protocol-natural imitation sequence replaces the random/protocol
-            // junk; otherwise emit the configured Jc count.
-            let remaining = if imitation_datagrams.is_empty() {
-                self.amnezia.pre_handshake_junk.packet_count
-            } else {
-                0
-            };
+            // Like wgbooster (execute_imitation_obfuscation then
+            // send_random_packets then the handshake), the imitation sequence and
+            // the Jc random/protocol-shaped junk are both emitted: the sequence
+            // first, then `packet_count` junk packets, then the initiation.
             self.pending_amnezia_junk = Some(PendingAmneziaJunk {
                 imitation_datagrams,
-                remaining,
+                remaining: self.amnezia.pre_handshake_junk.packet_count,
                 last_packet_at: None,
             });
             return self.advance_amnezia_junk(dst);
@@ -1411,14 +1408,50 @@ mod tests {
     }
 
     #[test]
+    fn amnezia_imitation_and_jc_junk_both_precede_handshake() {
+        // wgbooster emits the imitation sequence AND the Jc random/protocol-shaped
+        // junk before the handshake; Jc is not dropped when imitation is set.
+        let amnezia = AmneziaConfig::new(0, 0, 0, 0)
+            .with_pre_handshake_junk(2, 28, 100, 0)
+            .with_protocol_imitation(amnezia::AmneziaImitationProtocol::Stun, None);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = vec![0u8; 2048];
+
+        let mut datagrams = 0;
+        let mut result = my_tun.format_handshake_initiation(&mut dst, false);
+        loop {
+            let pkt = unwrap_network_packet(result);
+            if pkt.len() == HANDSHAKE_INIT_SZ
+                && u32::from_le_bytes(pkt[..4].try_into().unwrap()) == HANDSHAKE_INIT
+            {
+                break;
+            }
+            datagrams += 1;
+            assert!(datagrams <= 8, "imitation sequence did not terminate");
+            std::thread::sleep(Duration::from_millis(25));
+            result = my_tun.update_timers(&mut dst);
+        }
+        // 2 STUN imitation packets + 2 Jc junk packets, then the initiation.
+        assert_eq!(datagrams, 4);
+    }
+
+    #[test]
     fn amnezia_pre_handshake_junk_uses_protocol_imitation() {
+        // QUIC imitation (omitted browser -> curl) emits one full Initial, then
+        // the Jc QUIC-shaped junk packet, then the handshake.
         let amnezia = AmneziaConfig::new(0, 0, 0, 0)
             .with_pre_handshake_junk(1, 10, 20, 0)
             .with_protocol_imitation(amnezia::AmneziaImitationProtocol::Quic, None);
         let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
         let mut dst = vec![0u8; 2048];
 
-        let junk = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        // curl QUIC Initial.
+        let initial = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        assert_eq!(initial.len(), 1250);
+        assert_eq!(initial[0] & 0xc0, 0xc0);
+
+        // Jc QUIC-shaped junk packet.
+        let junk = unwrap_network_packet(my_tun.update_timers(&mut dst));
         assert!((1200..=1252).contains(&junk.len()));
         assert_eq!(junk[0] & 0xc0, 0xc0);
 

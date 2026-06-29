@@ -208,11 +208,13 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk(
 // with USE-CANDIDATE) carrying MESSAGE-INTEGRITY and FINGERPRINT. QUIC sends full
 // browser-fingerprinted QUIC Initial(s); the browser defaults to curl when none
 // is given (see new_tunnel_with_amnezia_imitation_browser and
-// wireguard_amnezia_browser_profile). (If the library is built with
-// --no-default-features, i.e. without the quic-imitation feature, QUIC instead
-// emits lightweight QUIC-shaped junk.) The caller must drain these via
-// wireguard_write()/wireguard_tick() (one datagram per call) as for any
-// pre-handshake junk.
+// wireguard_amnezia_browser_profile). (If the library is built without the
+// quic-imitation feature (--no-default-features), QUIC emits no Initials — its
+// pre-handshake is then only the configured Jc lightweight QUIC-shaped junk
+// packets, i.e. nothing when Jc is 0.) The imitation sequence is followed by the
+// Jc protocol-shaped junk packets (if any) and then the handshake. The caller
+// must drain all of these via wireguard_write()/wireguard_tick() (one datagram
+// per call) as for any pre-handshake junk.
 enum wireguard_amnezia_imitation_protocol {
     WIREGUARD_AMNEZIA_IMITATION_NONE = 0,
     WIREGUARD_AMNEZIA_IMITATION_DNS = 1,
@@ -225,10 +227,13 @@ enum wireguard_amnezia_imitation_protocol {
 /// imitation.
 ///
 /// `imitation_protocol` uses enum wireguard_amnezia_imitation_protocol values
-/// and, for DNS/SIP/STUN, also triggers the pre-handshake imitation sequence
-/// described on that enum. `imitation_domain` may be NULL; it is the DNS query
-/// name / SIP URI host / QUIC SNI when valid (LDH host name), and a random host
-/// is generated otherwise.
+/// and triggers the pre-handshake imitation sequence described on that enum.
+/// `imitation_domain` may be NULL; it is the DNS query name / SIP URI host / QUIC
+/// SNI. DNS and SIP require a strict LDH host name; the QUIC SNI also accepts
+/// UTF-8/IDN. Invalid values are dropped and a random host is generated instead.
+/// If both this protocol imitation and a non-zero junk_packet_count (Jc) are
+/// configured, the imitation sequence is emitted first, then the Jc
+/// protocol-shaped junk packets, then the handshake.
 struct wireguard_tunnel *new_tunnel_with_amnezia_imitation(
                                     const char *static_private,
                                     const char *server_static_public,
@@ -302,10 +307,13 @@ enum wireguard_amnezia_browser_profile {
 /// browser-fingerprinted QUIC Initial imitation.
 ///
 /// `imitation_browser` uses enum wireguard_amnezia_browser_profile and is only
-/// meaningful when imitation_protocol is QUIC. With a non-DEFAULT browser, the
-/// pre-handshake phase emits the standalone browser QUIC Initial(s) (two for
-/// Chrome/Firefox, one for curl) carrying a ClientHello whose SNI is
-/// imitation_domain (a random host is generated when NULL/invalid).
+/// meaningful when imitation_protocol is QUIC. For any value (DEFAULT resolves to
+/// curl), the pre-handshake phase emits the standalone browser QUIC Initial(s)
+/// (two for Chrome/Firefox, one for curl) carrying a ClientHello whose SNI is
+/// imitation_domain (a random host is generated when NULL/invalid). If the
+/// library is built without the quic-imitation feature (--no-default-features),
+/// no QUIC Initials are emitted; the QUIC pre-handshake then consists only of the
+/// configured Jc lightweight QUIC-shaped junk packets (none if Jc is 0).
 struct wireguard_tunnel *new_tunnel_with_amnezia_imitation_browser(
                                     const char *static_private,
                                     const char *server_static_public,
