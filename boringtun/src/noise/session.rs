@@ -194,7 +194,13 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, obf: ObfuscationRanges, rng: &mut impl RngCore, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+    pub(super) fn format_packet_data<'a>(
+        &self,
+        obf: ObfuscationRanges,
+        rng: &mut impl RngCore,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> &'a mut [u8] {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
