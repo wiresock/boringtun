@@ -95,7 +95,8 @@ mod tests {
         let ids: Vec<u16> = packets.iter().map(|p| be16(&p[0..2])).collect();
         assert!(
             ids[0] != ids[1] && ids[0] != ids[2] && ids[1] != ids[2],
-            "transaction ids must all differ, got {ids:?}"
+            "transaction ids must all differ, got {:?}",
+            ids
         );
     }
 }

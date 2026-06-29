@@ -1207,7 +1207,8 @@ mod tests {
             for _ in 0..pre_handshake_count {
                 assert!(
                     matches!(result, TunnResult::WriteToNetwork(_)),
-                    "expected pre-handshake datagram for protocol={protocol:?}"
+                    "expected pre-handshake datagram for protocol={:?}",
+                    protocol
                 );
                 std::thread::sleep(Duration::from_millis(25));
                 result = my_tun.update_timers(&mut dst);
@@ -1236,7 +1237,10 @@ mod tests {
             let recv_packet_buf = if let TunnResult::WriteToTunnelV4(recv, _addr) = recv {
                 recv
             } else {
-                panic!("expected WriteToTunnelV4 for protocol={protocol:?}, got {recv:?}");
+                panic!(
+                    "expected WriteToTunnelV4 for protocol={:?}, got {:?}",
+                    protocol, recv
+                );
             };
             assert_eq!(sent_packet_buf, recv_packet_buf, "protocol={protocol:?}");
         }

@@ -164,7 +164,8 @@ mod tests {
             let is_curl = fp.key_share_groups == vec![0x001d];
             assert!(
                 is_chrome || is_firefox || is_curl,
-                "random must be a real profile (seed {seed})"
+                "random must be a real profile (seed {})",
+                seed
             );
             seen_curl |= is_curl;
             seen_two_packet |= packets.len() == 2;

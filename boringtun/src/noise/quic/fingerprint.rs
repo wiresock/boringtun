@@ -39,14 +39,6 @@ impl Fingerprint {
         v.dedup();
         v
     }
-
-    /// Transport-parameter ids as a sorted set.
-    pub(crate) fn transport_param_set(&self) -> Vec<u64> {
-        let mut v = self.transport_param_ids.clone();
-        v.sort_unstable();
-        v.dedup();
-        v
-    }
 }
 
 fn be16(b: &[u8]) -> u16 {
