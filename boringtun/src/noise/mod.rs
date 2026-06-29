@@ -1540,11 +1540,12 @@ mod tests {
         let result = ObfuscationRanges::new(10, 20, 100, 110, 200, 210, 20, 30);
         assert!(result.is_err());
         let msg = result.unwrap_err();
-        assert!(msg.contains("H1"), "Error should mention H1: {msg}");
-        assert!(msg.contains("H4"), "Error should mention H4: {msg}");
+        assert!(msg.contains("H1"), "Error should mention H1: {}", msg);
+        assert!(msg.contains("H4"), "Error should mention H4: {}", msg);
         assert!(
             msg.contains("overlaps"),
-            "Error should mention overlaps: {msg}"
+            "Error should mention overlaps: {}",
+            msg
         );
     }
 
@@ -1553,8 +1554,8 @@ mod tests {
         let result = ObfuscationRanges::new(10, 20, 50, 60, 55, 65, 100, 110);
         assert!(result.is_err());
         let msg = result.unwrap_err();
-        assert!(msg.contains("H2"), "Error should mention H2: {msg}");
-        assert!(msg.contains("H3"), "Error should mention H3: {msg}");
+        assert!(msg.contains("H2"), "Error should mention H2: {}", msg);
+        assert!(msg.contains("H3"), "Error should mention H3: {}", msg);
     }
 
     #[test]
@@ -1562,8 +1563,12 @@ mod tests {
         let result = ObfuscationRanges::new(20, 10, 100, 110, 200, 210, 300, 310);
         assert!(result.is_err());
         let msg = result.unwrap_err();
-        assert!(msg.contains("H1"), "Error should identify range H1: {msg}");
-        assert!(msg.contains("start"), "Error should mention start: {msg}");
+        assert!(
+            msg.contains("H1"),
+            "Error should identify range H1: {}",
+            msg
+        );
+        assert!(msg.contains("start"), "Error should mention start: {}", msg);
     }
 
     #[test]
@@ -1621,22 +1626,26 @@ mod tests {
             let v = obf.random_h1(&mut rng);
             assert!(
                 v >= 100 && v <= 200,
-                "H1 random {v} out of range [100..200]"
+                "H1 random {} out of range [100..200]",
+                v
             );
             let v = obf.random_h2(&mut rng);
             assert!(
                 v >= 300 && v <= 400,
-                "H2 random {v} out of range [300..400]"
+                "H2 random {} out of range [300..400]",
+                v
             );
             let v = obf.random_h3(&mut rng);
             assert!(
                 v >= 500 && v <= 600,
-                "H3 random {v} out of range [500..600]"
+                "H3 random {} out of range [500..600]",
+                v
             );
             let v = obf.random_h4(&mut rng);
             assert!(
                 v >= 700 && v <= 800,
-                "H4 random {v} out of range [700..800]"
+                "H4 random {} out of range [700..800]",
+                v
             );
         }
     }
