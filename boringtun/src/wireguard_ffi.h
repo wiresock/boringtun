@@ -208,10 +208,7 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk(
 // with USE-CANDIDATE) carrying MESSAGE-INTEGRITY and FINGERPRINT. QUIC sends full
 // browser-fingerprinted QUIC Initial(s); the browser defaults to curl when none
 // is given (see new_tunnel_with_amnezia_imitation_browser and
-// wireguard_amnezia_browser_profile). (If the library is built without the
-// quic-imitation feature (--no-default-features), QUIC emits no Initials — its
-// pre-handshake is then only the configured Jc lightweight QUIC-shaped junk
-// packets, i.e. nothing when Jc is 0.) The imitation sequence is followed by the
+// wireguard_amnezia_browser_profile). The imitation sequence is followed by the
 // Jc protocol-shaped junk packets (if any) and then the handshake. The caller
 // must drain all of these via wireguard_write()/wireguard_tick() (one datagram
 // per call) as for any pre-handshake junk.
@@ -291,11 +288,8 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
 // Browser fingerprint selector for QUIC protocol imitation. Every value emits a
 // full browser-fingerprinted QUIC Initial; DEFAULT resolves to CURL (matching
 // wgbooster's default when a domain is set but no browser is given), and RANDOM
-// picks Chrome, Firefox, or curl per connection. Needs the `quic-imitation`
-// build feature (ON BY DEFAULT); if built with --no-default-features the value
-// is accepted but no QUIC Initials are emitted — the QUIC pre-handshake is then
-// only the configured Jc lightweight QUIC-shaped junk packets (nothing when
-// Jc=0). Only meaningful when imitation_protocol is QUIC.
+// picks Chrome, Firefox, or curl per connection. Only meaningful when
+// imitation_protocol is QUIC.
 enum wireguard_amnezia_browser_profile {
     WIREGUARD_AMNEZIA_BROWSER_DEFAULT = 0,
     WIREGUARD_AMNEZIA_BROWSER_CHROME = 1,
@@ -311,10 +305,7 @@ enum wireguard_amnezia_browser_profile {
 /// meaningful when imitation_protocol is QUIC. For any value (DEFAULT resolves to
 /// curl), the pre-handshake phase emits the standalone browser QUIC Initial(s)
 /// (two for Chrome/Firefox, one for curl) carrying a ClientHello whose SNI is
-/// imitation_domain (a random host is generated when NULL/invalid). If the
-/// library is built without the quic-imitation feature (--no-default-features),
-/// no QUIC Initials are emitted; the QUIC pre-handshake then consists only of the
-/// configured Jc lightweight QUIC-shaped junk packets (none if Jc is 0).
+/// imitation_domain (a random host is generated when NULL/invalid).
 struct wireguard_tunnel *new_tunnel_with_amnezia_imitation_browser(
                                     const char *static_private,
                                     const char *server_static_public,

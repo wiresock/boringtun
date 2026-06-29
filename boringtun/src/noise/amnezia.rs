@@ -55,9 +55,8 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
 }
 
 /// Browser fingerprint for QUIC protocol imitation. All variants emit a full
-/// browser-fingerprinted QUIC Initial (needs the `quic-imitation` feature, which
-/// is on by default); `Default` resolves to curl, matching wgbooster's default
-/// browser when a domain is set but `Ib` is omitted.
+/// browser-fingerprinted QUIC Initial; `Default` resolves to curl, matching
+/// wgbooster's default browser when a domain is set but `Ib` is omitted.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum AmneziaImitationBrowser {
@@ -84,7 +83,6 @@ impl TryFrom<u8> for AmneziaImitationBrowser {
     }
 }
 
-#[cfg(any(test, feature = "quic-imitation"))]
 impl AmneziaImitationBrowser {
     /// Map to a QUIC generator profile. `Default` resolves to curl, matching
     /// wgbooster's default browser when a domain is set but no `Ib` is given —
@@ -274,17 +272,10 @@ impl AmneziaConfig {
     }
 
     /// True when a full protocol-natural imitation sequence should be emitted
-    /// for the pre-handshake phase: DNS/SIP/STUN always, QUIC whenever the
-    /// `quic-imitation` feature is available (an omitted browser defaults to
-    /// curl, matching wgbooster).
+    /// for the pre-handshake phase. DNS/SIP/STUN/QUIC all qualify (QUIC's omitted
+    /// browser defaults to curl, matching wgbooster); only `None` does not.
     pub(crate) fn has_imitation_sequence(&self) -> bool {
-        match self.imitation.protocol {
-            AmneziaImitationProtocol::Dns
-            | AmneziaImitationProtocol::Sip
-            | AmneziaImitationProtocol::Stun => true,
-            AmneziaImitationProtocol::Quic => cfg!(any(test, feature = "quic-imitation")),
-            AmneziaImitationProtocol::None => false,
-        }
+        self.imitation.protocol != AmneziaImitationProtocol::None
     }
 
     /// The configured imitation host, or a generated random one (DNS query name
@@ -317,20 +308,13 @@ impl AmneziaConfig {
             }
             AmneziaImitationProtocol::Stun => (stun::generate(rng), &[0, 15]),
             AmneziaImitationProtocol::Quic => {
-                #[cfg(any(test, feature = "quic-imitation"))]
-                {
-                    let browser = self.imitation.browser.to_quic();
-                    let datagrams = crate::noise::quic::generator::generate_client_initials(
-                        browser,
-                        &self.imitation_host(rng),
-                        rng,
-                    );
-                    (datagrams, &[])
-                }
-                #[cfg(not(any(test, feature = "quic-imitation")))]
-                {
-                    (Vec::new(), &[])
-                }
+                let browser = self.imitation.browser.to_quic();
+                let datagrams = crate::noise::quic::generator::generate_client_initials(
+                    browser,
+                    &self.imitation_host(rng),
+                    rng,
+                );
+                (datagrams, &[])
             }
             AmneziaImitationProtocol::None => (Vec::new(), &[]),
         };

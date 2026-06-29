@@ -7,10 +7,7 @@ pub mod handshake;
 mod imitation;
 pub mod rate_limiter;
 
-// QUIC Initial imitation generator. Compiled into release builds only behind the
-// `quic-imitation` feature (which also pulls in `aes`); always available under
-// test so its known-answer and capture-parity tests run with a plain `cargo test`.
-#[cfg(any(test, feature = "quic-imitation"))]
+// QUIC Initial imitation generator (always compiled; pulls in `aes`).
 mod quic;
 mod session;
 mod timers;

@@ -52,17 +52,6 @@
 //! ECH is emitted as a realistic *outer* wire shape only (the extension is
 //! present so the fingerprint matches); no real Encrypted ClientHello is
 //! performed.
-//!
-//! # Build
-//!
-//! Gated behind the `quic-imitation` Cargo feature (which also pulls in `aes`).
-//! That feature is **on by default**; opt out with `--no-default-features`.
-//! Always available under `cfg(test)`.
-
-// Items are reachable from the `amnezia` runtime path only with the
-// `quic-imitation` feature; under a plain `cargo test` some are exercised only
-// by this module's own tests, so silence dead-code warnings module-wide.
-#![allow(dead_code)]
 
 pub(crate) mod crypto;
 pub(crate) mod generator;

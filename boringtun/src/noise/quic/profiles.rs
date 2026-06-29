@@ -81,9 +81,6 @@ pub(crate) struct Profile {
     pub use_empty_session_id: bool,
     pub enable_ech: bool,
     pub randomize_extensions_order: bool,
-    /// Inject `initial_source_connection_id` (0x0f) = SCID at build time
-    /// (Firefox); Chrome instead carries an explicit empty 0x0f in `quic_tp`.
-    pub emit_scid_tp: bool,
     pub packet_target: usize,
 }
 
@@ -147,7 +144,6 @@ fn chrome() -> Profile {
         use_empty_session_id: true,
         enable_ech: true,
         randomize_extensions_order: true,
-        emit_scid_tp: false,
         packet_target: CHROME_PACKET_SIZE,
     }
 }
@@ -204,7 +200,6 @@ fn firefox() -> Profile {
         use_empty_session_id: true,
         enable_ech: true,
         randomize_extensions_order: true,
-        emit_scid_tp: true,
         packet_target: FIREFOX_PACKET_SIZE,
     }
 }
@@ -248,7 +243,6 @@ fn curl() -> Profile {
         use_empty_session_id: false,
         enable_ech: true,
         randomize_extensions_order: false,
-        emit_scid_tp: false,
         packet_target: CHROME_PACKET_SIZE,
     }
 }
