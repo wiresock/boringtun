@@ -729,8 +729,16 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_imitation_browser(
     else {
         return ptr::null_mut();
     };
-    let Some(imitation_browser) = parse_amnezia_browser(imitation_browser) else {
-        return ptr::null_mut();
+    // The browser is only meaningful for QUIC; for other protocols its value is
+    // ignored (AmneziaImitation::new forces Default), so don't reject an
+    // out-of-range value there — that would be a surprising constructor failure.
+    let imitation_browser = if imitation_protocol == AmneziaImitationProtocol::Quic {
+        let Some(browser) = parse_amnezia_browser(imitation_browser) else {
+            return ptr::null_mut();
+        };
+        browser
+    } else {
+        AmneziaImitationBrowser::Default
     };
 
     new_tunnel_with_amnezia_config(
@@ -801,8 +809,16 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation_browser(
     else {
         return ptr::null_mut();
     };
-    let Some(imitation_browser) = parse_amnezia_browser(imitation_browser) else {
-        return ptr::null_mut();
+    // The browser is only meaningful for QUIC; for other protocols its value is
+    // ignored (AmneziaImitation::new forces Default), so don't reject an
+    // out-of-range value there — that would be a surprising constructor failure.
+    let imitation_browser = if imitation_protocol == AmneziaImitationProtocol::Quic {
+        let Some(browser) = parse_amnezia_browser(imitation_browser) else {
+            return ptr::null_mut();
+        };
+        browser
+    } else {
+        AmneziaImitationBrowser::Default
     };
 
     new_tunnel_with_amnezia_config(
@@ -872,6 +888,69 @@ mod tests {
         assert_eq!(parse_amnezia_browser(99), None);
         assert_eq!(last_error_string(), "Invalid Amnezia imitation browser");
         last_tunnel_error_free();
+    }
+
+    #[test]
+    fn browser_constructor_only_validates_browser_for_quic() {
+        unsafe {
+            let server = CString::new("unused").unwrap();
+
+            // Non-QUIC protocol with an out-of-range browser: the browser is
+            // ignored, so the failure is the (null) key, not the browser value.
+            last_tunnel_error_free();
+            let tunnel = new_tunnel_with_amnezia_imitation_browser(
+                ptr::null(),
+                server.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                AmneziaImitationProtocol::Dns as u8,
+                ptr::null(),
+                99, // invalid browser, must be ignored for DNS
+            );
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Missing static private key");
+
+            // QUIC with an out-of-range browser still fails on the browser.
+            last_tunnel_error_free();
+            let tunnel = new_tunnel_with_amnezia_imitation_browser(
+                ptr::null(),
+                server.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                AmneziaImitationProtocol::Quic as u8,
+                ptr::null(),
+                99,
+            );
+            assert!(tunnel.is_null());
+            assert_eq!(last_error_string(), "Invalid Amnezia imitation browser");
+            last_tunnel_error_free();
+        }
     }
 
     #[test]
