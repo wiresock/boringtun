@@ -698,8 +698,10 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation(
 /// `imitation_browser` selects the QUIC ClientHello fingerprint (see
 /// `enum wireguard_amnezia_browser_profile`); it is only meaningful when
 /// `imitation_protocol` is QUIC. Browser imitation requires the library to be
-/// built with the `quic-imitation` feature; otherwise the configuration is
-/// accepted but the lightweight QUIC-shaped junk is emitted instead.
+/// built with the `quic-imitation` feature (enabled by default); without it the
+/// configuration is accepted but no QUIC Initials are emitted — the QUIC
+/// pre-handshake is then only the configured Jc lightweight QUIC-shaped junk
+/// packets (nothing when Jc=0).
 /// Keys must be valid base64 encoded 32-byte keys.
 #[no_mangle]
 pub unsafe extern "C" fn new_tunnel_with_amnezia_imitation_browser(

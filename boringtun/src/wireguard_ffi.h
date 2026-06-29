@@ -293,8 +293,9 @@ struct wireguard_tunnel *new_tunnel_with_amnezia_junk_imitation(
 // wgbooster's default when a domain is set but no browser is given), and RANDOM
 // picks Chrome, Firefox, or curl per connection. Needs the `quic-imitation`
 // build feature (ON BY DEFAULT); if built with --no-default-features the value
-// is accepted but the lightweight QUIC-shaped junk is emitted instead. Only
-// meaningful when imitation_protocol is QUIC.
+// is accepted but no QUIC Initials are emitted — the QUIC pre-handshake is then
+// only the configured Jc lightweight QUIC-shaped junk packets (nothing when
+// Jc=0). Only meaningful when imitation_protocol is QUIC.
 enum wireguard_amnezia_browser_profile {
     WIREGUARD_AMNEZIA_BROWSER_DEFAULT = 0,
     WIREGUARD_AMNEZIA_BROWSER_CHROME = 1,

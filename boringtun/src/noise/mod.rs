@@ -644,7 +644,17 @@ impl Tunn {
                 return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
             }
             let (_, datagram) = pending.imitation_datagrams.pop_front().unwrap();
-            pending.last_packet_at = Some(Instant::now());
+            // wgbooster uses a delay-AFTER model: the imitation sequence has no
+            // trailing sleep, and send_random_packets() emits its first packet
+            // immediately. So once the imitation queue is drained, clear
+            // last_packet_at to make the first Jc junk packet (or the handshake,
+            // when Jc=0) due immediately rather than waiting one extra Jd. While
+            // datagrams remain, time the next one's delay from now.
+            pending.last_packet_at = if pending.imitation_datagrams.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
             dst[..size].copy_from_slice(&datagram);
             return TunnResult::WriteToNetwork(&mut dst[..size]);
         }
@@ -1433,6 +1443,32 @@ mod tests {
         }
         // 2 STUN imitation packets + 2 Jc junk packets, then the initiation.
         assert_eq!(datagrams, 4);
+    }
+
+    #[test]
+    fn amnezia_first_jc_packet_is_immediate_after_imitation_with_jd() {
+        // wgbooster's delay-after model: the first send_random_packets() packet
+        // is emitted immediately after the imitation sequence (no leading Jd),
+        // and Jd only spaces the subsequent Jc packets.
+        let amnezia = AmneziaConfig::new(0, 0, 0, 0)
+            .with_pre_handshake_junk(2, 28, 100, 150) // Jc=2, Jd=150ms
+            .with_protocol_imitation(amnezia::AmneziaImitationProtocol::Stun, None);
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = vec![0u8; 2048];
+
+        // Drain the two STUN imitation packets (second after its 15 ms delay).
+        let s1 = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+        assert_eq!(&s1[0..2], &[0x00, 0x01], "STUN Binding Request");
+        std::thread::sleep(Duration::from_millis(20));
+        let s2 = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert_eq!(&s2[0..2], &[0x00, 0x01]);
+
+        // The first Jc packet must be due *immediately* — no extra Jd wait.
+        let j1 = unwrap_network_packet(my_tun.update_timers(&mut dst));
+        assert!((28..=100).contains(&j1.len()), "STUN-shaped Jc junk");
+
+        // The second Jc packet, however, must wait Jd: an immediate poll is Done.
+        assert!(matches!(my_tun.update_timers(&mut dst), TunnResult::Done));
     }
 
     #[test]
