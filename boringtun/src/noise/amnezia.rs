@@ -300,9 +300,18 @@ impl AmneziaConfig {
     /// at the configuration. Callers accepting operator input should reject it
     /// at the point of entry instead.
     ///
-    /// The bounds mirror the kernel module's own validation
-    /// (`amneziawg-linux-kernel-module/src/device.c:584-601`), so a
-    /// configuration accepted here is accepted there and vice versa.
+    /// The bounds correspond to the kernel module's own validation
+    /// (`amneziawg-linux-kernel-module/src/device.c:584-601`), but are 28 bytes
+    /// stricter: the kernel bounds by the protocol ceiling
+    /// (`MESSAGE_MAX_SIZE = 65535`) while this uses `MAX_SENDABLE_DATAGRAM`,
+    /// what a UDP socket can actually carry.
+    ///
+    /// The relationship is therefore one-way, not symmetric: every
+    /// configuration that *functions* on the kernel module is accepted here,
+    /// but a configuration landing in the 28-byte gap is accepted by the kernel
+    /// and rejected here. Nothing is lost — such a configuration fails on the
+    /// kernel too, at send time with `EMSGSIZE`, so it never worked there
+    /// either. See `MAX_SENDABLE_DATAGRAM` for the arithmetic.
     pub fn validate(&self) -> Result<(), String> {
         for (label, junk, base) in [
             ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
@@ -332,7 +341,7 @@ impl AmneziaConfig {
     ///
     /// Everything else is preserved, including the imitation protocol itself:
     /// S1-S4 padding is still filled with protocol-shaped bytes
-    /// ([`Self::fill_outbound_junk`]), so the server's own traffic keeps the
+    /// (`fill_outbound_junk`), so the server's own traffic keeps the
     /// same byte distribution as the client's. Only the *standalone* datagrams
     /// are suppressed.
     pub fn as_responder(mut self) -> Self {
@@ -1349,8 +1358,9 @@ mod tests {
 
     #[test]
     fn validate_accepts_sizes_that_fit_and_rejects_those_that_cannot() {
-        // Bounds mirror the kernel module: junk + base packet must fit in one
-        // 65535-byte datagram.
+        // Junk + base packet must fit in one sendable UDP datagram
+        // (MAX_SENDABLE_DATAGRAM = 65507, the IPv4 payload limit) -- not the
+        // 65535 protocol ceiling the kernel module bounds by.
         assert!(AmneziaConfig::new(0, 0, 0, 0).validate().is_ok());
         assert!(AmneziaConfig::new(1000, 1000, 1000, 1000)
             .validate()
