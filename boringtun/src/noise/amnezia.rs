@@ -478,24 +478,18 @@ impl AmneziaConfig {
             return packet;
         }
 
-        // Prefer the configured S4 offset before the plain offset-0 fallback.
-        // S4 junk can itself start with a value inside H4; checking offset 0
-        // first would leave valid padded transport packets unstripped.
-        if packet.len() >= junk_size + DATA_OVERHEAD_SZ {
-            if Self::read_tag(packet, junk_size)
-                .map(|tag| Self::tag_matches(obf, PacketKind::TransportData, tag))
-                .unwrap_or(false)
-            {
-                return &packet[junk_size..];
-            }
-        }
-
-        if packet.len() >= DATA_OVERHEAD_SZ
-            && Self::read_tag(packet, 0)
+        // Strip at the configured S4 offset. There is deliberately no offset-0
+        // retry: with S4 configured a conforming peer always pads, so an
+        // unpadded datagram is not ours, and the kernel drops it rather than
+        // reparsing (`amneziawg-linux-kernel-module/src/receive.c`
+        // `prepare_awg_message`). Returning the packet unchanged has the same
+        // effect here, since the caller's tag check then rejects it.
+        if packet.len() >= junk_size + DATA_OVERHEAD_SZ
+            && Self::read_tag(packet, junk_size)
                 .map(|tag| Self::tag_matches(obf, PacketKind::TransportData, tag))
                 .unwrap_or(false)
         {
-            return packet;
+            return &packet[junk_size..];
         }
 
         packet
