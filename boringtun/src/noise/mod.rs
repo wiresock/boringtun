@@ -556,7 +556,7 @@ impl Tunn {
             self.timers.clear();
         }
 
-        if self.amnezia.pre_handshake_junk.is_enabled() || self.amnezia.has_imitation_sequence() {
+        if self.amnezia.emits_pre_handshake() {
             let imitation_datagrams = self
                 .amnezia
                 .pre_handshake_imitation_datagrams(&mut self.handshake.rng);
@@ -1284,6 +1284,34 @@ mod tests {
             u32::from_le_bytes(init[5..9].try_into().unwrap()),
             HANDSHAKE_INIT
         );
+    }
+
+    #[test]
+    fn amnezia_responder_skips_pre_handshake_but_keeps_padding() {
+        // Same configuration as the test above, but adapted for a responder:
+        // the initiation must come out immediately, with no junk datagrams
+        // ahead of it, while S1 padding is still applied.
+        let amnezia = AmneziaConfig::new(5, 0, 0, 0)
+            .with_pre_handshake_junk(2, 10, 20, 0)
+            .with_protocol_imitation(crate::noise::amnezia::AmneziaImitationProtocol::Quic, None)
+            .as_responder();
+        let (mut my_tun, _their_tun) = create_two_tuns_with_amnezia(amnezia);
+        let mut dst = vec![0u8; 2048];
+
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
+
+        assert_eq!(
+            init.len(),
+            HANDSHAKE_INIT_SZ + 5,
+            "a responder emits the initiation directly, still S1-padded"
+        );
+        assert_eq!(
+            u32::from_le_bytes(init[5..9].try_into().unwrap()),
+            HANDSHAKE_INIT
+        );
+        // The imitation protocol is retained, so the padding is still
+        // protocol-shaped rather than random: QUIC uses a 1-RTT short header.
+        assert_eq!(init[0] & 0xc0, 0x40, "S1 padding keeps its QUIC shape");
     }
 
     #[test]

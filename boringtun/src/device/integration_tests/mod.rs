@@ -266,6 +266,8 @@ mod tests {
                     use_multi_queue: true,
                     #[cfg(target_os = "linux")]
                     uapi_fd: -1,
+                    obf: Default::default(),
+                    amnezia: Default::default(),
                 },
             )
         }
@@ -558,6 +560,8 @@ mod tests {
                 use_multi_queue: true,
                 #[cfg(target_os = "linux")]
                 uapi_fd: -1,
+                obf: Default::default(),
+                amnezia: Default::default(),
             },
         );
 
@@ -716,6 +720,8 @@ mod tests {
                 use_multi_queue: true,
                 #[cfg(target_os = "linux")]
                 uapi_fd: -1,
+                obf: Default::default(),
+                amnezia: Default::default(),
             },
         );
 

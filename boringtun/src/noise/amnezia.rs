@@ -152,6 +152,10 @@ pub struct AmneziaConfig {
     pub(crate) transport_packet_junk_size: u16,
     pub(crate) pre_handshake_junk: AmneziaPreHandshakeJunk,
     pub(crate) imitation: AmneziaImitation,
+    /// Suppress the client-only pre-handshake burst (Jc junk packets and the
+    /// protocol imitation sequence) while keeping every other AmneziaWG
+    /// behaviour. See [`AmneziaConfig::as_responder`].
+    pub(crate) suppress_pre_handshake: bool,
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -236,6 +240,7 @@ impl AmneziaConfig {
             transport_packet_junk_size: s4,
             pre_handshake_junk: AmneziaPreHandshakeJunk::default(),
             imitation: AmneziaImitation::default(),
+            suppress_pre_handshake: false,
         }
     }
 
@@ -271,11 +276,38 @@ impl AmneziaConfig {
         self
     }
 
+    /// Adapt this configuration for the responder (server) side of a tunnel.
+    ///
+    /// A server must *tolerate* a client's pre-handshake camouflage but must
+    /// never emit it: the Jc junk burst and the protocol imitation sequence are
+    /// things a client sends to open a conversation. Emitting them from a
+    /// responder is both directionally wrong — it looks like the server is
+    /// opening a QUIC/DNS/SIP/STUN exchange with its own peer — and slow, since
+    /// the queue drains one datagram per `update_timers` tick, delaying any
+    /// server-initiated handshake by the length of the sequence.
+    ///
+    /// Everything else is preserved, including the imitation protocol itself:
+    /// S1-S4 padding is still filled with protocol-shaped bytes
+    /// ([`Self::fill_outbound_junk`]), so the server's own traffic keeps the
+    /// same byte distribution as the client's. Only the *standalone* datagrams
+    /// are suppressed.
+    pub fn as_responder(mut self) -> Self {
+        self.suppress_pre_handshake = true;
+        self
+    }
+
     /// True when a full protocol-natural imitation sequence should be emitted
     /// for the pre-handshake phase. DNS/SIP/STUN/QUIC all qualify (QUIC's omitted
     /// browser defaults to curl, matching wgbooster); only `None` does not.
     pub(crate) fn has_imitation_sequence(&self) -> bool {
         self.imitation.protocol != AmneziaImitationProtocol::None
+    }
+
+    /// True when this endpoint should emit a pre-handshake burst at all —
+    /// false for a responder, and for a client with neither Jc nor imitation.
+    pub(crate) fn emits_pre_handshake(&self) -> bool {
+        !self.suppress_pre_handshake
+            && (self.pre_handshake_junk.is_enabled() || self.has_imitation_sequence())
     }
 
     /// The configured imitation host, or a generated random one (DNS query name
