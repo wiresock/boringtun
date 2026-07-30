@@ -317,6 +317,65 @@ impl Device {
         }
     }
 
+    /// Apply an update to a peer that already exists, in place.
+    ///
+    /// Each field is only touched when the caller supplied it, so a reload that
+    /// re-sends unchanged values is inert. That matters because the underlying
+    /// setters are not all free: changing the pre-shared key discards live
+    /// sessions.
+    fn merge_peer(
+        &mut self,
+        peer: &Arc<Mutex<Peer>>,
+        replace_ips: bool,
+        endpoint: Option<SocketAddr>,
+        allowed_ips: &[AllowedIP],
+        keepalive: Option<u16>,
+        preshared_key: Option<[u8; 32]>,
+    ) {
+        {
+            let mut p = peer.lock();
+
+            if let Some(addr) = endpoint {
+                p.set_endpoint(addr);
+            }
+            if keepalive.is_some() {
+                p.set_persistent_keepalive(keepalive);
+            }
+            if preshared_key.is_some() {
+                p.set_preshared_key(preshared_key);
+            }
+        }
+
+        // `replace_allowed_ips=true` means "these prefixes are now the whole
+        // set"; without it the new prefixes are additive. Either way the stale
+        // global index entries have to go first, or a prefix that was just
+        // dropped keeps routing here.
+        if replace_ips {
+            self.peers_by_ip
+                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(peer, p));
+            peer.lock().set_allowed_ips(allowed_ips);
+        } else if !allowed_ips.is_empty() {
+            let mut merged: Vec<AllowedIP> = peer
+                .lock()
+                .allowed_ips()
+                .map(|(addr, cidr)| AllowedIP { addr, cidr })
+                .collect();
+            merged.extend_from_slice(allowed_ips);
+            self.peers_by_ip
+                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(peer, p));
+            peer.lock().set_allowed_ips(&merged);
+        }
+
+        if replace_ips || !allowed_ips.is_empty() {
+            let prefixes: Vec<(IpAddr, u8)> = peer.lock().allowed_ips().collect();
+            for (addr, cidr) in prefixes {
+                self.peers_by_ip.insert(addr, cidr as _, Arc::clone(peer));
+            }
+        }
+
+        tracing::info!("Peer updated");
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn update_peer(
         &mut self,
@@ -333,10 +392,22 @@ impl Device {
             return self.remove_peer(&pub_key);
         }
 
-        // Update an existing peer
-        if self.peers.get(&pub_key).is_some() {
-            // We already have a peer, we need to merge the existing config into the newly created one
-            panic!("Modifying existing peers is not yet supported. Remove and add again instead.");
+        // Merge into an existing peer rather than rejecting the update.
+        //
+        // This path is not exotic: `awg syncconf` re-sends every peer's full
+        // block on each configuration reload, so the installer hits it on every
+        // client add and revoke. Aborting here would take the daemon down during
+        // routine peer management.
+        if let Some(peer) = self.peers.get(&pub_key).cloned() {
+            self.merge_peer(
+                &peer,
+                _replace_ips,
+                endpoint,
+                allowed_ips,
+                keepalive,
+                preshared_key,
+            );
+            return;
         }
 
         let next_index = self.next_index();
@@ -630,7 +701,13 @@ impl Device {
                                 }
                             };
                         }
-                        _ => panic!("Unexpected result from update_timers"),
+                        // update_timers only yields Done/Err/WriteToNetwork, but
+                        // this runs on a 250 ms tick for every peer: an
+                        // unexpected variant must not take the daemon down.
+                        other => tracing::error!(
+                            message = "Unexpected result from update_timers",
+                            result = ?other
+                        ),
                     };
                 }
                 Action::Continue
@@ -913,7 +990,12 @@ impl Device {
                                 tracing::error!("No endpoint");
                             }
                         }
-                        _ => panic!("Unexpected result from encapsulate"),
+                        // Per-packet path: drop the packet rather than aborting
+                        // the whole daemon on an unexpected variant.
+                        other => tracing::error!(
+                            message = "Unexpected result from encapsulate",
+                            result = ?other
+                        ),
                     };
                 }
                 Action::Continue

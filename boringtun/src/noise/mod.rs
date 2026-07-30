@@ -334,6 +334,40 @@ impl Tunn {
         self.pending_amnezia_junk = None;
     }
 
+    /// Update the persistent-keepalive interval.
+    ///
+    /// Purely a timer change, so live sessions are kept: the peer's keys are
+    /// unaffected and re-handshaking would be gratuitous.
+    pub fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
+        self.timers.set_persistent_keepalive(keepalive);
+    }
+
+    /// The peer's optional pre-shared key.
+    pub fn preshared_key(&self) -> Option<[u8; 32]> {
+        self.handshake.preshared_key()
+    }
+
+    /// Replace the peer's optional pre-shared key.
+    ///
+    /// Unlike the keepalive, this **discards every established session**. The
+    /// pre-shared key is mixed into the handshake, so sessions derived under the
+    /// old value are cryptographically stale; keeping them would leave the peer
+    /// authenticated by a key the operator has just revoked. This mirrors what
+    /// [`Self::set_static_private`] does for the static key.
+    ///
+    /// No-op when the key is unchanged, so a configuration reload that re-sends
+    /// the same value does not tear down live tunnels.
+    pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        if self.handshake.preshared_key() == preshared_key {
+            return;
+        }
+        self.handshake.set_preshared_key(preshared_key);
+        for s in &mut self.sessions {
+            *s = None;
+        }
+        self.pending_amnezia_junk = None;
+    }
+
     /// Encapsulate a single packet from the tunnel interface.
     /// Returns TunnResult.
     ///
@@ -1283,6 +1317,53 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(init[5..9].try_into().unwrap()),
             HANDSHAKE_INIT
+        );
+    }
+
+    #[test]
+    fn set_persistent_keepalive_updates_interval_without_dropping_sessions() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "session exists"
+        );
+
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(my_tun.persistent_keepalive(), Some(25));
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "a keepalive change is a timer change; sessions must survive"
+        );
+
+        // None disables it, matching how Timers::new reads the same argument.
+        my_tun.set_persistent_keepalive(None);
+        assert_eq!(my_tun.persistent_keepalive(), None);
+    }
+
+    #[test]
+    fn set_preshared_key_discards_sessions_only_when_it_actually_changes() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "session exists"
+        );
+
+        // Re-applying the same value must not disturb live tunnels -- a config
+        // reload re-sends every peer's block unchanged.
+        let current = my_tun.preshared_key();
+        my_tun.set_preshared_key(current);
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "unchanged key must not tear down sessions"
+        );
+
+        // A real change invalidates them: sessions derived under the old key are
+        // cryptographically stale.
+        my_tun.set_preshared_key(Some([7u8; 32]));
+        assert_eq!(my_tun.preshared_key(), Some([7u8; 32]));
+        assert!(
+            my_tun.sessions.iter().all(|s| s.is_none()),
+            "changed key must discard every session"
         );
     }
 

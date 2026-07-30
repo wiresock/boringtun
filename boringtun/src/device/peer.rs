@@ -144,6 +144,27 @@ impl Peer {
         Ok(udp_conn)
     }
 
+    /// Replace this peer's allowed-IP set.
+    ///
+    /// Only updates the peer's own trie. The device keeps a second, global
+    /// `peers_by_ip` index used for routing, and the caller must remove this
+    /// peer's stale entries there first — otherwise a prefix that was just
+    /// removed still routes to this peer.
+    pub(crate) fn set_allowed_ips(&mut self, allowed_ips: &[AllowedIP]) {
+        self.allowed_ips = allowed_ips.iter().map(|ip| (ip, ())).collect();
+    }
+
+    /// Replace this peer's pre-shared key, discarding sessions if it changed.
+    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        self.preshared_key = preshared_key;
+        self.tunnel.set_preshared_key(preshared_key);
+    }
+
+    /// Replace this peer's persistent-keepalive interval, keeping sessions.
+    pub(crate) fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
+        self.tunnel.set_persistent_keepalive(keepalive);
+    }
+
     pub fn is_allowed_ip<I: Into<IpAddr>>(&self, addr: I) -> bool {
         self.allowed_ips.find(addr.into()).is_some()
     }

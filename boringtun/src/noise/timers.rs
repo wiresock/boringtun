@@ -339,3 +339,11 @@ impl Tunn {
         }
     }
 }
+
+impl Timers {
+    /// Replace the persistent-keepalive interval. `None` (or zero) disables it,
+    /// matching how [`Timers::new`] interprets the same argument.
+    pub(super) fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
+        self.persistent_keepalive = usize::from(keepalive.unwrap_or(0));
+    }
+}
