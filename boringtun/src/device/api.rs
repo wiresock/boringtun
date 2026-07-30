@@ -5,7 +5,6 @@ use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
-use crate::noise::amnezia::AmneziaConfig;
 use crate::noise::handshake::ObfuscationRanges;
 use crate::serialization::KeyBytes;
 use crate::x25519;
@@ -388,7 +387,12 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                     }
                 }
                 {
-                    let parsed_cmd: Vec<&str> = cmd.split('=').collect();
+                    // Split on the *first* `=` only. Values may legitimately
+                    // contain one: `KeyBytes` accepts base64 as well as hex, and
+                    // a base64-encoded 32-byte key is 44 characters ending in
+                    // `=` padding, which `split('=')` would turn into three
+                    // fields and reject as EPROTO.
+                    let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
                     if parsed_cmd.len() != 2 {
                         return EPROTO;
                     }
@@ -581,6 +585,27 @@ mod tests {
             parse_tag_range(&u32::MAX.to_string()),
             Some((u32::MAX, u32::MAX))
         );
+    }
+
+    #[test]
+    fn uapi_line_split_keeps_padding_in_base64_values() {
+        // A base64-encoded 32-byte key is 44 chars ending in `=` padding.
+        // Splitting on every `=` yields three fields and is rejected as EPROTO,
+        // even though KeyBytes documents base64 as an accepted form.
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let line = format!("private_key={}", key);
+
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        assert_eq!(parts.len(), 2, "must split into exactly key and value");
+        assert_eq!(parts[0], "private_key");
+        assert_eq!(parts[1], key, "padding must survive intact");
+        assert!(
+            parts[1].parse::<KeyBytes>().is_ok(),
+            "value must still parse"
+        );
+
+        // A line with no separator is still rejected.
+        assert_eq!("no_separator".splitn(2, '=').count(), 1);
     }
 
     #[test]

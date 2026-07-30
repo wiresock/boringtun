@@ -177,6 +177,10 @@ fn main() {
         use_connected_socket: !matches.get_flag("disable-connected-udp"),
         #[cfg(target_os = "linux")]
         use_multi_queue: !matches.get_flag("disable-multi-queue"),
+        // AmneziaWG parameters arrive over the UAPI (`awg setconf`), not the
+        // command line, so the device starts as plain WireGuard. `..default()`
+        // rather than naming them, so future fields do not break this build.
+        ..Default::default()
     };
 
     let mut device_handle: DeviceHandle = match DeviceHandle::new(tun_name, config) {
