@@ -17,9 +17,19 @@ const DEFAULT_JUNK_PACKET_SIZE_MAX: u16 = 1000;
 const MAX_JUNK_PACKET_COUNT: u16 = 128;
 const MAX_JUNK_PACKET_SIZE: u16 = 1280;
 const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
-/// Largest datagram the protocol can carry — the kernel module's
-/// `MESSAGE_MAX_SIZE` (`amneziawg-linux-kernel-module/src/messages.h:132`).
-const MESSAGE_MAX_SIZE: usize = 65535;
+/// Largest datagram that can actually be sent: the IPv4 UDP payload limit,
+/// `65535 - 20 (IP header) - 8 (UDP header)`. IPv6 allows 27 bytes more, but the
+/// stricter bound is used so a configuration validated once is sendable over
+/// either family — a device may be listening on both.
+///
+/// The kernel module bounds the same sizes by `MESSAGE_MAX_SIZE = 65535`
+/// (`amneziawg-linux-kernel-module/src/messages.h:132`), which is the protocol
+/// ceiling rather than the transport one. The 28-byte difference is deliberate:
+/// a configuration in that window passes the kernel's check and then fails at
+/// send time with `EMSGSIZE`, so it does not work there either. Rejecting it up
+/// front is not a parity break — every configuration that *functions* on the
+/// kernel module is still accepted here.
+const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 const DNS_JUNK_SIZE_MIN: usize = 50;
 const DNS_JUNK_SIZE_MAX: usize = 200;
 const QUIC_JUNK_SIZE_MIN: usize = 1200;
@@ -300,10 +310,10 @@ impl AmneziaConfig {
             ("S3", self.cookie_packet_junk_size, COOKIE_REPLY_SZ),
             ("S4", self.transport_packet_junk_size, DATA_OVERHEAD_SZ),
         ] {
-            if junk as usize + base > MESSAGE_MAX_SIZE {
+            if junk as usize + base > MAX_SENDABLE_DATAGRAM {
                 return Err(format!(
                     "{} is too large: {} junk bytes + {} packet bytes exceed the {}-byte maximum datagram",
-                    label, junk, base, MESSAGE_MAX_SIZE
+                    label, junk, base, MAX_SENDABLE_DATAGRAM
                 ));
             }
         }
@@ -1347,10 +1357,10 @@ mod tests {
             .is_ok());
 
         // Exactly at the limit for each packet type.
-        let max_s1 = (MESSAGE_MAX_SIZE - HANDSHAKE_INIT_SZ) as u16;
-        let max_s2 = (MESSAGE_MAX_SIZE - HANDSHAKE_RESP_SZ) as u16;
-        let max_s3 = (MESSAGE_MAX_SIZE - COOKIE_REPLY_SZ) as u16;
-        let max_s4 = (MESSAGE_MAX_SIZE - DATA_OVERHEAD_SZ) as u16;
+        let max_s1 = (MAX_SENDABLE_DATAGRAM - HANDSHAKE_INIT_SZ) as u16;
+        let max_s2 = (MAX_SENDABLE_DATAGRAM - HANDSHAKE_RESP_SZ) as u16;
+        let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
+        let max_s4 = (MAX_SENDABLE_DATAGRAM - DATA_OVERHEAD_SZ) as u16;
         assert!(AmneziaConfig::new(max_s1, max_s2, max_s3, max_s4)
             .validate()
             .is_ok());
@@ -1368,22 +1378,55 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_sizes_that_fit_the_protocol_but_not_a_udp_datagram() {
+        // The protocol ceiling is 65535, but an IPv4 UDP payload tops out at
+        // 65535 - 20 - 8 = 65507. Sizes in between pass the kernel module's
+        // check and then fail at send time with EMSGSIZE, so they must be
+        // rejected here rather than accepted into a tunnel that never works.
+        const PROTOCOL_MAX: usize = 65535;
+        assert_eq!(MAX_SENDABLE_DATAGRAM, 65507);
+
+        // For each field: the size the protocol ceiling alone would allow.
+        let cases = [
+            ("S1", HANDSHAKE_INIT_SZ, 0usize),
+            ("S2", HANDSHAKE_RESP_SZ, 1),
+            ("S3", COOKIE_REPLY_SZ, 2),
+            ("S4", DATA_OVERHEAD_SZ, 3),
+        ];
+
+        for (label, base, slot) in cases {
+            let over = (PROTOCOL_MAX - base) as u16;
+            let mut s = [0u16; 4];
+            s[slot] = over;
+            let cfg = AmneziaConfig::new(s[0], s[1], s[2], s[3]);
+
+            let err = cfg.validate().expect_err(&format!(
+                "{}={} yields a {}-byte datagram, unsendable over IPv4",
+                label,
+                over,
+                over as usize + base
+            ));
+            assert!(err.contains(label), "error should name {}: {}", label, err);
+        }
+    }
+
+    #[test]
     fn validated_max_size_actually_round_trips_through_prepend_outbound() {
         // The bound is only meaningful if the largest accepted configuration can
         // still emit a packet -- otherwise validate() would be off by one.
         let obf = ObfuscationRanges::default();
         let mut rng = ChaCha8Rng::seed_from_u64(11);
-        let max_s1 = (MESSAGE_MAX_SIZE - HANDSHAKE_INIT_SZ) as u16;
+        let max_s1 = (MAX_SENDABLE_DATAGRAM - HANDSHAKE_INIT_SZ) as u16;
         let cfg = AmneziaConfig::new(max_s1, 0, 0, 0);
         cfg.validate().unwrap();
 
-        let mut buffer = vec![0u8; MESSAGE_MAX_SIZE];
+        let mut buffer = vec![0u8; MAX_SENDABLE_DATAGRAM];
         write_tag(&mut buffer, HANDSHAKE_INIT);
 
         let packet = cfg
             .prepend_outbound(obf, &mut buffer, HANDSHAKE_INIT_SZ, &mut rng)
             .expect("largest validated S1 must still fit");
-        assert_eq!(packet.len(), MESSAGE_MAX_SIZE);
+        assert_eq!(packet.len(), MAX_SENDABLE_DATAGRAM);
     }
 
     #[test]
