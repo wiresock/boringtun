@@ -661,6 +661,12 @@ impl Handshake {
         self.params.set_static_private(private_key, public_key)
     }
 
+    /// Replace the message-type tag ranges. Purely a framing change — no key or
+    /// Noise state is affected.
+    pub(crate) fn set_obfuscation(&mut self, obf: ObfuscationRanges) {
+        self.obf = obf;
+    }
+
     pub(crate) fn preshared_key(&self) -> Option<[u8; KEY_LEN]> {
         self.params.preshared_key
     }

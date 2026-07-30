@@ -334,6 +334,24 @@ impl Tunn {
         self.pending_amnezia_junk = None;
     }
 
+    /// Replace this tunnel's AmneziaWG obfuscation settings.
+    ///
+    /// H1-H4 and S1-S4 are interface-wide in AmneziaWG, so when the device's
+    /// settings change every peer must follow: a peer left on the old values
+    /// tags and pads its packets differently from the interface that has to
+    /// parse them, and the tunnel dies silently and permanently.
+    ///
+    /// Live sessions are kept. Obfuscation is a framing concern, not a
+    /// cryptographic one — the keys and the Noise state are untouched, so
+    /// forcing a re-handshake would drop traffic for no benefit. Any queued
+    /// pre-handshake junk is dropped, since it was generated under the previous
+    /// configuration.
+    pub fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
+        self.handshake.set_obfuscation(obf);
+        self.amnezia = amnezia;
+        self.pending_amnezia_junk = None;
+    }
+
     /// Update the persistent-keepalive interval.
     ///
     /// Purely a timer change, so live sessions are kept: the peer's keys are
@@ -1318,6 +1336,36 @@ mod tests {
             u32::from_le_bytes(init[5..9].try_into().unwrap()),
             HANDSHAKE_INIT
         );
+    }
+
+    #[test]
+    fn set_obfuscation_reframes_without_dropping_sessions() {
+        // H/S are interface-wide, so a live change has to reach every peer or
+        // the peer frames packets the interface can no longer parse. It is a
+        // framing change, not a cryptographic one, so sessions must survive.
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "session exists"
+        );
+
+        let new_obf = ObfuscationRanges::new(10, 20, 30, 40, 50, 60, 70, 80).unwrap();
+        let new_amnezia = AmneziaConfig::new(3, 5, 7, 9);
+        my_tun.set_obfuscation(new_obf, new_amnezia.clone());
+
+        assert_eq!(my_tun.handshake.obf, new_obf, "tag ranges updated");
+        assert_eq!(my_tun.amnezia, new_amnezia, "junk sizes updated");
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "reframing must not tear down established sessions"
+        );
+
+        // A handshake initiation now carries the new H1 tag and S1 prefix.
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ + 3, "S1 = 3 applied");
+        let tag = u32::from_le_bytes(init[3..7].try_into().unwrap());
+        assert!((10..=20).contains(&tag), "H1 in new range, got {}", tag);
     }
 
     #[test]
