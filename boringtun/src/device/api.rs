@@ -128,6 +128,14 @@ impl AwgParams {
             cur_junk.packet_delay_ms,
         );
 
+        // Reject sizes that could never emit a valid datagram, before anything
+        // is committed. Without this, an oversized S value is accepted here and
+        // only shows up later as a tunnel that never completes a handshake.
+        if let Err(e) = amnezia.validate() {
+            tracing::error!(message = "rejecting AmneziaWG parameters", error = %e);
+            return Err(EINVAL);
+        }
+
         if device.set_obfuscation(obf, amnezia) {
             tracing::info!(message = "AmneziaWG parameters updated");
         }
