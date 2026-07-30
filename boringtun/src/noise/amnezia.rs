@@ -456,7 +456,7 @@ impl AmneziaConfig {
         }
 
         buffer.copy_within(0..packet_size, junk_size);
-        self.fill_outbound_junk(kind, &mut buffer[..junk_size], packet_size, rng);
+        self.fill_outbound_junk(&mut buffer[..junk_size], packet_size, rng);
         Ok(&mut buffer[..new_size])
     }
 
@@ -508,23 +508,12 @@ impl AmneziaConfig {
         }
     }
 
-    fn fill_outbound_junk(
-        &self,
-        kind: PacketKind,
-        dst: &mut [u8],
-        trailing_size: usize,
-        rng: &mut impl RngCore,
-    ) {
+    fn fill_outbound_junk(&self, dst: &mut [u8], trailing_size: usize, rng: &mut impl RngCore) {
         match self.imitation.protocol {
             AmneziaImitationProtocol::None => fill_random(dst, rng),
-            protocol => fill_protocol_like(
-                protocol,
-                self.imitation.domain(),
-                kind,
-                dst,
-                trailing_size,
-                rng,
-            ),
+            protocol => {
+                fill_protocol_like(protocol, self.imitation.domain(), dst, trailing_size, rng)
+            }
         }
     }
 }
@@ -561,7 +550,6 @@ fn random_usize_inclusive(min: usize, max: usize, rng: &mut impl RngCore) -> usi
 fn fill_protocol_like(
     protocol: AmneziaImitationProtocol,
     domain: Option<&str>,
-    kind: PacketKind,
     dst: &mut [u8],
     trailing_size: usize,
     rng: &mut impl RngCore,
@@ -569,13 +557,21 @@ fn fill_protocol_like(
     match protocol {
         AmneziaImitationProtocol::None => fill_random(dst, rng),
         AmneziaImitationProtocol::Dns => fill_dns(dst, trailing_size, domain, rng),
-        AmneziaImitationProtocol::Quic => {
-            if matches!(kind, PacketKind::HandshakeInit | PacketKind::TransportData) {
-                fill_quic_short(dst, rng);
-            } else {
-                fill_quic_initial(dst, rng);
-            }
-        }
+        // Always a 1-RTT short header, for every packet kind. A long header
+        // carries a length field that would have to frame the bytes that
+        // follow -- but those are the immutable WireGuard packet, which this
+        // prefix cannot describe, so any long-header form parses as malformed.
+        // A short header has no version or length field, so the remaining
+        // bytes are indistinguishable from encrypted 1-RTT payload.
+        //
+        // The S-region is also far too small for a valid Initial: S2 + 92 and
+        // S3 + 64 are nowhere near the 1200-byte minimum of RFC 9000 §14.1
+        // (contrast `pre_handshake_junk_size`, where the QUIC branch picks
+        // QUIC_JUNK_SIZE_MIN..=MAX = 1200..=1252 precisely so that a
+        // long-header Initial is legal). And S2/S3 travel responder -> peer,
+        // so emitting an Initial there inverts the direction of a real QUIC
+        // handshake, where the Initial is the client's first packet.
+        AmneziaImitationProtocol::Quic => fill_quic_short(dst, rng),
         AmneziaImitationProtocol::Sip => fill_sip(dst, domain, rng),
         AmneziaImitationProtocol::Stun => fill_stun(dst, rng),
     }
@@ -1276,31 +1272,60 @@ mod tests {
     }
 
     #[test]
-    fn quic_imitation_uses_short_header_for_s1_and_s4() {
+    fn quic_imitation_uses_short_header_for_every_packet_kind() {
         let cfg = AmneziaConfig::new(8, 9, 10, 11)
             .with_protocol_imitation(AmneziaImitationProtocol::Quic, None);
 
-        let init = packet_after_prepend(
-            &cfg,
-            HANDSHAKE_INIT_SZ,
-            HANDSHAKE_INIT,
-            HANDSHAKE_INIT_SZ + 32,
-        );
-        assert_eq!(init[0] & 0xc0, 0x40);
-        assert_eq!(&init[8..12], &HANDSHAKE_INIT.to_le_bytes());
+        // Every S-region is a 1-RTT short header: form bit clear, fixed bit
+        // set. A long header would carry a length field that cannot frame the
+        // WireGuard packet that follows, and S2/S3 are far below the 1200-byte
+        // minimum a valid Initial requires (RFC 9000 §14.1).
+        let cases = [
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ, 8usize),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ, 9),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ, 10),
+            (DATA, DATA_OVERHEAD_SZ + 4, 11),
+        ];
 
-        let data = packet_after_prepend(&cfg, DATA_OVERHEAD_SZ + 4, DATA, DATA_OVERHEAD_SZ + 64);
-        assert_eq!(data[0] & 0xc0, 0x40);
-        assert_eq!(&data[11..15], &DATA.to_le_bytes());
+        for (tag, packet_size, junk_size) in cases {
+            let packet = packet_after_prepend(&cfg, packet_size, tag, packet_size + 64);
 
-        let response = packet_after_prepend(
-            &cfg,
-            HANDSHAKE_RESP_SZ,
-            HANDSHAKE_RESP,
-            HANDSHAKE_RESP_SZ + 32,
+            assert_eq!(
+                packet[0] & 0xc0,
+                0x40,
+                "tag={:#x} must use a 1-RTT short header, got first byte {:#04x}",
+                tag,
+                packet[0]
+            );
+            assert_eq!(
+                &packet[junk_size..junk_size + 4],
+                &tag.to_le_bytes(),
+                "tag={:#x} payload must start right after the junk prefix",
+                tag
+            );
+        }
+    }
+
+    #[test]
+    fn quic_pre_handshake_junk_keeps_long_header_initial_at_rfc_minimum_size() {
+        // The Jc path is the one place a long-header Initial is legal: it is a
+        // standalone client->server datagram and its size is drawn from
+        // QUIC_JUNK_SIZE_MIN..=MAX, which starts at the RFC 9000 §14.1 minimum.
+        let cfg = AmneziaConfig::new(0, 0, 0, 0)
+            .with_pre_handshake_junk(1, 0, 0, 0)
+            .with_protocol_imitation(AmneziaImitationProtocol::Quic, None);
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut buffer = vec![0u8; QUIC_JUNK_SIZE_MAX];
+
+        let junk = cfg.fill_pre_handshake_junk(&mut buffer, &mut rng).unwrap();
+
+        assert!(
+            junk.len() >= 1200,
+            "a long-header Initial needs a >=1200 byte datagram, got {}",
+            junk.len()
         );
-        assert_eq!(response[0] & 0xc0, 0xc0);
-        assert_eq!(&response[1..5], &[0x00, 0x00, 0x00, 0x01]);
+        assert_eq!(junk[0] & 0xc0, 0xc0, "long header form + fixed bit");
+        assert_eq!(&junk[1..5], &[0x00, 0x00, 0x00, 0x01], "QUIC v1");
     }
 
     #[test]
