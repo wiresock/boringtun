@@ -1281,13 +1281,14 @@ mod tests {
         // WireGuard packet that follows, and S2/S3 are far below the 1200-byte
         // minimum a valid Initial requires (RFC 9000 §14.1).
         let cases = [
-            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ, 8usize),
-            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ, 9),
-            (COOKIE_REPLY, COOKIE_REPLY_SZ, 10),
-            (DATA, DATA_OVERHEAD_SZ + 4, 11),
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ),
+            (DATA, DATA_OVERHEAD_SZ + 4),
         ];
 
-        for (tag, packet_size, junk_size) in cases {
+        for (tag, packet_size) in cases {
+            let junk_size = expected_junk(&cfg, tag);
             let packet = packet_after_prepend(&cfg, packet_size, tag, packet_size + 64);
 
             assert_eq!(
@@ -1311,6 +1312,20 @@ mod tests {
         // The Jc path is the one place a long-header Initial is legal: it is a
         // standalone client->server datagram and its size is drawn from
         // QUIC_JUNK_SIZE_MIN..=MAX, which starts at the RFC 9000 §14.1 minimum.
+        // Deliberately an independent literal rather than QUIC_JUNK_SIZE_MIN:
+        // this is an external requirement imposed by the RFC, and the point of
+        // the test is that our constant satisfies it. Asserting against
+        // QUIC_JUNK_SIZE_MIN would be tautological, since the junk length is
+        // drawn from that very constant.
+        const RFC9000_MIN_INITIAL_DATAGRAM: usize = 1200;
+        assert!(
+            QUIC_JUNK_SIZE_MIN >= RFC9000_MIN_INITIAL_DATAGRAM,
+            "QUIC_JUNK_SIZE_MIN ({}) must not drop below the RFC 9000 §14.1 \
+             minimum ({}), or the Jc path emits invalid Initials",
+            QUIC_JUNK_SIZE_MIN,
+            RFC9000_MIN_INITIAL_DATAGRAM
+        );
+
         let cfg = AmneziaConfig::new(0, 0, 0, 0)
             .with_pre_handshake_junk(1, 0, 0, 0)
             .with_protocol_imitation(AmneziaImitationProtocol::Quic, None);
@@ -1320,8 +1335,9 @@ mod tests {
         let junk = cfg.fill_pre_handshake_junk(&mut buffer, &mut rng).unwrap();
 
         assert!(
-            junk.len() >= 1200,
-            "a long-header Initial needs a >=1200 byte datagram, got {}",
+            junk.len() >= RFC9000_MIN_INITIAL_DATAGRAM,
+            "a long-header Initial needs a >={} byte datagram, got {}",
+            RFC9000_MIN_INITIAL_DATAGRAM,
             junk.len()
         );
         assert_eq!(junk[0] & 0xc0, 0xc0, "long header form + fixed bit");
