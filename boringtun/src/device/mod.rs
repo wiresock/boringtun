@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
+use crate::noise::amnezia::AmneziaConfig;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::handshake::ObfuscationRanges;
@@ -107,7 +108,8 @@ pub struct DeviceHandle {
     threads: Vec<JoinHandle<()>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+// Not `Copy`: `amnezia` owns an optional imitation domain.
+#[derive(Debug, Clone)]
 pub struct DeviceConfig {
     pub n_threads: usize,
     pub use_connected_socket: bool,
@@ -115,6 +117,17 @@ pub struct DeviceConfig {
     pub use_multi_queue: bool,
     #[cfg(target_os = "linux")]
     pub uapi_fd: i32,
+    /// Interface-wide AmneziaWG H1-H4 message-type tag ranges.
+    ///
+    /// These are device-scoped rather than per-peer because ingress must
+    /// classify a datagram *before* it knows which peer sent it: the tag is
+    /// what the parse keys on, and the parse result is what finds the peer.
+    /// The default is the vanilla WireGuard message types.
+    pub obf: ObfuscationRanges,
+    /// Interface-wide AmneziaWG S1-S4 junk sizes and imitation settings. Jc and
+    /// the imitation sequence are client-only and are dropped when this is
+    /// handed to a peer; see [`AmneziaConfig::as_responder`].
+    pub amnezia: AmneziaConfig,
 }
 
 impl Default for DeviceConfig {
@@ -126,6 +139,10 @@ impl Default for DeviceConfig {
             use_multi_queue: true,
             #[cfg(target_os = "linux")]
             uapi_fd: -1,
+            // Vanilla WireGuard: no obfuscation, no junk. Exactly the behaviour
+            // before AmneziaWG support existed.
+            obf: ObfuscationRanges::default(),
+            amnezia: AmneziaConfig::default(),
         }
     }
 }
@@ -328,23 +345,30 @@ impl Device {
             .as_ref()
             .expect("Private key must be set first");
 
-        let tunn = Tunn::new(
+        // Read the obfuscation settings from the device rather than taking them
+        // as parameters: that is what guarantees every peer's copy stays
+        // byte-identical to the device's, which matters because the connected-
+        // socket path strips with the *per-peer* config while the anonymous
+        // path strips with the device's.
+        let obf = self.config.obf;
+        let tunn = Tunn::new_with_amnezia(
             device_key_pair.0.clone(),
             pub_key,
             preshared_key,
             keepalive,
             next_index,
             None,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
+            obf.h1_init.start,
+            obf.h1_init.end,
+            obf.h2_resp.start,
+            obf.h2_resp.end,
+            obf.h3_cookie.start,
+            obf.h3_cookie.end,
+            obf.h4_data.start,
+            obf.h4_data.end,
+            self.config.amnezia.clone().as_responder(),
         )
-        .expect("default obfuscation ranges must not conflict");
+        .expect("device obfuscation ranges were validated when they were set");
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 
@@ -485,6 +509,37 @@ impl Device {
         self.rate_limiter = Some(rate_limiter);
     }
 
+    /// Set the interface-wide AmneziaWG parameters.
+    ///
+    /// Returns `false` and changes nothing when the values already match. That
+    /// short-circuit is load-bearing rather than an optimisation: `awg syncconf`
+    /// re-sends the whole `[Interface]` block on every peer add or revoke, and
+    /// H/S changes invalidate all sessions, so applying unconditionally would
+    /// tear down every live tunnel on routine peer management. `set_key` above
+    /// short-circuits for the same reason.
+    fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) -> bool {
+        if self.config.obf == obf && self.config.amnezia == amnezia {
+            return false;
+        }
+
+        // Peers snapshot these values when their `Tunn` is built, so any peer
+        // that already exists keeps the previous settings. In practice
+        // `awg setconf` sends the interface block before any peer section, so
+        // this only bites on a live reconfiguration.
+        if !self.peers.is_empty() {
+            tracing::warn!(
+                message =
+                    "AmneziaWG parameters changed while peers exist; existing peers keep the \
+                           previous settings until they are removed and re-added",
+                peers = self.peers.len()
+            );
+        }
+
+        self.config.obf = obf;
+        self.config.amnezia = amnezia;
+        true
+    }
+
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
         self.fwmark = Some(mark);
@@ -609,6 +664,9 @@ impl Device {
                 let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
 
                 let rate_limiter = d.rate_limiter.as_ref().unwrap();
+                // Interface-wide AmneziaWG tag ranges. `ObfuscationRanges` is
+                // `Copy`, so this is a cheap snapshot for the whole batch.
+                let obf = d.config.obf;
 
                 // Loop while we have packets on the anonymous connection
 
@@ -617,10 +675,18 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = &t.src_buf[..packet_len];
+                    // Strip the AmneziaWG S-prefix *before* verifying. The order
+                    // is mandatory: mac1/mac2 are computed over the slice handed
+                    // to the rate limiter, so verifying the padded datagram fails
+                    // the MAC check. This mirrors the kernel module, which strips
+                    // at device level before peer lookup.
+                    let packet = d
+                        .config
+                        .amnezia
+                        .strip_inbound(obf, &t.src_buf[..packet_len]);
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
-                        ObfuscationRanges::default(),
+                        obf,
                         &mut OsRng,
                         Some(addr.as_socket().unwrap().ip()),
                         packet,
@@ -628,7 +694,18 @@ impl Device {
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
-                            let _: Result<_, _> = udp.send_to(cookie, &addr);
+                            // The limiter writes a bare cookie reply; it does not
+                            // know about S3. Re-prefix it in place before sending,
+                            // or the peer will reject it.
+                            let cookie_len = cookie.len();
+                            if let Ok(out) = d.config.amnezia.prepend_outbound(
+                                obf,
+                                &mut t.dst_buf,
+                                cookie_len,
+                                &mut OsRng,
+                            ) {
+                                let _: Result<_, _> = udp.send_to(out, &addr);
+                            }
                             continue;
                         }
                         Err(_) => continue,

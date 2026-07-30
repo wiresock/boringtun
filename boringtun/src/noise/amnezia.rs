@@ -17,6 +17,19 @@ const DEFAULT_JUNK_PACKET_SIZE_MAX: u16 = 1000;
 const MAX_JUNK_PACKET_COUNT: u16 = 128;
 const MAX_JUNK_PACKET_SIZE: u16 = 1280;
 const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
+/// Largest datagram that can actually be sent: the IPv4 UDP payload limit,
+/// `65535 - 20 (IP header) - 8 (UDP header)`. IPv6 allows 27 bytes more, but the
+/// stricter bound is used so a configuration validated once is sendable over
+/// either family — a device may be listening on both.
+///
+/// The kernel module bounds the same sizes by `MESSAGE_MAX_SIZE = 65535`
+/// (`amneziawg-linux-kernel-module/src/messages.h:132`), which is the protocol
+/// ceiling rather than the transport one. The 28-byte difference is deliberate:
+/// a configuration in that window passes the kernel's check and then fails at
+/// send time with `EMSGSIZE`, so it does not work there either. Rejecting it up
+/// front is not a parity break — every configuration that *functions* on the
+/// kernel module is still accepted here.
+const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 const DNS_JUNK_SIZE_MIN: usize = 50;
 const DNS_JUNK_SIZE_MAX: usize = 200;
 const QUIC_JUNK_SIZE_MIN: usize = 1200;
@@ -152,6 +165,10 @@ pub struct AmneziaConfig {
     pub(crate) transport_packet_junk_size: u16,
     pub(crate) pre_handshake_junk: AmneziaPreHandshakeJunk,
     pub(crate) imitation: AmneziaImitation,
+    /// Suppress the client-only pre-handshake burst (Jc junk packets and the
+    /// protocol imitation sequence) while keeping every other AmneziaWG
+    /// behaviour. See [`AmneziaConfig::as_responder`].
+    pub(crate) suppress_pre_handshake: bool,
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -236,6 +253,7 @@ impl AmneziaConfig {
             transport_packet_junk_size: s4,
             pre_handshake_junk: AmneziaPreHandshakeJunk::default(),
             imitation: AmneziaImitation::default(),
+            suppress_pre_handshake: false,
         }
     }
 
@@ -271,11 +289,78 @@ impl AmneziaConfig {
         self
     }
 
+    /// Check that every S-prefix can coexist with the packet it precedes.
+    ///
+    /// [`Self::new`] deliberately does not clamp, because the sizes are part of
+    /// the wire contract and a peer configured differently must still be
+    /// describable. But a configuration whose prefix cannot fit alongside its
+    /// base packet can never emit a valid datagram: `prepend_outbound` returns
+    /// [`WireGuardError::DestinationBufferTooSmall`] forever, which surfaces as
+    /// a tunnel that simply never completes a handshake, with nothing pointing
+    /// at the configuration. Callers accepting operator input should reject it
+    /// at the point of entry instead.
+    ///
+    /// The bounds correspond to the kernel module's own validation
+    /// (`amneziawg-linux-kernel-module/src/device.c:584-601`), but are 28 bytes
+    /// stricter: the kernel bounds by the protocol ceiling
+    /// (`MESSAGE_MAX_SIZE = 65535`) while this uses `MAX_SENDABLE_DATAGRAM`,
+    /// what a UDP socket can actually carry.
+    ///
+    /// The relationship is therefore one-way, not symmetric: every
+    /// configuration that *functions* on the kernel module is accepted here,
+    /// but a configuration landing in the 28-byte gap is accepted by the kernel
+    /// and rejected here. Nothing is lost — such a configuration fails on the
+    /// kernel too, at send time with `EMSGSIZE`, so it never worked there
+    /// either. See `MAX_SENDABLE_DATAGRAM` for the arithmetic.
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, junk, base) in [
+            ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
+            ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
+            ("S3", self.cookie_packet_junk_size, COOKIE_REPLY_SZ),
+            ("S4", self.transport_packet_junk_size, DATA_OVERHEAD_SZ),
+        ] {
+            if junk as usize + base > MAX_SENDABLE_DATAGRAM {
+                return Err(format!(
+                    "{} is too large: {} junk bytes + {} packet bytes exceed the {}-byte maximum datagram",
+                    label, junk, base, MAX_SENDABLE_DATAGRAM
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adapt this configuration for the responder (server) side of a tunnel.
+    ///
+    /// A server must *tolerate* a client's pre-handshake camouflage but must
+    /// never emit it: the Jc junk burst and the protocol imitation sequence are
+    /// things a client sends to open a conversation. Emitting them from a
+    /// responder is both directionally wrong — it looks like the server is
+    /// opening a QUIC/DNS/SIP/STUN exchange with its own peer — and slow, since
+    /// the queue drains one datagram per `update_timers` tick, delaying any
+    /// server-initiated handshake by the length of the sequence.
+    ///
+    /// Everything else is preserved, including the imitation protocol itself:
+    /// S1-S4 padding is still filled with protocol-shaped bytes
+    /// (`fill_outbound_junk`), so the server's own traffic keeps the
+    /// same byte distribution as the client's. Only the *standalone* datagrams
+    /// are suppressed.
+    pub fn as_responder(mut self) -> Self {
+        self.suppress_pre_handshake = true;
+        self
+    }
+
     /// True when a full protocol-natural imitation sequence should be emitted
     /// for the pre-handshake phase. DNS/SIP/STUN/QUIC all qualify (QUIC's omitted
     /// browser defaults to curl, matching wgbooster); only `None` does not.
     pub(crate) fn has_imitation_sequence(&self) -> bool {
         self.imitation.protocol != AmneziaImitationProtocol::None
+    }
+
+    /// True when this endpoint should emit a pre-handshake burst at all —
+    /// false for a responder, and for a client with neither Jc nor imitation.
+    pub(crate) fn emits_pre_handshake(&self) -> bool {
+        !self.suppress_pre_handshake
+            && (self.pre_handshake_junk.is_enabled() || self.has_imitation_sequence())
     }
 
     /// The configured imitation host, or a generated random one (DNS query name
@@ -1269,6 +1354,89 @@ mod tests {
         assert_eq!(packet.len(), HANDSHAKE_INIT_SZ + 7);
         assert_eq!(&packet[7..11], &HANDSHAKE_INIT.to_le_bytes());
         assert_eq!(packet[11], 0x42);
+    }
+
+    #[test]
+    fn validate_accepts_sizes_that_fit_and_rejects_those_that_cannot() {
+        // Junk + base packet must fit in one sendable UDP datagram
+        // (MAX_SENDABLE_DATAGRAM = 65507, the IPv4 payload limit) -- not the
+        // 65535 protocol ceiling the kernel module bounds by.
+        assert!(AmneziaConfig::new(0, 0, 0, 0).validate().is_ok());
+        assert!(AmneziaConfig::new(1000, 1000, 1000, 1000)
+            .validate()
+            .is_ok());
+
+        // Exactly at the limit for each packet type.
+        let max_s1 = (MAX_SENDABLE_DATAGRAM - HANDSHAKE_INIT_SZ) as u16;
+        let max_s2 = (MAX_SENDABLE_DATAGRAM - HANDSHAKE_RESP_SZ) as u16;
+        let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
+        let max_s4 = (MAX_SENDABLE_DATAGRAM - DATA_OVERHEAD_SZ) as u16;
+        assert!(AmneziaConfig::new(max_s1, max_s2, max_s3, max_s4)
+            .validate()
+            .is_ok());
+
+        // One byte over, each in turn.
+        for (cfg, want) in [
+            (AmneziaConfig::new(max_s1 + 1, 0, 0, 0), "S1"),
+            (AmneziaConfig::new(0, max_s2 + 1, 0, 0), "S2"),
+            (AmneziaConfig::new(0, 0, max_s3 + 1, 0), "S3"),
+            (AmneziaConfig::new(0, 0, 0, max_s4 + 1), "S4"),
+        ] {
+            let err = cfg.validate().expect_err("must be rejected");
+            assert!(err.contains(want), "error should name {}: {}", want, err);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_sizes_that_fit_the_protocol_but_not_a_udp_datagram() {
+        // The protocol ceiling is 65535, but an IPv4 UDP payload tops out at
+        // 65535 - 20 - 8 = 65507. Sizes in between pass the kernel module's
+        // check and then fail at send time with EMSGSIZE, so they must be
+        // rejected here rather than accepted into a tunnel that never works.
+        const PROTOCOL_MAX: usize = 65535;
+        assert_eq!(MAX_SENDABLE_DATAGRAM, 65507);
+
+        // For each field: the size the protocol ceiling alone would allow.
+        let cases = [
+            ("S1", HANDSHAKE_INIT_SZ, 0usize),
+            ("S2", HANDSHAKE_RESP_SZ, 1),
+            ("S3", COOKIE_REPLY_SZ, 2),
+            ("S4", DATA_OVERHEAD_SZ, 3),
+        ];
+
+        for (label, base, slot) in cases {
+            let over = (PROTOCOL_MAX - base) as u16;
+            let mut s = [0u16; 4];
+            s[slot] = over;
+            let cfg = AmneziaConfig::new(s[0], s[1], s[2], s[3]);
+
+            let err = cfg.validate().expect_err(&format!(
+                "{}={} yields a {}-byte datagram, unsendable over IPv4",
+                label,
+                over,
+                over as usize + base
+            ));
+            assert!(err.contains(label), "error should name {}: {}", label, err);
+        }
+    }
+
+    #[test]
+    fn validated_max_size_actually_round_trips_through_prepend_outbound() {
+        // The bound is only meaningful if the largest accepted configuration can
+        // still emit a packet -- otherwise validate() would be off by one.
+        let obf = ObfuscationRanges::default();
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let max_s1 = (MAX_SENDABLE_DATAGRAM - HANDSHAKE_INIT_SZ) as u16;
+        let cfg = AmneziaConfig::new(max_s1, 0, 0, 0);
+        cfg.validate().unwrap();
+
+        let mut buffer = vec![0u8; MAX_SENDABLE_DATAGRAM];
+        write_tag(&mut buffer, HANDSHAKE_INIT);
+
+        let packet = cfg
+            .prepend_outbound(obf, &mut buffer, HANDSHAKE_INIT_SZ, &mut rng)
+            .expect("largest validated S1 must still fit");
+        assert_eq!(packet.len(), MAX_SENDABLE_DATAGRAM);
     }
 
     #[test]

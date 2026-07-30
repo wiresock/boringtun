@@ -5,6 +5,7 @@ use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
+use crate::noise::handshake::ObfuscationRanges;
 use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
@@ -16,6 +17,130 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
 
 const SOCK_DIR: &str = "/var/run/wireguard/";
+
+/// Parse an AmneziaWG magic-header value: either a bare tag (`"1"`) or an
+/// inclusive range (`"342871004-442871003"`). A bare value is a degenerate
+/// range, which is exactly how the kernel module's `mh_genspec` treats it, so
+/// existing single-value configs map across unchanged.
+fn parse_tag_range(val: &str) -> Option<(u32, u32)> {
+    match val.split_once('-') {
+        Some((start, end)) => {
+            let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
+            if start > end {
+                return None;
+            }
+            Some((start, end))
+        }
+        None => {
+            let v = val.trim().parse().ok()?;
+            Some((v, v))
+        }
+    }
+}
+
+/// AmneziaWG values accumulated over one `set=1` transaction.
+///
+/// They cannot be applied one at a time: `ObfuscationRanges::new` validates all
+/// four header ranges together and rejects overlaps, so a partially-applied set
+/// could transiently fail validation on a configuration that is valid as a
+/// whole. Anything left `None` keeps the device's current value.
+#[derive(Default)]
+struct AwgParams {
+    jc: Option<u16>,
+    jmin: Option<u16>,
+    jmax: Option<u16>,
+    s1: Option<u16>,
+    s2: Option<u16>,
+    s3: Option<u16>,
+    s4: Option<u16>,
+    h1: Option<(u32, u32)>,
+    h2: Option<(u32, u32)>,
+    h3: Option<(u32, u32)>,
+    h4: Option<(u32, u32)>,
+    seen: bool,
+}
+
+impl AwgParams {
+    fn set_size(&mut self, key: &str, val: u16) {
+        match key {
+            "jc" => self.jc = Some(val),
+            "jmin" => self.jmin = Some(val),
+            "jmax" => self.jmax = Some(val),
+            "s1" => self.s1 = Some(val),
+            "s2" => self.s2 = Some(val),
+            "s3" => self.s3 = Some(val),
+            "s4" => self.s4 = Some(val),
+            _ => unreachable!("caller matched the key"),
+        }
+        self.seen = true;
+    }
+
+    fn set_header(&mut self, key: &str, range: (u32, u32)) {
+        match key {
+            "h1" => self.h1 = Some(range),
+            "h2" => self.h2 = Some(range),
+            "h3" => self.h3 = Some(range),
+            "h4" => self.h4 = Some(range),
+            _ => unreachable!("caller matched the key"),
+        }
+        self.seen = true;
+    }
+
+    /// Apply the accumulated values, merging with whatever the device already
+    /// has. A no-op when the transaction carried no AmneziaWG keys, so plain
+    /// WireGuard configurations are untouched.
+    fn apply(&self, device: &mut Device) -> Result<(), i32> {
+        if !self.seen {
+            return Ok(());
+        }
+
+        let cur_obf = device.config.obf;
+        let cur_junk = device.config.amnezia.pre_handshake_junk;
+        let (h1, h2, h3, h4) = (
+            self.h1
+                .unwrap_or((cur_obf.h1_init.start, cur_obf.h1_init.end)),
+            self.h2
+                .unwrap_or((cur_obf.h2_resp.start, cur_obf.h2_resp.end)),
+            self.h3
+                .unwrap_or((cur_obf.h3_cookie.start, cur_obf.h3_cookie.end)),
+            self.h4
+                .unwrap_or((cur_obf.h4_data.start, cur_obf.h4_data.end)),
+        );
+
+        let obf = ObfuscationRanges::new(h1.0, h1.1, h2.0, h2.1, h3.0, h3.1, h4.0, h4.1)
+            .map_err(|_| EINVAL)?;
+
+        // Start from the current value and overwrite only what this transaction
+        // carried. Rebuilding with `AmneziaConfig::new` would discard the
+        // protocol-imitation settings, which have no UAPI key of their own and
+        // therefore can only arrive via `DeviceConfig` at startup -- so any
+        // `set=1` mentioning an AmneziaWG key would silently turn imitation off.
+        let mut amnezia = device.config.amnezia.clone();
+        amnezia.init_packet_junk_size = self.s1.unwrap_or(amnezia.init_packet_junk_size);
+        amnezia.response_packet_junk_size = self.s2.unwrap_or(amnezia.response_packet_junk_size);
+        amnezia.cookie_packet_junk_size = self.s3.unwrap_or(amnezia.cookie_packet_junk_size);
+        amnezia.transport_packet_junk_size = self.s4.unwrap_or(amnezia.transport_packet_junk_size);
+        let amnezia = amnezia.with_pre_handshake_junk(
+            self.jc.unwrap_or(cur_junk.packet_count),
+            self.jmin.unwrap_or(cur_junk.packet_size_min),
+            self.jmax.unwrap_or(cur_junk.packet_size_max),
+            cur_junk.packet_delay_ms,
+        );
+
+        // Reject sizes that could never emit a valid datagram, before anything
+        // is committed. Without this, an oversized S value is accepted here and
+        // only shows up later as a tunnel that never completes a handshake.
+        if let Err(e) = amnezia.validate() {
+            tracing::error!(message = "rejecting AmneziaWG parameters", error = %e);
+            return Err(EINVAL);
+        }
+
+        if device.set_obfuscation(obf, amnezia) {
+            tracing::info!(message = "AmneziaWG parameters updated");
+        }
+        Ok(())
+    }
+}
 
 fn create_sock_dir() {
     let _ = create_dir(SOCK_DIR); // Create the directory if it does not exist
@@ -168,6 +293,44 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
         writeln!(writer, "fwmark={}", fwmark);
     }
 
+    // AmneziaWG interface parameters, emitted only when they differ from plain
+    // WireGuard so a vanilla device's output is byte-identical to before.
+    // Sizes are `%u`; magic headers use the kernel's `mh_genspec` convention --
+    // a bare value when the range is degenerate, `start-end` otherwise.
+    {
+        let a = &d.config.amnezia;
+        for (key, val) in [
+            ("jc", a.pre_handshake_junk.packet_count),
+            ("jmin", a.pre_handshake_junk.packet_size_min),
+            ("jmax", a.pre_handshake_junk.packet_size_max),
+            ("s1", a.init_packet_junk_size),
+            ("s2", a.response_packet_junk_size),
+            ("s3", a.cookie_packet_junk_size),
+            ("s4", a.transport_packet_junk_size),
+        ] {
+            if val != 0 {
+                writeln!(writer, "{}={}", key, val);
+            }
+        }
+
+        let obf = d.config.obf;
+        let default = ObfuscationRanges::default();
+        for (key, range, def) in [
+            ("h1", obf.h1_init, default.h1_init),
+            ("h2", obf.h2_resp, default.h2_resp),
+            ("h3", obf.h3_cookie, default.h3_cookie),
+            ("h4", obf.h4_data, default.h4_data),
+        ] {
+            if range != def {
+                if range.start == range.end {
+                    writeln!(writer, "{}={}", key, range.start);
+                } else {
+                    writeln!(writer, "{}={}-{}", key, range.start, range.end);
+                }
+            }
+        }
+    }
+
     for (k, p) in d.peers.iter() {
         let p = p.lock();
         writeln!(writer, "public_key={}", encode_hex(k.as_bytes()));
@@ -208,14 +371,28 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
             device.cancel_yield();
 
             let mut cmd = String::new();
+            // AmneziaWG keys are validated as a set (`ObfuscationRanges::new`
+            // rejects overlapping H ranges), so they are accumulated across the
+            // transaction and applied at whichever exit point comes first --
+            // including before delegating to a peer section, since peers
+            // snapshot the device's settings when they are created.
+            let mut awg = AwgParams::default();
 
             while reader.read_line(&mut cmd).is_ok() {
                 cmd.pop(); // remove newline if any
                 if cmd.is_empty() {
-                    return 0; // Done
+                    match awg.apply(device) {
+                        Ok(()) => return 0, // Done
+                        Err(code) => return code,
+                    }
                 }
                 {
-                    let parsed_cmd: Vec<&str> = cmd.split('=').collect();
+                    // Split on the *first* `=` only. Values may legitimately
+                    // contain one: `KeyBytes` accepts base64 as well as hex, and
+                    // a base64-encoded 32-byte key is 44 characters ending in
+                    // `=` padding, which `split('=')` would turn into three
+                    // fields and reject as EPROTO.
+                    let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
                     if parsed_cmd.len() != 2 {
                         return EPROTO;
                     }
@@ -256,14 +433,36 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                         "public_key" => match val.parse::<KeyBytes>() {
                             // Indicates a new peer section
                             Ok(key_bytes) => {
+                                // Apply before the first peer is built: peers
+                                // snapshot the device's AmneziaWG settings.
+                                if let Err(code) = awg.apply(device) {
+                                    return code;
+                                }
                                 return api_set_peer(
                                     reader,
                                     device,
                                     x25519::PublicKey::from(key_bytes.0),
-                                )
+                                );
                             }
                             Err(_) => return EINVAL,
                         },
+                        // AmneziaWG device keys. Sizes are `%u`; magic headers
+                        // are `%s` and may be a bare value or a `start-end`
+                        // range, matching amneziawg-tools' wire format.
+                        "jc" | "jmin" | "jmax" | "s1" | "s2" | "s3" | "s4" => {
+                            match val.parse::<u16>() {
+                                Ok(v) => awg.set_size(key, v),
+                                Err(_) => return EINVAL,
+                            }
+                        }
+                        "h1" | "h2" | "h3" | "h4" => match parse_tag_range(val) {
+                            Some(range) => awg.set_header(key, range),
+                            None => return EINVAL,
+                        },
+                        // AWG 2.0 signature packets. A responder only has to
+                        // tolerate these; accept and ignore rather than failing
+                        // the whole transaction on a config that carries them.
+                        "i1" | "i2" | "i3" | "i4" | "i5" => {}
                         _ => return EINVAL,
                     }
                 }
@@ -365,4 +564,58 @@ fn api_set_peer(
         cmd.clear();
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tag_range_accepts_bare_values_and_ranges() {
+        // A bare value is a degenerate range, matching the kernel module's
+        // mh_genspec, so single-value AmneziaWG configs map across unchanged.
+        assert_eq!(parse_tag_range("1"), Some((1, 1)));
+        assert_eq!(parse_tag_range("342871004"), Some((342871004, 342871004)));
+        assert_eq!(
+            parse_tag_range("342871004-442871003"),
+            Some((342871004, 442871003))
+        );
+        assert_eq!(parse_tag_range(" 7 - 9 "), Some((7, 9)));
+        assert_eq!(
+            parse_tag_range(&u32::MAX.to_string()),
+            Some((u32::MAX, u32::MAX))
+        );
+    }
+
+    #[test]
+    fn uapi_line_split_keeps_padding_in_base64_values() {
+        // A base64-encoded 32-byte key is 44 chars ending in `=` padding.
+        // Splitting on every `=` yields three fields and is rejected as EPROTO,
+        // even though KeyBytes documents base64 as an accepted form.
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let line = format!("private_key={}", key);
+
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        assert_eq!(parts.len(), 2, "must split into exactly key and value");
+        assert_eq!(parts[0], "private_key");
+        assert_eq!(parts[1], key, "padding must survive intact");
+        assert!(
+            parts[1].parse::<KeyBytes>().is_ok(),
+            "value must still parse"
+        );
+
+        // A line with no separator is still rejected.
+        assert_eq!("no_separator".splitn(2, '=').count(), 1);
+    }
+
+    #[test]
+    fn parse_tag_range_rejects_malformed_input() {
+        assert_eq!(parse_tag_range(""), None);
+        assert_eq!(parse_tag_range("abc"), None);
+        assert_eq!(parse_tag_range("9-7"), None, "inverted range");
+        assert_eq!(parse_tag_range("1-"), None);
+        assert_eq!(parse_tag_range("-1"), None);
+        assert_eq!(parse_tag_range("4294967296"), None, "overflows u32");
+        assert_eq!(parse_tag_range("1-2-3"), None);
+    }
 }
