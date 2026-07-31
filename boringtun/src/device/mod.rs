@@ -46,9 +46,8 @@ use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
-use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use rand_core::{OsRng, RngCore};
+use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
 use tun::TunSocket;
 

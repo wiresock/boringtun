@@ -1372,7 +1372,7 @@ mod tests {
         assert_eq!(
             my_tun.preshared_key(),
             Some([0u8; 32]),
-            "the stored value must still follow the caller, so `Peer`'s copy              and the handshake cannot disagree"
+            "the stored value must follow the caller, so `Peer`'s copy cannot disagree"
         );
 
         my_tun.set_preshared_key(None);
