@@ -603,12 +603,16 @@ impl Device {
 
     /// Set the interface-wide AmneziaWG parameters.
     ///
-    /// Returns `false` and changes nothing when the values already match. That
-    /// short-circuit is load-bearing rather than an optimisation: `awg syncconf`
-    /// re-sends the whole `[Interface]` block on every peer add or revoke, and
-    /// H/S changes invalidate all sessions, so applying unconditionally would
-    /// tear down every live tunnel on routine peer management. `set_key` above
-    /// short-circuits for the same reason.
+    /// Returns `false` and changes nothing when the values already match.
+    ///
+    /// The short-circuit is an optimisation, not a correctness requirement:
+    /// `awg syncconf` re-sends the whole `[Interface]` block on every peer add
+    /// or revoke, so without it each of those would walk every peer, take every
+    /// peer lock and log a spurious "parameters updated". Applying redundantly
+    /// would still be *safe* — `Tunn::set_obfuscation` keeps established
+    /// sessions, because obfuscation is framing rather than key material.
+    /// (`set_key` above short-circuits for a stronger reason: rekeying really
+    /// does drop sessions.)
     fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) -> bool {
         if self.config.obf == obf && self.config.amnezia == amnezia {
             return false;
