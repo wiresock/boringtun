@@ -394,7 +394,7 @@ impl Device {
         &mut self,
         pub_key: x25519::PublicKey,
         remove: bool,
-        _replace_ips: bool,
+        replace_ips: bool,
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
@@ -414,7 +414,7 @@ impl Device {
         if let Some(peer) = self.peers.get(&pub_key).cloned() {
             self.merge_peer(
                 &peer,
-                _replace_ips,
+                replace_ips,
                 endpoint,
                 allowed_ips,
                 keepalive,

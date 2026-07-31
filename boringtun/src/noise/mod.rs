@@ -383,10 +383,20 @@ impl Tunn {
         // `Option` comparison would treat a routine reload as a key change and
         // tear down every session for a peer that never had a PSK.
         let effective = |key: Option<[u8; 32]>| key.unwrap_or([0u8; 32]);
-        if effective(self.handshake.preshared_key()) == effective(preshared_key) {
+        let unchanged = effective(self.handshake.preshared_key()) == effective(preshared_key);
+
+        // Always store the caller's value, even when it is cryptographically
+        // equivalent. `Peer` keeps its own copy for `get=1`, and skipping the
+        // write here would let the two disagree -- the handshake holding
+        // `Some([0; 32])` while the peer reports `None`, or the reverse.
+        self.handshake.set_preshared_key(preshared_key);
+
+        // Only the teardown is conditional: sessions derived from an equivalent
+        // key are still valid, so discarding them would drop live traffic for
+        // no gain.
+        if unchanged {
             return;
         }
-        self.handshake.set_preshared_key(preshared_key);
         for s in &mut self.sessions {
             *s = None;
         }
@@ -1359,12 +1369,18 @@ mod tests {
             my_tun.sessions.iter().any(|s| s.is_some()),
             "None -> all-zero is not a key change and must keep sessions"
         );
+        assert_eq!(
+            my_tun.preshared_key(),
+            Some([0u8; 32]),
+            "the stored value must still follow the caller, so `Peer`'s copy              and the handshake cannot disagree"
+        );
 
         my_tun.set_preshared_key(None);
         assert!(
             my_tun.sessions.iter().any(|s| s.is_some()),
             "all-zero -> None must keep sessions too"
         );
+        assert_eq!(my_tun.preshared_key(), None, "stored value follows back");
 
         // A genuine key still resets, since sessions derived under the old key
         // are cryptographically stale.
