@@ -376,7 +376,14 @@ impl Tunn {
     /// No-op when the key is unchanged, so a configuration reload that re-sends
     /// the same value does not tear down live tunnels.
     pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
-        if self.handshake.preshared_key() == preshared_key {
+        // Compare the *effective* key, not the `Option`. The handshake mixes
+        // `preshared_key.unwrap_or([0u8; 32])`, so `None` and `Some([0; 32])`
+        // are the same key cryptographically -- and wg's tooling clears a PSK
+        // by sending 32 zero bytes rather than omitting the field, so a plain
+        // `Option` comparison would treat a routine reload as a key change and
+        // tear down every session for a peer that never had a PSK.
+        let effective = |key: Option<[u8; 32]>| key.unwrap_or([0u8; 32]);
+        if effective(self.handshake.preshared_key()) == effective(preshared_key) {
             return;
         }
         self.handshake.set_preshared_key(preshared_key);
@@ -1335,6 +1342,36 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(init[5..9].try_into().unwrap()),
             HANDSHAKE_INIT
+        );
+    }
+
+    #[test]
+    fn set_preshared_key_treats_all_zero_as_absent() {
+        // The handshake mixes `preshared_key.unwrap_or([0u8; 32])`, so an
+        // all-zero key and `None` are the same key. wg clears a PSK by sending
+        // 32 zero bytes, so this transition happens on ordinary reloads and
+        // must not be mistaken for a key change.
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(my_tun.sessions.iter().any(|s| s.is_some()));
+
+        my_tun.set_preshared_key(Some([0u8; 32]));
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "None -> all-zero is not a key change and must keep sessions"
+        );
+
+        my_tun.set_preshared_key(None);
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "all-zero -> None must keep sessions too"
+        );
+
+        // A genuine key still resets, since sessions derived under the old key
+        // are cryptographically stale.
+        my_tun.set_preshared_key(Some([7u8; 32]));
+        assert!(
+            my_tun.sessions.iter().all(|s| s.is_none()),
+            "a real key change must discard sessions"
         );
     }
 
