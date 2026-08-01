@@ -216,7 +216,7 @@ impl Device {
         match std::os::unix::fs::symlink(&path, &awg_path) {
             Ok(()) => self.cleanup_paths.push(awg_path),
             Err(e) => tracing::warn!(
-                message = "could not publish the UAPI socket for amneziawg-tools;                            `awg` will not find this interface",
+                message = "could not publish the UAPI socket for amneziawg-tools; awg will not find this interface",
                 path = awg_path.as_str(),
                 error = %e
             ),
