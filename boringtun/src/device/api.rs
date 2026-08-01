@@ -15,8 +15,18 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SOCK_DIR: &str = "/var/run/wireguard/";
+/// Where `amneziawg-tools` looks for a userspace implementation's UAPI socket.
+///
+/// `wg` uses `/var/run/wireguard/`, but `awg` is a fork and searches
+/// `/var/run/amneziawg/%s.sock` instead, so a socket published only under
+/// `SOCK_DIR` is invisible to it -- `awg setconf` fails with "Operation not
+/// supported" because it falls back to netlink and finds a TUN device that is
+/// not an amneziawg interface. Since AmneziaWG support is the point of this
+/// fork, publish in both places rather than choosing.
+const AWG_SOCK_DIR: &str = "/var/run/amneziawg/";
 
 /// Parse an AmneziaWG magic-header value: either a bare tag (`"1"`) or an
 /// inclusive range (`"342871004-442871003"`). A bare value is a degenerate
@@ -164,12 +174,12 @@ struct PeerSection {
     allowed_ips: Vec<AllowedIP>,
 }
 
-fn create_sock_dir() {
-    let _ = create_dir(SOCK_DIR); // Create the directory if it does not exist
+fn create_sock_dir(dir: &str) {
+    let _ = create_dir(dir); // Create the directory if it does not exist
 
     if let Ok((saved_uid, saved_gid)) = get_saved_ids() {
         unsafe {
-            let c_path = std::ffi::CString::new(SOCK_DIR).unwrap();
+            let c_path = std::ffi::CString::new(dir).unwrap();
             // The directory is under the root user, but we want to be able to
             // delete the files there when we exit, so we need to change the owner
             chown(
@@ -184,16 +194,40 @@ fn create_sock_dir() {
 impl Device {
     /// Register the api handler for this Device. The api handler receives stream connections on a Unix socket
     /// with a known path: /var/run/wireguard/{tun_name}.sock.
+    ///
+    /// The same socket is also published at /var/run/amneziawg/{tun_name}.sock
+    /// as a symlink, because `amneziawg-tools` searches that directory rather
+    /// than the WireGuard one; without it `awg` cannot see this interface at
+    /// all. There is still exactly one socket and one accept loop. If the
+    /// symlink cannot be created the handler is registered anyway and a warning
+    /// is logged, leaving the device reachable by `wg` but not `awg`.
     pub fn register_api_handler(&mut self) -> Result<(), Error> {
-        let path = format!("{}/{}.sock", SOCK_DIR, self.iface.name()?);
+        let name = self.iface.name()?;
+        let path = format!("{}/{}.sock", SOCK_DIR, name);
 
-        create_sock_dir();
+        create_sock_dir(SOCK_DIR);
 
         let _ = remove_file(&path); // Attempt to remove the socket if already exists
 
         let api_listener = UnixListener::bind(&path).map_err(Error::ApiSocket)?; // Bind a new socket to the path
 
         self.cleanup_paths.push(path.clone());
+
+        // Also publish where `awg` looks. A symlink rather than a second
+        // listener, so there is exactly one socket and one accept loop; both
+        // toolchains then reach the same device. Failure is not fatal -- the
+        // daemon still works, just only under `wg`.
+        let awg_path = format!("{}/{}.sock", AWG_SOCK_DIR, name);
+        create_sock_dir(AWG_SOCK_DIR);
+        let _ = remove_file(&awg_path);
+        match std::os::unix::fs::symlink(&path, &awg_path) {
+            Ok(()) => self.cleanup_paths.push(awg_path),
+            Err(e) => tracing::warn!(
+                message = "could not publish the UAPI socket for amneziawg-tools; awg will not find this interface",
+                path = awg_path.as_str(),
+                error = %e
+            ),
+        }
 
         self.queue.new_event(
             api_listener.as_raw_fd(),
@@ -373,9 +407,23 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             writeln!(writer, "allowed_ip={}/{}", ip, cidr);
         }
 
-        if let Some(time) = p.time_since_last_handshake() {
-            writeln!(writer, "last_handshake_time_sec={}", time.as_secs());
-            writeln!(writer, "last_handshake_time_nsec={}", time.subsec_nanos());
+        // `last_handshake_time_*` is an absolute wall-clock timestamp in the
+        // UAPI, not an age -- `wg`/`awg` subtract it from the current time to
+        // render "N seconds ago". Reporting the elapsed duration instead made
+        // every peer read as roughly 56 years stale, so any health check or
+        // management UI treating a stale handshake as "peer down" saw every
+        // peer as permanently dead. Verified against the kernel module, which
+        // reports the epoch timestamp here.
+        if let Some(elapsed) = p.time_since_last_handshake() {
+            if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                let handshake_at = now.saturating_sub(elapsed);
+                writeln!(writer, "last_handshake_time_sec={}", handshake_at.as_secs());
+                writeln!(
+                    writer,
+                    "last_handshake_time_nsec={}",
+                    handshake_at.subsec_nanos()
+                );
+            }
         }
 
         let (_, tx_bytes, rx_bytes, ..) = p.tunnel.stats();
