@@ -33,11 +33,11 @@ fn parse_tag_range(val: &str) -> Option<(u32, u32)> {
     if start > end {
         return None;
     }
-    // Reject 0 rather than accepting it silently. `ObfuscationRanges::resolve`
+    // Reject 0 rather than accepting it silently. `ObfuscationRanges::new`
     // treats an all-zero range as "unset" and substitutes the vanilla WireGuard
-    // message type, so `h1=0` would quietly disable obfuscation for that packet
-    // kind instead of using tag 0 -- the opposite of what the operator wrote.
-    // Failing the transaction with EINVAL makes that visible.
+    // message type for that packet kind, so `h1=0` would quietly disable
+    // obfuscation instead of using tag 0 -- the opposite of what the operator
+    // wrote. Failing the transaction with EINVAL makes that visible.
     if start == 0 {
         return None;
     }
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn parse_tag_range_rejects_zero_rather_than_silently_disabling() {
-        // ObfuscationRanges::resolve treats an all-zero range as "unset" and
+        // ObfuscationRanges::new treats an all-zero range as "unset" and
         // substitutes the vanilla WireGuard message type. Accepting h1=0 would
         // therefore turn obfuscation *off* for that packet kind while reporting
         // success -- the opposite of what the operator asked for.
