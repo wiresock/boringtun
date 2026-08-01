@@ -92,6 +92,8 @@ pub enum Error {
     DropPrivileges(String),
     #[error("API socket error: {0}")]
     ApiSocket(io::Error),
+    #[error("failed to set up peer: {0}")]
+    PeerSetup(String),
 }
 
 // What the event loop should do after a handler returns
@@ -192,6 +194,20 @@ struct ThreadData {
     /// ChaCha8 for exactly these bytes (`noise/handshake.rs`), so this matches
     /// the per-peer path rather than weakening it.
     junk_rng: ChaCha8Rng,
+}
+
+/// The device's key pair, or an error naming what is missing.
+///
+/// Extracted from `update_peer` so the guard sits behind a name that a test can
+/// call. A free function rather than a method because constructing a `Device`
+/// needs a TUN device and root, which would put this out of reach of ordinary
+/// tests -- and an untestable guard is how it silently regresses to a panic.
+fn require_key_pair(
+    key_pair: &Option<(x25519::StaticSecret, x25519::PublicKey)>,
+) -> Result<&(x25519::StaticSecret, x25519::PublicKey), Error> {
+    key_pair
+        .as_ref()
+        .ok_or_else(|| Error::PeerSetup("private key must be set first".to_owned()))
 }
 
 impl DeviceHandle {
@@ -398,10 +414,11 @@ impl Device {
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
         preshared_key: Option<[u8; 32]>,
-    ) {
+    ) -> Result<(), Error> {
         if remove {
             // Completely remove a peer
-            return self.remove_peer(&pub_key);
+            self.remove_peer(&pub_key);
+            return Ok(());
         }
 
         // Merge into an existing peer rather than rejecting the update.
@@ -419,36 +436,36 @@ impl Device {
                 keepalive,
                 preshared_key,
             );
-            return;
+            return Ok(());
         }
 
         let next_index = self.next_index();
-        let device_key_pair = self
-            .key_pair
-            .as_ref()
-            .expect("Private key must be set first");
+        // Reachable from the control plane, not an invariant: a `set=1`
+        // transaction that names a peer before `private_key=` arrives here with
+        // no key pair. `awg setconf` always sends the key first, so this is
+        // malformed input rather than normal use -- which is exactly why it
+        // should be an error the caller sees rather than a dead daemon.
+        let device_key_pair = require_key_pair(&self.key_pair)?;
 
         // Read the obfuscation settings from the device rather than taking them
         // as parameters: that is what guarantees every peer's copy stays
         // byte-identical to the device's, which matters because the connected-
         // socket path strips with the *per-peer* config while the anonymous
         // path strips with the device's.
-        let obf = self.config.obf;
-        let tunn = Tunn::new_with_amnezia(
+        // Pass the validated ranges straight through rather than decomposing
+        // them into eight integers for `new_with_amnezia` to re-validate. That
+        // round trip could only fail on values this device has already
+        // accepted, so its error was unreachable -- and asserting an
+        // unreachable error with `expect` turns any future gap in that
+        // reasoning into a dead daemon.
+        let tunn = Tunn::new_with_obfuscation(
             device_key_pair.0.clone(),
             pub_key,
             preshared_key,
             keepalive,
             next_index,
             None,
-            obf.h1_init.start,
-            obf.h1_init.end,
-            obf.h2_resp.start,
-            obf.h2_resp.end,
-            obf.h3_cookie.start,
-            obf.h3_cookie.end,
-            obf.h4_data.start,
-            obf.h4_data.end,
+            self.config.obf,
             // Not `as_responder()`: the kernel module emits Jc junk from
             // `wg_packet_send_handshake_initiation` (src/send.c:58-75), i.e.
             // from whichever side initiates, with no role distinction. Since
@@ -459,7 +476,7 @@ impl Device {
             // still opt in via `AmneziaConfig::as_responder`.
             self.config.amnezia.clone(),
         )
-        .expect("device obfuscation ranges were validated when they were set");
+        .map_err(Error::PeerSetup)?;
 
         let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
 
@@ -473,6 +490,7 @@ impl Device {
         }
 
         tracing::info!("Peer added");
+        Ok(())
     }
 
     pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
@@ -1196,6 +1214,41 @@ mod ingress_tests {
             *client_public.as_bytes(),
             "must identify the initiating peer"
         );
+    }
+
+    /// A peer named before `private_key=` is an error the control plane can
+    /// report, not a reason to abort the daemon.
+    ///
+    /// `awg setconf` always sends the key first, so this is malformed input --
+    /// but it arrives over a socket, and a UAPI client should not be able to
+    /// kill the server by reordering two lines.
+    #[test]
+    fn peer_before_private_key_is_an_error_not_a_panic() {
+        // Calls the same `require_key_pair` that `update_peer` calls, so a
+        // regression to `expect`/panic there fails here. An earlier version of
+        // this test inlined the `ok_or_else` instead, which only asserted that
+        // `Option::ok_or_else` works and would have passed either way.
+        // `expect_err` is unavailable here: the Ok type contains `StaticSecret`,
+        // which deliberately does not implement `Debug` so secrets cannot leak
+        // into a panic message or a log line.
+        let err = match require_key_pair(&None) {
+            Err(e) => e,
+            Ok(_) => panic!("no key pair must be an error"),
+        };
+        assert!(
+            matches!(err, Error::PeerSetup(ref m) if m.contains("private key")),
+            "error should name the missing private key, got {:?}",
+            err
+        );
+
+        // And the configured case still yields the pair.
+        let secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let public = x25519::PublicKey::from(&secret);
+        let configured = Some((secret, public));
+        match require_key_pair(&configured) {
+            Ok((_, got_public)) => assert_eq!(got_public.as_bytes(), public.as_bytes()),
+            Err(e) => panic!("a configured key pair must be returned, got {:?}", e),
+        }
     }
 
     /// A device left on the vanilla defaults cannot read that datagram. This is

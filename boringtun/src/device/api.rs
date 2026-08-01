@@ -557,7 +557,7 @@ fn api_set_peer(
     while reader.read_line(&mut cmd).is_ok() {
         cmd.pop(); // remove newline if any
         if cmd.is_empty() {
-            d.update_peer(
+            if let Err(e) = d.update_peer(
                 public_key,
                 sec.remove,
                 sec.replace_ips,
@@ -565,7 +565,14 @@ fn api_set_peer(
                 sec.allowed_ips.as_slice(),
                 sec.keepalive,
                 sec.preshared_key,
-            );
+            ) {
+                tracing::error!(
+                    message = "failed to apply peer",
+                    peer = encode_hex(public_key.as_bytes()).as_str(),
+                    error = ?e
+                );
+                return EIO;
+            }
             return 0; // Done
         }
         {
@@ -603,7 +610,7 @@ fn api_set_peer(
                 },
                 "public_key" => {
                     // Indicates a new peer section. Commit changes for current peer, and continue to next peer
-                    d.update_peer(
+                    if let Err(e) = d.update_peer(
                         public_key,
                         sec.remove,
                         sec.replace_ips,
@@ -611,7 +618,14 @@ fn api_set_peer(
                         sec.allowed_ips.as_slice(),
                         sec.keepalive,
                         sec.preshared_key,
-                    );
+                    ) {
+                        tracing::error!(
+                            message = "failed to apply peer",
+                            peer = encode_hex(public_key.as_bytes()).as_str(),
+                            error = ?e
+                        );
+                        return EIO;
+                    }
                     // Each `[Peer]` block is independent, matching the kernel's
                     // nested-attribute model. Reset every attribute, not just
                     // allowed_ips: carrying `remove` would delete the next peer,
