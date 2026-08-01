@@ -1099,6 +1099,14 @@ mod ingress_tests {
     ///
     /// Mirrors `register_udp_handler`: strip the S-prefix, verify with the
     /// device-scoped ranges, then identify the peer from the parse result.
+    ///
+    /// The source address is supplied for the same reason the real path
+    /// supplies it (`Some(addr.as_socket().unwrap().ip())`): once the limiter
+    /// is under load, `verify_packet` rejects a `None` address outright with
+    /// `UnderLoad`, because mac2 cannot be validated without one. Passing
+    /// `None` here would pass today only because two packets never trip the
+    /// 100/s limit -- the helper would quietly stop mirroring production the
+    /// moment the limit dropped or this was reused for cookie-path tests.
     fn demux_handshake(
         server_secret: &x25519::StaticSecret,
         obf: ObfuscationRanges,
@@ -1109,9 +1117,12 @@ mod ingress_tests {
         let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
         let mut scratch = vec![0u8; MAX_UDP_SIZE];
 
+        // RFC 5737 TEST-NET-3, so the value is obviously a fixture.
+        let src_addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+
         let stripped = amnezia.strip_inbound(obf, datagram);
         let parsed = limiter
-            .verify_packet(obf, &mut OsRng, None, stripped, &mut scratch)
+            .verify_packet(obf, &mut OsRng, Some(src_addr), stripped, &mut scratch)
             .ok()?;
 
         match parsed {
