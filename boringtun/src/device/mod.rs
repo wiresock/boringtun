@@ -1077,3 +1077,160 @@ impl Default for IndexLfsr {
         }
     }
 }
+
+#[cfg(test)]
+mod ingress_tests {
+    //! Device-level ingress demux, exercised without a TUN device or root.
+    //!
+    //! `integration_tests` covers the daemon end-to-end but needs `CAP_NET_ADMIN`
+    //! to create interfaces, so it cannot run in CI or under an unprivileged
+    //! shell. The demux is the part of the server that AmneziaWG actually
+    //! changes, and it is reachable with nothing but a keypair and a byte
+    //! buffer: reproduce the exact sequence `register_udp_handler` performs on
+    //! an anonymous datagram.
+
+    use super::*;
+    use crate::noise::handshake::parse_handshake_anon;
+    use crate::x25519;
+    use rand_core::OsRng;
+
+    /// Run the device's anonymous-ingress sequence over `datagram`, returning
+    /// the initiator's static public key when it demuxes to a handshake.
+    ///
+    /// Mirrors `register_udp_handler`: strip the S-prefix, verify with the
+    /// device-scoped ranges, then identify the peer from the parse result.
+    fn demux_handshake(
+        server_secret: &x25519::StaticSecret,
+        obf: ObfuscationRanges,
+        amnezia: &AmneziaConfig,
+        datagram: &[u8],
+    ) -> Option<[u8; 32]> {
+        let server_public = x25519::PublicKey::from(server_secret);
+        let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
+        let mut scratch = vec![0u8; MAX_UDP_SIZE];
+
+        let stripped = amnezia.strip_inbound(obf, datagram);
+        let parsed = limiter
+            .verify_packet(obf, &mut OsRng, None, stripped, &mut scratch)
+            .ok()?;
+
+        match parsed {
+            Packet::HandshakeInit(p) => parse_handshake_anon(server_secret, &server_public, &p)
+                .ok()
+                .map(|hh| hh.peer_static_public),
+            _ => None,
+        }
+    }
+
+    /// An AmneziaWG client's obfuscated initiation is demuxed to the right peer.
+    ///
+    /// This is the crux of server support: ingress has to classify a datagram
+    /// *before* any peer is known, so the S-prefix must be stripped and the
+    /// H1 tag understood using the device's settings alone.
+    #[test]
+    fn obfuscated_initiation_demuxes_to_the_initiating_peer() {
+        let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let client_public = x25519::PublicKey::from(&client_secret);
+
+        // Non-default tags and a junk prefix on every packet kind, so a device
+        // still on the vanilla defaults could not parse this.
+        let obf = ObfuscationRanges::new(
+            342871004, 442871003, 542871004, 642871003, 742871004, 842871003, 942871004, 1042871003,
+        )
+        .unwrap();
+        let amnezia = AmneziaConfig::new(37, 121, 88, 64);
+
+        let mut client = Tunn::new_with_amnezia(
+            client_secret,
+            server_public,
+            None,
+            None,
+            1,
+            None,
+            342871004,
+            442871003,
+            542871004,
+            642871003,
+            742871004,
+            842871003,
+            942871004,
+            1042871003,
+            amnezia.clone(),
+        )
+        .unwrap();
+
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let datagram = match client.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+
+        // S1 = 37 bytes of junk ahead of the 148-byte initiation.
+        assert_eq!(datagram.len(), 37 + 148, "S1 prefix present on the wire");
+        let mut tag_bytes = [0u8; 4];
+        tag_bytes.copy_from_slice(&datagram[37..41]);
+        let tag = u32::from_le_bytes(tag_bytes);
+        assert!(
+            (342871004..=442871003).contains(&tag),
+            "H1 tag in the configured range, got {}",
+            tag
+        );
+
+        let demuxed = demux_handshake(&server_secret, obf, &amnezia, &datagram)
+            .expect("device ingress must demux an obfuscated initiation");
+        assert_eq!(
+            demuxed,
+            *client_public.as_bytes(),
+            "must identify the initiating peer"
+        );
+    }
+
+    /// A device left on the vanilla defaults cannot read that datagram. This is
+    /// what was silently happening before device-scoped settings existed: the
+    /// daemon dropped every AmneziaWG client without a diagnostic.
+    #[test]
+    fn vanilla_device_cannot_demux_an_obfuscated_initiation() {
+        let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        let client_secret = x25519::StaticSecret::random_from_rng(OsRng);
+
+        let amnezia = AmneziaConfig::new(37, 121, 88, 64);
+        let mut client = Tunn::new_with_amnezia(
+            client_secret,
+            server_public,
+            None,
+            None,
+            1,
+            None,
+            342871004,
+            442871003,
+            542871004,
+            642871003,
+            742871004,
+            842871003,
+            942871004,
+            1042871003,
+            amnezia,
+        )
+        .unwrap();
+
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let datagram = match client.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+
+        let demuxed = demux_handshake(
+            &server_secret,
+            ObfuscationRanges::default(),
+            &AmneziaConfig::default(),
+            &datagram,
+        );
+        assert!(
+            demuxed.is_none(),
+            "a vanilla device must not be able to read an obfuscated initiation"
+        );
+    }
+}
