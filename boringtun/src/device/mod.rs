@@ -46,7 +46,8 @@ use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
-use rand_core::{OsRng, RngCore};
+use rand_chacha::ChaCha8Rng;
+use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
 use tun::TunSocket;
 
@@ -124,9 +125,9 @@ pub struct DeviceConfig {
     /// what the parse keys on, and the parse result is what finds the peer.
     /// The default is the vanilla WireGuard message types.
     pub obf: ObfuscationRanges,
-    /// Interface-wide AmneziaWG S1-S4 junk sizes and imitation settings. Jc and
-    /// the imitation sequence are client-only and are dropped when this is
-    /// handed to a peer; see [`AmneziaConfig::as_responder`].
+    /// Interface-wide AmneziaWG S1-S4 junk sizes, Jc pre-handshake junk, and
+    /// imitation settings. Applied to every peer verbatim, matching the kernel
+    /// module: junk is emitted by whichever side initiates a handshake.
     pub amnezia: AmneziaConfig,
 }
 
@@ -182,6 +183,15 @@ struct ThreadData {
     iface: Arc<TunSocket>,
     src_buf: [u8; MAX_UDP_SIZE],
     dst_buf: [u8; MAX_UDP_SIZE],
+    /// Per-thread CSPRNG for AmneziaWG junk bytes.
+    ///
+    /// The junk fillers write byte-by-byte from `next_u32`, so handing them
+    /// `OsRng` costs a syscall per few bytes. That is on the cookie-reply path,
+    /// which runs *before* any peer is authenticated, so an unauthenticated
+    /// flood would turn into a syscall storm. `Tunn` already uses a seeded
+    /// ChaCha8 for exactly these bytes (`noise/handshake.rs`), so this matches
+    /// the per-peer path rather than weakening it.
+    junk_rng: ChaCha8Rng,
 }
 
 impl DeviceHandle {
@@ -225,6 +235,7 @@ impl DeviceHandle {
         let mut thread_local = ThreadData {
             src_buf: [0u8; MAX_UDP_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
+            junk_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
             iface: if _i == 0 || !device.read().config.use_multi_queue {
                 // For the first thread use the original iface
                 Arc::clone(&device.read().iface)
@@ -250,6 +261,7 @@ impl DeviceHandle {
         let mut thread_local = ThreadData {
             src_buf: [0u8; MAX_UDP_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
+            junk_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
             iface: Arc::clone(&device.read().iface),
         };
 
@@ -317,12 +329,71 @@ impl Device {
         }
     }
 
+    /// Apply an update to a peer that already exists, in place.
+    ///
+    /// Each field is only touched when the caller supplied it, so a reload that
+    /// re-sends unchanged values is inert. That matters because the underlying
+    /// setters are not all free: changing the pre-shared key discards live
+    /// sessions.
+    fn merge_peer(
+        &mut self,
+        peer: &Arc<Mutex<Peer>>,
+        replace_ips: bool,
+        endpoint: Option<SocketAddr>,
+        allowed_ips: &[AllowedIP],
+        keepalive: Option<u16>,
+        preshared_key: Option<[u8; 32]>,
+    ) {
+        {
+            let mut p = peer.lock();
+
+            if let Some(addr) = endpoint {
+                p.set_endpoint(addr);
+            }
+            if keepalive.is_some() {
+                p.set_persistent_keepalive(keepalive);
+            }
+            if preshared_key.is_some() {
+                p.set_preshared_key(preshared_key);
+            }
+        }
+
+        // `replace_allowed_ips=true` means "these prefixes are now the whole
+        // set"; without it the new prefixes are additive. Either way the stale
+        // global index entries have to go first, or a prefix that was just
+        // dropped keeps routing here.
+        if replace_ips {
+            self.peers_by_ip
+                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(peer, p));
+            peer.lock().set_allowed_ips(allowed_ips);
+        } else if !allowed_ips.is_empty() {
+            let mut merged: Vec<AllowedIP> = peer
+                .lock()
+                .allowed_ips()
+                .map(|(addr, cidr)| AllowedIP { addr, cidr })
+                .collect();
+            merged.extend_from_slice(allowed_ips);
+            self.peers_by_ip
+                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(peer, p));
+            peer.lock().set_allowed_ips(&merged);
+        }
+
+        if replace_ips || !allowed_ips.is_empty() {
+            let prefixes: Vec<(IpAddr, u8)> = peer.lock().allowed_ips().collect();
+            for (addr, cidr) in prefixes {
+                self.peers_by_ip.insert(addr, cidr as _, Arc::clone(peer));
+            }
+        }
+
+        tracing::info!("Peer updated");
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn update_peer(
         &mut self,
         pub_key: x25519::PublicKey,
         remove: bool,
-        _replace_ips: bool,
+        replace_ips: bool,
         endpoint: Option<SocketAddr>,
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
@@ -333,10 +404,22 @@ impl Device {
             return self.remove_peer(&pub_key);
         }
 
-        // Update an existing peer
-        if self.peers.get(&pub_key).is_some() {
-            // We already have a peer, we need to merge the existing config into the newly created one
-            panic!("Modifying existing peers is not yet supported. Remove and add again instead.");
+        // Merge into an existing peer rather than rejecting the update.
+        //
+        // This path is not exotic: `awg syncconf` re-sends every peer's full
+        // block on each configuration reload, so the installer hits it on every
+        // client add and revoke. Aborting here would take the daemon down during
+        // routine peer management.
+        if let Some(peer) = self.peers.get(&pub_key).cloned() {
+            self.merge_peer(
+                &peer,
+                replace_ips,
+                endpoint,
+                allowed_ips,
+                keepalive,
+                preshared_key,
+            );
+            return;
         }
 
         let next_index = self.next_index();
@@ -366,7 +449,15 @@ impl Device {
             obf.h3_cookie.end,
             obf.h4_data.start,
             obf.h4_data.end,
-            self.config.amnezia.clone().as_responder(),
+            // Not `as_responder()`: the kernel module emits Jc junk from
+            // `wg_packet_send_handshake_initiation` (src/send.c:58-75), i.e.
+            // from whichever side initiates, with no role distinction. Since
+            // this device layer is also what backs boringtun-cli as
+            // `wg-quick`'s userspace implementation -- a client -- suppressing
+            // it here would silently drop configured junk for the common case.
+            // Embedders that genuinely want responder-only suppression can
+            // still opt in via `AmneziaConfig::as_responder`.
+            self.config.amnezia.clone(),
         )
         .expect("device obfuscation ranges were validated when they were set");
 
@@ -511,32 +602,36 @@ impl Device {
 
     /// Set the interface-wide AmneziaWG parameters.
     ///
-    /// Returns `false` and changes nothing when the values already match. That
-    /// short-circuit is load-bearing rather than an optimisation: `awg syncconf`
-    /// re-sends the whole `[Interface]` block on every peer add or revoke, and
-    /// H/S changes invalidate all sessions, so applying unconditionally would
-    /// tear down every live tunnel on routine peer management. `set_key` above
-    /// short-circuits for the same reason.
+    /// Returns `false` and changes nothing when the values already match.
+    ///
+    /// The short-circuit is an optimisation, not a correctness requirement:
+    /// `awg syncconf` re-sends the whole `[Interface]` block on every peer add
+    /// or revoke, so without it each of those would walk every peer, take every
+    /// peer lock and log a spurious "parameters updated". Applying redundantly
+    /// would still be *safe* — `Tunn::set_obfuscation` keeps established
+    /// sessions, because obfuscation is framing rather than key material.
+    /// (`set_key` above short-circuits for a stronger reason: rekeying really
+    /// does drop sessions.)
     fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) -> bool {
         if self.config.obf == obf && self.config.amnezia == amnezia {
             return false;
         }
 
-        // Peers snapshot these values when their `Tunn` is built, so any peer
-        // that already exists keeps the previous settings. In practice
-        // `awg setconf` sends the interface block before any peer section, so
-        // this only bites on a live reconfiguration.
-        if !self.peers.is_empty() {
-            tracing::warn!(
-                message =
-                    "AmneziaWG parameters changed while peers exist; existing peers keep the \
-                           previous settings until they are removed and re-added",
-                peers = self.peers.len()
-            );
-        }
-
         self.config.obf = obf;
         self.config.amnezia = amnezia;
+
+        // Push to every existing peer, exactly as `set_key` does above. Peers
+        // snapshot these values when their `Tunn` is built, so without this a
+        // live change leaves each peer framing packets differently from the
+        // interface that has to parse them: every tunnel dies silently and
+        // stays dead until the daemon restarts. `awg syncconf` reaches here on
+        // any `[Interface]` edit, so this is a routine path, not a corner case.
+        let obf = self.config.obf;
+        let amnezia = self.config.amnezia.clone();
+        for peer in self.peers.values_mut() {
+            peer.lock().tunnel.set_obfuscation(obf, amnezia.clone());
+        }
+
         true
     }
 
@@ -630,7 +725,13 @@ impl Device {
                                 }
                             };
                         }
-                        _ => panic!("Unexpected result from update_timers"),
+                        // update_timers only yields Done/Err/WriteToNetwork, but
+                        // this runs on a 250 ms tick for every peer: an
+                        // unexpected variant must not take the daemon down.
+                        other => tracing::error!(
+                            message = "Unexpected result from update_timers",
+                            result = ?other
+                        ),
                     };
                 }
                 Action::Continue
@@ -702,7 +803,7 @@ impl Device {
                                 obf,
                                 &mut t.dst_buf,
                                 cookie_len,
-                                &mut OsRng,
+                                &mut t.junk_rng,
                             ) {
                                 let _: Result<_, _> = udp.send_to(out, &addr);
                             }
@@ -913,7 +1014,12 @@ impl Device {
                                 tracing::error!("No endpoint");
                             }
                         }
-                        _ => panic!("Unexpected result from encapsulate"),
+                        // Per-packet path: drop the packet rather than aborting
+                        // the whole daemon on an unexpected variant.
+                        other => tracing::error!(
+                            message = "Unexpected result from encapsulate",
+                            result = ?other
+                        ),
                     };
                 }
                 Action::Continue

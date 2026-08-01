@@ -661,6 +661,23 @@ impl Handshake {
         self.params.set_static_private(private_key, public_key)
     }
 
+    /// Replace the message-type tag ranges. Purely a framing change — no key or
+    /// Noise state is affected.
+    pub(crate) fn set_obfuscation(&mut self, obf: ObfuscationRanges) {
+        self.obf = obf;
+    }
+
+    pub(crate) fn preshared_key(&self) -> Option<[u8; KEY_LEN]> {
+        self.params.preshared_key
+    }
+
+    /// Replace the peer's optional pre-shared key. The caller is responsible for
+    /// discarding existing sessions: the key is mixed into the handshake, so any
+    /// session derived under the old value stays valid until dropped.
+    pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; KEY_LEN]>) {
+        self.params.preshared_key = preshared_key;
+    }
+
     pub(super) fn receive_handshake_initialization<'a>(
         &mut self,
         packet: HandshakeInit,

@@ -334,6 +334,75 @@ impl Tunn {
         self.pending_amnezia_junk = None;
     }
 
+    /// Replace this tunnel's AmneziaWG obfuscation settings.
+    ///
+    /// H1-H4 and S1-S4 are interface-wide in AmneziaWG, so when the device's
+    /// settings change every peer must follow: a peer left on the old values
+    /// tags and pads its packets differently from the interface that has to
+    /// parse them, and the tunnel dies silently and permanently.
+    ///
+    /// Live sessions are kept. Obfuscation is a framing concern, not a
+    /// cryptographic one — the keys and the Noise state are untouched, so
+    /// forcing a re-handshake would drop traffic for no benefit. Any queued
+    /// pre-handshake junk is dropped, since it was generated under the previous
+    /// configuration.
+    pub fn set_obfuscation(&mut self, obf: ObfuscationRanges, amnezia: AmneziaConfig) {
+        self.handshake.set_obfuscation(obf);
+        self.amnezia = amnezia;
+        self.pending_amnezia_junk = None;
+    }
+
+    /// Update the persistent-keepalive interval.
+    ///
+    /// Purely a timer change, so live sessions are kept: the peer's keys are
+    /// unaffected and re-handshaking would be gratuitous.
+    pub fn set_persistent_keepalive(&mut self, keepalive: Option<u16>) {
+        self.timers.set_persistent_keepalive(keepalive);
+    }
+
+    /// The peer's optional pre-shared key.
+    pub fn preshared_key(&self) -> Option<[u8; 32]> {
+        self.handshake.preshared_key()
+    }
+
+    /// Replace the peer's optional pre-shared key.
+    ///
+    /// Unlike the keepalive, this **discards every established session**. The
+    /// pre-shared key is mixed into the handshake, so sessions derived under the
+    /// old value are cryptographically stale; keeping them would leave the peer
+    /// authenticated by a key the operator has just revoked. This mirrors what
+    /// [`Self::set_static_private`] does for the static key.
+    ///
+    /// No-op when the key is unchanged, so a configuration reload that re-sends
+    /// the same value does not tear down live tunnels.
+    pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
+        // Compare the *effective* key, not the `Option`. The handshake mixes
+        // `preshared_key.unwrap_or([0u8; 32])`, so `None` and `Some([0; 32])`
+        // are the same key cryptographically -- and wg's tooling clears a PSK
+        // by sending 32 zero bytes rather than omitting the field, so a plain
+        // `Option` comparison would treat a routine reload as a key change and
+        // tear down every session for a peer that never had a PSK.
+        let effective = |key: Option<[u8; 32]>| key.unwrap_or([0u8; 32]);
+        let unchanged = effective(self.handshake.preshared_key()) == effective(preshared_key);
+
+        // Always store the caller's value, even when it is cryptographically
+        // equivalent. `Peer` keeps its own copy for `get=1`, and skipping the
+        // write here would let the two disagree -- the handshake holding
+        // `Some([0; 32])` while the peer reports `None`, or the reverse.
+        self.handshake.set_preshared_key(preshared_key);
+
+        // Only the teardown is conditional: sessions derived from an equivalent
+        // key are still valid, so discarding them would drop live traffic for
+        // no gain.
+        if unchanged {
+            return;
+        }
+        for s in &mut self.sessions {
+            *s = None;
+        }
+        self.pending_amnezia_junk = None;
+    }
+
     /// Encapsulate a single packet from the tunnel interface.
     /// Returns TunnResult.
     ///
@@ -1283,6 +1352,119 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(init[5..9].try_into().unwrap()),
             HANDSHAKE_INIT
+        );
+    }
+
+    #[test]
+    fn set_preshared_key_treats_all_zero_as_absent() {
+        // The handshake mixes `preshared_key.unwrap_or([0u8; 32])`, so an
+        // all-zero key and `None` are the same key. wg clears a PSK by sending
+        // 32 zero bytes, so this transition happens on ordinary reloads and
+        // must not be mistaken for a key change.
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(my_tun.sessions.iter().any(|s| s.is_some()));
+
+        my_tun.set_preshared_key(Some([0u8; 32]));
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "None -> all-zero is not a key change and must keep sessions"
+        );
+        assert_eq!(
+            my_tun.preshared_key(),
+            Some([0u8; 32]),
+            "the stored value must follow the caller, so `Peer`'s copy cannot disagree"
+        );
+
+        my_tun.set_preshared_key(None);
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "all-zero -> None must keep sessions too"
+        );
+        assert_eq!(my_tun.preshared_key(), None, "stored value follows back");
+
+        // A genuine key still resets, since sessions derived under the old key
+        // are cryptographically stale.
+        my_tun.set_preshared_key(Some([7u8; 32]));
+        assert!(
+            my_tun.sessions.iter().all(|s| s.is_none()),
+            "a real key change must discard sessions"
+        );
+    }
+
+    #[test]
+    fn set_obfuscation_reframes_without_dropping_sessions() {
+        // H/S are interface-wide, so a live change has to reach every peer or
+        // the peer frames packets the interface can no longer parse. It is a
+        // framing change, not a cryptographic one, so sessions must survive.
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "session exists"
+        );
+
+        let new_obf = ObfuscationRanges::new(10, 20, 30, 40, 50, 60, 70, 80).unwrap();
+        let new_amnezia = AmneziaConfig::new(3, 5, 7, 9);
+        my_tun.set_obfuscation(new_obf, new_amnezia.clone());
+
+        assert_eq!(my_tun.handshake.obf, new_obf, "tag ranges updated");
+        assert_eq!(my_tun.amnezia, new_amnezia, "junk sizes updated");
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "reframing must not tear down established sessions"
+        );
+
+        // A handshake initiation now carries the new H1 tag and S1 prefix.
+        let mut dst = vec![0u8; 2048];
+        let init = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, true));
+        assert_eq!(init.len(), HANDSHAKE_INIT_SZ + 3, "S1 = 3 applied");
+        let tag = u32::from_le_bytes(init[3..7].try_into().unwrap());
+        assert!((10..=20).contains(&tag), "H1 in new range, got {}", tag);
+    }
+
+    #[test]
+    fn set_persistent_keepalive_updates_interval_without_dropping_sessions() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "session exists"
+        );
+
+        my_tun.set_persistent_keepalive(Some(25));
+        assert_eq!(my_tun.persistent_keepalive(), Some(25));
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "a keepalive change is a timer change; sessions must survive"
+        );
+
+        // None disables it, matching how Timers::new reads the same argument.
+        my_tun.set_persistent_keepalive(None);
+        assert_eq!(my_tun.persistent_keepalive(), None);
+    }
+
+    #[test]
+    fn set_preshared_key_discards_sessions_only_when_it_actually_changes() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "session exists"
+        );
+
+        // Re-applying the same value must not disturb live tunnels -- a config
+        // reload re-sends every peer's block unchanged.
+        let current = my_tun.preshared_key();
+        my_tun.set_preshared_key(current);
+        assert!(
+            my_tun.sessions.iter().any(|s| s.is_some()),
+            "unchanged key must not tear down sessions"
+        );
+
+        // A real change invalidates them: sessions derived under the old key are
+        // cryptographically stale.
+        my_tun.set_preshared_key(Some([7u8; 32]));
+        assert_eq!(my_tun.preshared_key(), Some([7u8; 32]));
+        assert!(
+            my_tun.sessions.iter().all(|s| s.is_none()),
+            "changed key must discard every session"
         );
     }
 

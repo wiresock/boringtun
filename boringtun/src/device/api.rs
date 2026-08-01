@@ -23,19 +23,25 @@ const SOCK_DIR: &str = "/var/run/wireguard/";
 /// range, which is exactly how the kernel module's `mh_genspec` treats it, so
 /// existing single-value configs map across unchanged.
 fn parse_tag_range(val: &str) -> Option<(u32, u32)> {
-    match val.split_once('-') {
-        Some((start, end)) => {
-            let (start, end) = (start.trim().parse().ok()?, end.trim().parse().ok()?);
-            if start > end {
-                return None;
-            }
-            Some((start, end))
-        }
+    let (start, end) = match val.split_once('-') {
+        Some((start, end)) => (start.trim().parse().ok()?, end.trim().parse().ok()?),
         None => {
-            let v = val.trim().parse().ok()?;
-            Some((v, v))
+            let v: u32 = val.trim().parse().ok()?;
+            (v, v)
         }
+    };
+    if start > end {
+        return None;
     }
+    // Reject 0 rather than accepting it silently. `ObfuscationRanges::new`
+    // treats an all-zero range as "unset" and substitutes the vanilla WireGuard
+    // message type for that packet kind, so `h1=0` would quietly disable
+    // obfuscation instead of using tag 0 -- the opposite of what the operator
+    // wrote. Failing the transaction with EINVAL makes that visible.
+    if start == 0 {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// AmneziaWG values accumulated over one `set=1` transaction.
@@ -140,6 +146,22 @@ impl AwgParams {
         }
         Ok(())
     }
+}
+
+/// The attributes of a single `[Peer]` section of a `set=1` transaction.
+///
+/// Grouped into one struct with a `Default` so that starting a new section is a
+/// single assignment. They were previously six separate locals declared outside
+/// the parse loop, of which only `allowed_ips` was reset between sections — so
+/// every other attribute leaked into the next peer.
+#[derive(Default)]
+struct PeerSection {
+    remove: bool,
+    replace_ips: bool,
+    endpoint: Option<SocketAddr>,
+    keepalive: Option<u16>,
+    preshared_key: Option<[u8; 32]>,
+    allowed_ips: Vec<AllowedIP>,
 }
 
 fn create_sock_dir() {
@@ -482,26 +504,20 @@ fn api_set_peer(
 ) -> i32 {
     let mut cmd = String::new();
 
-    let mut remove = false;
-    let mut replace_ips = false;
-    let mut endpoint = None;
-    let mut keepalive = None;
     let mut public_key = pub_key;
-    let mut preshared_key = None;
-    let mut allowed_ips: Vec<AllowedIP> = vec![];
+    let mut sec = PeerSection::default();
     while reader.read_line(&mut cmd).is_ok() {
         cmd.pop(); // remove newline if any
         if cmd.is_empty() {
             d.update_peer(
                 public_key,
-                remove,
-                replace_ips,
-                endpoint,
-                allowed_ips.as_slice(),
-                keepalive,
-                preshared_key,
+                sec.remove,
+                sec.replace_ips,
+                sec.endpoint,
+                sec.allowed_ips.as_slice(),
+                sec.keepalive,
+                sec.preshared_key,
             );
-            allowed_ips.clear(); //clear the vector content after update
             return 0; // Done
         }
         {
@@ -512,43 +528,47 @@ fn api_set_peer(
             let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
             match key {
                 "remove" => match val.parse::<bool>() {
-                    Ok(true) => remove = true,
-                    Ok(false) => remove = false,
+                    Ok(true) => sec.remove = true,
+                    Ok(false) => sec.remove = false,
                     Err(_) => return EINVAL,
                 },
                 "preshared_key" => match val.parse::<KeyBytes>() {
-                    Ok(key_bytes) => preshared_key = Some(key_bytes.0),
+                    Ok(key_bytes) => sec.preshared_key = Some(key_bytes.0),
                     Err(_) => return EINVAL,
                 },
                 "endpoint" => match val.parse::<SocketAddr>() {
-                    Ok(addr) => endpoint = Some(addr),
+                    Ok(addr) => sec.endpoint = Some(addr),
                     Err(_) => return EINVAL,
                 },
                 "persistent_keepalive_interval" => match val.parse::<u16>() {
-                    Ok(interval) => keepalive = Some(interval),
+                    Ok(interval) => sec.keepalive = Some(interval),
                     Err(_) => return EINVAL,
                 },
                 "replace_allowed_ips" => match val.parse::<bool>() {
-                    Ok(true) => replace_ips = true,
-                    Ok(false) => replace_ips = false,
+                    Ok(true) => sec.replace_ips = true,
+                    Ok(false) => sec.replace_ips = false,
                     Err(_) => return EINVAL,
                 },
                 "allowed_ip" => match val.parse::<AllowedIP>() {
-                    Ok(ip) => allowed_ips.push(ip),
+                    Ok(ip) => sec.allowed_ips.push(ip),
                     Err(_) => return EINVAL,
                 },
                 "public_key" => {
                     // Indicates a new peer section. Commit changes for current peer, and continue to next peer
                     d.update_peer(
                         public_key,
-                        remove,
-                        replace_ips,
-                        endpoint,
-                        allowed_ips.as_slice(),
-                        keepalive,
-                        preshared_key,
+                        sec.remove,
+                        sec.replace_ips,
+                        sec.endpoint,
+                        sec.allowed_ips.as_slice(),
+                        sec.keepalive,
+                        sec.preshared_key,
                     );
-                    allowed_ips.clear(); //clear the vector content after update
+                    // Each `[Peer]` block is independent, matching the kernel's
+                    // nested-attribute model. Reset every attribute, not just
+                    // allowed_ips: carrying `remove` would delete the next peer,
+                    // and carrying `preshared_key` would overwrite its key.
+                    sec = PeerSection::default();
                     match val.parse::<KeyBytes>() {
                         Ok(key_bytes) => public_key = key_bytes.0.into(),
                         Err(_) => return EINVAL,
@@ -617,5 +637,19 @@ mod tests {
         assert_eq!(parse_tag_range("-1"), None);
         assert_eq!(parse_tag_range("4294967296"), None, "overflows u32");
         assert_eq!(parse_tag_range("1-2-3"), None);
+    }
+
+    #[test]
+    fn parse_tag_range_rejects_zero_rather_than_silently_disabling() {
+        // ObfuscationRanges::new treats an all-zero range as "unset" and
+        // substitutes the vanilla WireGuard message type. Accepting h1=0 would
+        // therefore turn obfuscation *off* for that packet kind while reporting
+        // success -- the opposite of what the operator asked for.
+        assert_eq!(parse_tag_range("0"), None);
+        assert_eq!(parse_tag_range("0-0"), None);
+        assert_eq!(parse_tag_range("0-5"), None);
+        // Non-zero starts are unaffected.
+        assert_eq!(parse_tag_range("1"), Some((1, 1)));
+        assert_eq!(parse_tag_range("1-5"), Some((1, 5)));
     }
 }
