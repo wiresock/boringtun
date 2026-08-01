@@ -566,7 +566,11 @@ fn api_set_peer(
                 sec.keepalive,
                 sec.preshared_key,
             ) {
-                tracing::error!(message = "failed to apply peer", error = ?e);
+                tracing::error!(
+                    message = "failed to apply peer",
+                    peer = encode_hex(public_key.as_bytes()).as_str(),
+                    error = ?e
+                );
                 return EIO;
             }
             return 0; // Done
@@ -615,7 +619,11 @@ fn api_set_peer(
                         sec.keepalive,
                         sec.preshared_key,
                     ) {
-                        tracing::error!(message = "failed to apply peer", error = ?e);
+                        tracing::error!(
+                            message = "failed to apply peer",
+                            peer = encode_hex(public_key.as_bytes()).as_str(),
+                            error = ?e
+                        );
                         return EIO;
                     }
                     // Each `[Peer]` block is independent, matching the kernel's

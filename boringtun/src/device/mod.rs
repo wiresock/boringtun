@@ -196,6 +196,20 @@ struct ThreadData {
     junk_rng: ChaCha8Rng,
 }
 
+/// The device's key pair, or an error naming what is missing.
+///
+/// Extracted from `update_peer` so the guard sits behind a name that a test can
+/// call. A free function rather than a method because constructing a `Device`
+/// needs a TUN device and root, which would put this out of reach of ordinary
+/// tests -- and an untestable guard is how it silently regresses to a panic.
+fn require_key_pair(
+    key_pair: &Option<(x25519::StaticSecret, x25519::PublicKey)>,
+) -> Result<&(x25519::StaticSecret, x25519::PublicKey), Error> {
+    key_pair
+        .as_ref()
+        .ok_or_else(|| Error::PeerSetup("private key must be set first".to_owned()))
+}
+
 impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         let n_threads = config.n_threads;
@@ -431,10 +445,7 @@ impl Device {
         // no key pair. `awg setconf` always sends the key first, so this is
         // malformed input rather than normal use -- which is exactly why it
         // should be an error the caller sees rather than a dead daemon.
-        let device_key_pair = self
-            .key_pair
-            .as_ref()
-            .ok_or_else(|| Error::PeerSetup("private key must be set first".to_owned()))?;
+        let device_key_pair = require_key_pair(&self.key_pair)?;
 
         // Read the obfuscation settings from the device rather than taking them
         // as parameters: that is what guarantees every peer's copy stays
@@ -1213,20 +1224,31 @@ mod ingress_tests {
     /// kill the server by reordering two lines.
     #[test]
     fn peer_before_private_key_is_an_error_not_a_panic() {
-        // A `Device` needs a TUN, so exercise the guard directly: the branch
-        // under test is `self.key_pair.as_ref().ok_or_else(...)`, and what
-        // matters is that the None case yields Err rather than unwinding.
-        let key_pair: Option<(x25519::StaticSecret, x25519::PublicKey)> = None;
-        let result = key_pair
-            .as_ref()
-            .ok_or_else(|| Error::PeerSetup("private key must be set first".to_owned()));
-
-        let err = result.err().expect("no key pair must produce an error");
+        // Calls the same `require_key_pair` that `update_peer` calls, so a
+        // regression to `expect`/panic there fails here. An earlier version of
+        // this test inlined the `ok_or_else` instead, which only asserted that
+        // `Option::ok_or_else` works and would have passed either way.
+        // `expect_err` is unavailable here: the Ok type contains `StaticSecret`,
+        // which deliberately does not implement `Debug` so secrets cannot leak
+        // into a panic message or a log line.
+        let err = match require_key_pair(&None) {
+            Err(e) => e,
+            Ok(_) => panic!("no key pair must be an error"),
+        };
         assert!(
             matches!(err, Error::PeerSetup(ref m) if m.contains("private key")),
             "error should name the missing private key, got {:?}",
             err
         );
+
+        // And the configured case still yields the pair.
+        let secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let public = x25519::PublicKey::from(&secret);
+        let configured = Some((secret, public));
+        match require_key_pair(&configured) {
+            Ok((_, got_public)) => assert_eq!(got_public.as_bytes(), public.as_bytes()),
+            Err(e) => panic!("a configured key pair must be returned, got {:?}", e),
+        }
     }
 
     /// A device left on the vanilla defaults cannot read that datagram. This is
