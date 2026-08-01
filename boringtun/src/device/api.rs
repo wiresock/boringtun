@@ -194,6 +194,13 @@ fn create_sock_dir(dir: &str) {
 impl Device {
     /// Register the api handler for this Device. The api handler receives stream connections on a Unix socket
     /// with a known path: /var/run/wireguard/{tun_name}.sock.
+    ///
+    /// The same socket is also published at /var/run/amneziawg/{tun_name}.sock
+    /// as a symlink, because `amneziawg-tools` searches that directory rather
+    /// than the WireGuard one; without it `awg` cannot see this interface at
+    /// all. There is still exactly one socket and one accept loop. If the
+    /// symlink cannot be created the handler is registered anyway and a warning
+    /// is logged, leaving the device reachable by `wg` but not `awg`.
     pub fn register_api_handler(&mut self) -> Result<(), Error> {
         let name = self.iface.name()?;
         let path = format!("{}/{}.sock", SOCK_DIR, name);
