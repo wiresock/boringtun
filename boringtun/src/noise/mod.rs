@@ -277,8 +277,6 @@ impl Tunn {
         h4_data_end: u32,
         amnezia: AmneziaConfig,
     ) -> Result<Self, String> {
-        let static_public = x25519::PublicKey::from(&static_private);
-
         let obf = ObfuscationRanges::new(
             h1_init_start,
             h1_init_end,
@@ -289,6 +287,41 @@ impl Tunn {
             h4_data_start,
             h4_data_end,
         )?;
+
+        Self::new_with_obfuscation(
+            static_private,
+            peer_static_public,
+            preshared_key,
+            persistent_keepalive,
+            index,
+            rate_limiter,
+            obf,
+            amnezia,
+        )
+    }
+
+    /// As [`Self::new_with_amnezia`], but taking obfuscation ranges that have
+    /// already been validated.
+    ///
+    /// Callers holding an [`ObfuscationRanges`] should prefer this: the raw
+    /// eight-integer form has to re-run `ObfuscationRanges::new`, which can
+    /// only fail on input the caller has by definition already rejected, so the
+    /// error it returns is unreachable and tempts callers into `expect`.
+    ///
+    /// The remaining failure is real but rare: seeding the per-tunnel RNG from
+    /// OS entropy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_obfuscation(
+        static_private: x25519::StaticSecret,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+        index: u32,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        obf: ObfuscationRanges,
+        amnezia: AmneziaConfig,
+    ) -> Result<Self, String> {
+        let static_public = x25519::PublicKey::from(&static_private);
 
         Ok(Tunn {
             handshake: Handshake::new(
