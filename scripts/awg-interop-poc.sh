@@ -130,7 +130,15 @@ BORINGTUN=${1:-}
 # check 1 blames "awg setconf", having already reported preflight OK.
 case "$BORINGTUN" in
   /*) ;;
-  *) BORINGTUN="$(cd "$(dirname "$BORINGTUN")" 2>/dev/null && pwd)/$(basename "$BORINGTUN")" ;;
+  *)
+    # Resolve via the containing directory, and fail loudly if that directory
+    # does not exist. Letting the substitution collapse would leave
+    # "/<basename>", which at best names a path the caller never typed and at
+    # worst names a different executable that happens to sit in /.
+    _dir=$(cd "$(dirname "$BORINGTUN")" 2>/dev/null && pwd)
+    [ -n "$_dir" ] || die "cannot resolve $BORINGTUN: no such directory"
+    BORINGTUN="$_dir/$(basename "$BORINGTUN")"
+    ;;
 esac
 
 [ "$(id -u)" -eq 0 ]              || die "must run as root (creates network namespaces)"
@@ -172,6 +180,11 @@ info "preflight OK  (binary: $BORINGTUN, kernel module present)"
 
 # ------------------------------------------------------------------- set up --
 
+# Abort on the first failure for the whole setup phase. Without it a failed
+# `ip netns add` or `awg genkey` leaves a half-built topology, and every check
+# below then reports an interop failure that is really setup breakage.
+# Disabled again before the checks, which inspect non-zero exits themselves.
+set -e
 umask 077
 cd "$WORKDIR" || die "cannot enter $WORKDIR"
 awg genkey > srv.key; awg pubkey < srv.key > srv.pub
@@ -210,7 +223,8 @@ write_iface_conf srv.conf "$(cat srv.key)" "ListenPort = $PORT" "${OBF_LINES[@]}
 printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.66.201.2/32\n' "$(cat cli.pub)" >> srv.conf
 
 for n in 1 2; do
-  k=cli.key; ep=10.201.0.1; [ "$n" = 2 ] && { k=cli2.key; ep=10.201.1.1; }
+  k=cli.key; ep=10.201.0.1
+  if [ "$n" = 2 ]; then k=cli2.key; ep=10.201.1.1; fi
   write_iface_conf "c$n.conf" "$(cat $k)" "${OBF_LINES[@]}"
   printf '\n[Peer]\nPublicKey = %s\nEndpoint = %s:%s\nAllowedIPs = 10.66.201.1/32\nPersistentKeepalive = 25\n' \
     "$(cat srv.pub)" "$ep" "$PORT" >> "c$n.conf"
@@ -248,6 +262,9 @@ start_client() {  # $1 = ns, $2 = conf, $3 = tunnel addr
   ip netns exec "$1" awg setconf "$IF_CLI" "$2" || return 1
   ip netns exec "$1" sh -c "ip addr add $3/32 dev $IF_CLI && ip link set $IF_CLI up mtu 1420 && ip route add 10.66.201.1/32 dev $IF_CLI" || return 1
 }
+
+# Checks from here on inspect exit statuses themselves.
+set +e
 
 # --------------------------------------------------------------------- tests --
 
