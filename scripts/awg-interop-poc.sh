@@ -329,11 +329,15 @@ while read -r hex; do
   fi
 done <<EOF
 $(ip netns exec "$NS_SRV" tcpdump -r "$WORKDIR/wire.pcap" -nn -x 2>/dev/null | awk '
-  /^[^\t ]/ { if (h != "") print h; h = ""; next }
-  { for (i = 2; i <= NF; i++) h = h $i }
+  /^[[:space:]]*0x[0-9a-fA-F]+:/ { for (i = 2; i <= NF; i++) h = h $i; next }
+  { if (h != "") print h; h = "" }
   END { if (h != "") print h }')
 EOF
-if [ "$tag_found" -ne 1 ]; then
+if [ "$frames" -eq 0 ]; then
+  # Distinct from the case below: nothing was decoded, so this says nothing
+  # about the wire format and must not be reported as if it did.
+  bad "could not decode any frame from the capture (tcpdump output not understood?)"
+elif [ "$tag_found" -ne 1 ]; then
   bad "no captured frame carried an H4 tag at offset $S4 (frames examined: $frames)"
 fi
 
