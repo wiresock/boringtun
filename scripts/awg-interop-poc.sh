@@ -129,15 +129,25 @@ BORINGTUN=${1:-}
 # target/release fallback -- no longer resolves: the server fails to start and
 # check 1 blames "awg setconf", having already reported preflight OK.
 case "$BORINGTUN" in
-  /*) ;;
-  *)
-    # Resolve via the containing directory, and fail loudly if that directory
-    # does not exist. Letting the substitution collapse would leave
-    # "/<basename>", which at best names a path the caller never typed and at
-    # worst names a different executable that happens to sit in /.
+  /*)
+    # Already absolute.
+    ;;
+  */*)
+    # A path with a directory component: resolve it via that directory, and
+    # fail loudly if the directory does not exist. Letting the substitution
+    # collapse would leave "/<basename>", which at best names a path the
+    # caller never typed and at worst a different executable sitting in /.
     _dir=$(cd "$(dirname "$BORINGTUN")" 2>/dev/null && pwd)
     [ -n "$_dir" ] || die "cannot resolve $BORINGTUN: no such directory"
     BORINGTUN="$_dir/$(basename "$BORINGTUN")"
+    ;;
+  *)
+    # A bare command name. dirname would make this "./<name>" and look only
+    # in the current directory, so an installed boringtun-cli would be
+    # reported as missing. Resolve it the way the shell would.
+    _resolved=$(command -v "$BORINGTUN" 2>/dev/null)
+    [ -n "$_resolved" ] || die "$BORINGTUN not found on PATH"
+    BORINGTUN=$_resolved
     ;;
 esac
 
