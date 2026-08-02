@@ -219,11 +219,13 @@ done
 start_server() {  # $1 = config file
   ip netns exec "$NS_SRV" env WG_LOG_FILE="$WORKDIR/srv.log" \
     "$BORINGTUN" --disable-drop-privileges "$IF_SRV" >/dev/null 2>&1
-  # Poll for the UAPI socket rather than assuming a fixed startup time. A
-  # fixed sleep is a false negative waiting for a slow or loaded host, and
-  # this check is meant to be trusted when it fails.
+  # Poll for the socket `awg` actually opens, not the one boringtun binds
+  # first: it binds /var/run/wireguard/<if>.sock and only then symlinks it
+  # into /var/run/amneziawg/ (device/api.rs), so waiting on the former leaves
+  # a window where the poll succeeds and setconf still cannot find the device.
+  # A fixed sleep would be worse again -- a false negative on a loaded host.
   local waited=0
-  while [ ! -S "/var/run/wireguard/${IF_SRV}.sock" ]; do
+  while [ ! -e "/var/run/amneziawg/${IF_SRV}.sock" ]; do
     sleep 0.2
     waited=$((waited + 1))
     [ "$waited" -ge 50 ] && return 1   # 10s
@@ -295,8 +297,9 @@ else
 fi
 
 info "5. Multi-peer: a second peer added live to the running server"
-ip netns exec "$NS_SRV" awg set "$IF_SRV" peer "$(cat cli2.pub)" allowed-ips 10.66.201.3/32
-if ! start_client "$NS_CLI2" c2.conf 10.66.201.3; then
+if ! ip netns exec "$NS_SRV" awg set "$IF_SRV" peer "$(cat cli2.pub)" allowed-ips 10.66.201.3/32; then
+  bad "server rejected the second peer (awg set) -- not a client or datapath result"
+elif ! start_client "$NS_CLI2" c2.conf 10.66.201.3; then
   bad "second client setup failed (ip link add / awg setconf) -- not a datapath result"
 elif ip netns exec "$NS_CLI2" ping -c3 -W3 -q 10.66.201.1 >/dev/null 2>&1; then
   ok "second peer handshakes and passes traffic"
@@ -343,9 +346,10 @@ $(ip netns exec "$NS_SRV" tcpdump -r "$WORKDIR/wire.pcap" -nn -x 2>/dev/null | a
   END { if (h != "") print h }')
 EOF
 if [ "$frames" -eq 0 ]; then
-  # Distinct from the case below: nothing was decoded, so this says nothing
-  # about the wire format and must not be reported as if it did.
-  bad "could not decode any frame from the capture (tcpdump output not understood?)"
+  # Either nothing was captured, or the output could not be parsed. Both are
+  # real possibilities and neither says anything about the wire format, so
+  # name both rather than pointing debugging at the decoder.
+  bad "no frames decoded: either no traffic was captured or the tcpdump output was not understood"
 elif [ "$tag_found" -ne 1 ]; then
   bad "no captured frame carried an H4 tag at offset $S4 (frames examined: $frames)"
 fi
