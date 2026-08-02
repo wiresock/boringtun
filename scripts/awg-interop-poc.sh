@@ -29,7 +29,14 @@ readonly NS_CLI2=awgpoc-cli2
 readonly IF_SRV=awgpoc0
 readonly IF_CLI=awgpocc
 readonly PORT=51820
-readonly WORKDIR=$(mktemp -d /tmp/awg-interop-poc.XXXXXX)
+# Checked: on failure this is empty, and `cd ""` succeeds in bash without
+# changing directory, so the `cd "$WORKDIR" || die` below would not fire and
+# every artifact would land in the invoking directory instead.
+WORKDIR=$(mktemp -d /tmp/awg-interop-poc.XXXXXX) || {
+  echo "preflight: could not create a temporary directory" >&2
+  exit 2
+}
+readonly WORKDIR
 
 # Obfuscation parameters. H1-H4 are deliberately *ranges*, not single values:
 # that is how real deployments are configured, and single values would not
@@ -56,7 +63,7 @@ cleanup() {
   ip link del awgpoc-vs2 >/dev/null 2>&1
   rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
   rmdir /var/run/amneziawg >/dev/null 2>&1
-  rm -rf "$WORKDIR"
+  [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"
   return $rc
 }
 trap cleanup EXIT INT TERM
@@ -71,6 +78,13 @@ BORINGTUN=${1:-}
 [ -x "$BORINGTUN" ]               || die "boringtun-cli not found or not executable: $BORINGTUN"
 command -v awg >/dev/null         || die "amneziawg-tools (awg) not installed"
 command -v ip  >/dev/null         || die "iproute2 (ip) not installed"
+# Asserted rather than assumed: absent, these do not merely skip a check --
+# tcpdump/timeout make check 6 report a wire-format failure that is really a
+# missing tool, and without pkill the cleanup cannot stop the server, which on
+# a shared host is the worst outcome this script can produce.
+command -v tcpdump >/dev/null     || die "tcpdump not installed (needed by the wire-format check)"
+command -v timeout >/dev/null     || die "timeout not installed (needed by the wire-format check)"
+command -v pkill   >/dev/null     || die "pkill not installed (needed to stop the server on cleanup)"
 lsmod | grep -q '^amneziawg'      || die "amneziawg kernel module not loaded -- the point of this test is a REAL client"
 [ -e /dev/net/tun ]               || die "/dev/net/tun missing"
 
@@ -152,7 +166,9 @@ if start_server srv.conf; then
   ok "awg setconf accepted (implies the UAPI socket was discoverable)"
 else
   bad "awg setconf failed -- see $WORKDIR/srv.log"
-  echo "SUMMARY: $PASS passed, $((FAIL+1)) failed"; exit 1
+  # `bad` already incremented FAIL; adding one here would over-report.
+  printf '[31mSUMMARY: %d passed, %d FAILED[0m
+' "$PASS" "$FAIL"; exit 1
 fi
 
 info "2. UAPI: showconf round-trips every AmneziaWG parameter"
