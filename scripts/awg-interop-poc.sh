@@ -48,6 +48,13 @@ readonly H2=390382747-890382746
 readonly H3=1033691040-1433691039
 readonly H4=1526332224-2026332223
 
+# Whether the amneziawg runtime directory predates this run. Cleanup removes it
+# only if we created it: it may be host-managed, and cleanup also runs when
+# preflight refuses to start, so removing it unconditionally would be a host
+# change the safety notice rules out.
+AWG_RUNDIR=/var/run/amneziawg
+if [ -d "$AWG_RUNDIR" ]; then readonly AWG_RUNDIR_PREEXISTING=1; else readonly AWG_RUNDIR_PREEXISTING=0; fi
+
 PASS=0; FAIL=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
@@ -77,6 +84,8 @@ cleanup() {
   # host-managed, so removing it because it happens to be empty would be exactly
   # the kind of host change this script promises not to make.
   rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
+  # Remove the directory only when this run created it, and only if empty.
+  [ "$AWG_RUNDIR_PREEXISTING" -eq 0 ] && rmdir "$AWG_RUNDIR" >/dev/null 2>&1
   [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"
   return $rc
 }
