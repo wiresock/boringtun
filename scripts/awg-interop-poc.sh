@@ -9,8 +9,11 @@
 # found the epoch-timestamp and UAPI-socket-path bugs (#12); neither was
 # reachable from any unit test.
 #
-# Requires: root, the amneziawg kernel module, amneziawg-tools, iproute2,
-#           tcpdump and timeout (preflight enforces all of these).
+# Requires: root, the amneziawg kernel module, amneziawg-tools (awg), iproute2
+#           (ip), tcpdump, timeout, ping, and awk/cut/date/grep/head/lsmod.
+#           Preflight enforces every one of them and names the missing tool,
+#           because a missing dependency otherwise surfaces as a bogus test
+#           failure rather than as a setup problem.
 #
 # SAFETY: everything lives in throwaway network namespaces. The host's own
 # interfaces, routes, firewall rules and WireGuard/AmneziaWG devices are never
@@ -131,6 +134,16 @@ command -v ip  >/dev/null         || die "iproute2 (ip) not installed"
 # script whose purpose is to be believed.
 command -v tcpdump >/dev/null     || die "tcpdump not installed (needed by the wire-format check)"
 command -v timeout >/dev/null     || die "timeout not installed (needed by the wire-format check)"
+# Everything else the checks shell out to. Ordinary userland, but assert it
+# anyway: absence produces a wrong diagnosis rather than an obvious one --
+# without awk, check 6 reports "no H4 tag" as if the wire format were broken;
+# without ping, checks 3 and 5 report a dead datapath; and without grep or
+# lsmod the module check below reports the module as not loaded. ping is the
+# realistic one: minimal images frequently ship without iputils.
+for tool in awk cut date grep head lsmod ping; do
+  command -v "$tool" >/dev/null || die "$tool not installed (used by preflight or the checks)"
+done
+
 lsmod | grep -q '^amneziawg'      || die "amneziawg kernel module not loaded -- the point of this test is a REAL client"
 [ -e /dev/net/tun ]               || die "/dev/net/tun missing"
 
