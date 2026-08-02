@@ -210,9 +210,17 @@ done
 start_server() {  # $1 = config file
   ip netns exec "$NS_SRV" env WG_LOG_FILE="$WORKDIR/srv.log" \
     "$BORINGTUN" --disable-drop-privileges "$IF_SRV" >/dev/null 2>&1
-  sleep 2
+  # Poll for the UAPI socket rather than assuming a fixed startup time. A
+  # fixed sleep is a false negative waiting for a slow or loaded host, and
+  # this check is meant to be trusted when it fails.
+  local waited=0
+  while [ ! -S "/var/run/wireguard/${IF_SRV}.sock" ]; do
+    sleep 0.2
+    waited=$((waited + 1))
+    [ "$waited" -ge 50 ] && return 1   # 10s
+  done
   ip netns exec "$NS_SRV" awg setconf "$IF_SRV" "$1" || return 1
-  ip netns exec "$NS_SRV" sh -c "ip addr add 10.66.201.1/24 dev $IF_SRV; ip link set $IF_SRV up mtu 1420"
+  ip netns exec "$NS_SRV" sh -c "ip addr add 10.66.201.1/24 dev $IF_SRV && ip link set $IF_SRV up mtu 1420"
 }
 stop_server() {
   kill_server
@@ -220,10 +228,14 @@ stop_server() {
   rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
   sleep 1
 }
+# Returns non-zero on a setup failure, so a caller can distinguish "the client
+# could not be configured" from "the client was configured and no traffic
+# flowed". Reporting the former as the latter points debugging at the wrong
+# half of the system.
 start_client() {  # $1 = ns, $2 = conf, $3 = tunnel addr
-  ip netns exec "$1" ip link add "$IF_CLI" type amneziawg
-  ip netns exec "$1" awg setconf "$IF_CLI" "$2"
-  ip netns exec "$1" sh -c "ip addr add $3/32 dev $IF_CLI; ip link set $IF_CLI up mtu 1420; ip route add 10.66.201.1/32 dev $IF_CLI"
+  ip netns exec "$1" ip link add "$IF_CLI" type amneziawg || return 1
+  ip netns exec "$1" awg setconf "$IF_CLI" "$2" || return 1
+  ip netns exec "$1" sh -c "ip addr add $3/32 dev $IF_CLI && ip link set $IF_CLI up mtu 1420 && ip route add 10.66.201.1/32 dev $IF_CLI" || return 1
 }
 
 # --------------------------------------------------------------------- tests --
@@ -240,15 +252,22 @@ else
 fi
 
 info "2. UAPI: showconf round-trips every AmneziaWG parameter"
-conf_out=$(ip netns exec "$NS_SRV" awg showconf "$IF_SRV" 2>/dev/null)
-for kv in "Jc = $JC" "Jmin = $JMIN" "Jmax = $JMAX" "S1 = $S1" "S2 = $S2" "S3 = $S3" "S4 = $S4" \
-          "H1 = $H1" "H2 = $H2" "H3 = $H3" "H4 = $H4"; do
-  if grep -qF "$kv" <<<"$conf_out"; then ok "showconf: $kv"; else bad "showconf lost or altered: $kv"; fi
-done
+# Capture stderr and test the exit status: if showconf itself fails, every one
+# of the eleven key assertions would otherwise report "lost or altered" and
+# bury the single real cause under eleven false ones.
+if conf_out=$(ip netns exec "$NS_SRV" awg showconf "$IF_SRV" 2>&1); then
+  for kv in "Jc = $JC" "Jmin = $JMIN" "Jmax = $JMAX" "S1 = $S1" "S2 = $S2" "S3 = $S3" "S4 = $S4" \
+            "H1 = $H1" "H2 = $H2" "H3 = $H3" "H4 = $H4"; do
+    if grep -qF "$kv" <<<"$conf_out"; then ok "showconf: $kv"; else bad "showconf lost or altered: $kv"; fi
+  done
+else
+  bad "awg showconf failed, so no parameter could be checked: $conf_out"
+fi
 
 info "3. Handshake and bidirectional traffic from a kernel-module client"
-start_client "$NS_CLI" c1.conf 10.66.201.2
-if ip netns exec "$NS_CLI" ping -c3 -W3 -q 10.66.201.1 >/dev/null 2>&1; then
+if ! start_client "$NS_CLI" c1.conf 10.66.201.2; then
+  bad "client setup failed (ip link add / awg setconf) -- not a datapath result"
+elif ip netns exec "$NS_CLI" ping -c3 -W3 -q 10.66.201.1 >/dev/null 2>&1; then
   ok "kernel-module client passes traffic to the boringtun server"
 else
   bad "no traffic -- handshake or datapath broken"
@@ -268,8 +287,9 @@ fi
 
 info "5. Multi-peer: a second peer added live to the running server"
 ip netns exec "$NS_SRV" awg set "$IF_SRV" peer "$(cat cli2.pub)" allowed-ips 10.66.201.3/32
-start_client "$NS_CLI2" c2.conf 10.66.201.3
-if ip netns exec "$NS_CLI2" ping -c3 -W3 -q 10.66.201.1 >/dev/null 2>&1; then
+if ! start_client "$NS_CLI2" c2.conf 10.66.201.3; then
+  bad "second client setup failed (ip link add / awg setconf) -- not a datapath result"
+elif ip netns exec "$NS_CLI2" ping -c3 -W3 -q 10.66.201.1 >/dev/null 2>&1; then
   ok "second peer handshakes and passes traffic"
 else
   bad "second peer failed"
