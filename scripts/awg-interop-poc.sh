@@ -9,7 +9,8 @@
 # found the epoch-timestamp and UAPI-socket-path bugs (#12); neither was
 # reachable from any unit test.
 #
-# Requires: root, the amneziawg kernel module, amneziawg-tools, iproute2.
+# Requires: root, the amneziawg kernel module, amneziawg-tools, iproute2,
+#           tcpdump and timeout (preflight enforces all of these).
 #
 # SAFETY: everything lives in throwaway network namespaces. The host's own
 # interfaces, routes, firewall rules and WireGuard/AmneziaWG devices are never
@@ -57,6 +58,10 @@ readonly H4=1526332224-2026332223
 # owns nothing -- tearing down links and sockets it did not create would be
 # the very clobbering preflight exists to prevent.
 SETUP_STARTED=0
+# Set on any failing path. The failure messages point at $WORKDIR, so deleting
+# it on the way out would advertise a log file that never exists -- the harness
+# would be least debuggable exactly when it has something to report.
+KEEP_WORKDIR=0
 
 AWG_RUNDIR=/var/run/amneziawg
 if [ -d "$AWG_RUNDIR" ]; then readonly AWG_RUNDIR_PREEXISTING=1; else readonly AWG_RUNDIR_PREEXISTING=0; fi
@@ -75,10 +80,10 @@ die()  { printf '\033[31mpreflight: %s\033[0m\n' "$1" >&2; exit 2; }
 is_uint() { case "${1:-}" in ""|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 is_hex8() { case "${1:-}" in *[!0-9a-fA-F]*) return 1 ;; *) [ "${#1}" -eq 8 ] ;; esac; }
 
-# Kill only what is inside our own namespace. `pkill -f "$IF_SRV"` matches on
-# the whole command line, so it would also reap unrelated host processes that
-# merely mention the interface name -- unacceptable in a script whose selling
-# point is that it is safe to run on a shared host.
+# Kill only what is inside our own namespace, via `ip netns pids`. Matching on
+# the command line instead (`pkill -f "$IF_SRV"`) would also reap unrelated
+# host processes that merely mention the interface name -- unacceptable in a
+# script whose selling point is that it is safe to run on a shared host.
 kill_server() {
   local pids
   pids=$(ip netns pids "$NS_SRV" 2>/dev/null)
@@ -99,8 +104,13 @@ cleanup() {
     # Remove the runtime directory only when this run created it, and only if empty.
     [ "$AWG_RUNDIR_PREEXISTING" -eq 0 ] && rmdir "$AWG_RUNDIR" >/dev/null 2>&1
   fi
-  # Always ours: mktemp gave it a unique name.
-  [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"
+  # The temp dir is unambiguously ours (unique mktemp name), but keep it when
+  # a check failed so the logs it points at are still there.
+  if [ "$KEEP_WORKDIR" -eq 1 ]; then
+    printf 'logs preserved in %s\n' "$WORKDIR" >&2
+  else
+    [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"
+  fi
   return $rc
 }
 trap cleanup EXIT INT TERM
@@ -210,6 +220,7 @@ if start_server srv.conf; then
   ok "awg setconf accepted (implies the UAPI socket was discoverable)"
 else
   bad "awg setconf failed -- see $WORKDIR/srv.log"
+  KEEP_WORKDIR=1
   # `bad` already incremented FAIL; adding one here would over-report.
   printf '\033[31mSUMMARY: %d passed, %d FAILED\033[0m\n' "$PASS" "$FAIL"
   exit 1
@@ -315,6 +326,9 @@ echo
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[32mSUMMARY: all %d checks passed\033[0m\n' "$PASS"; exit 0
 else
-  printf '\033[31mSUMMARY: %d passed, %d FAILED\033[0m  (logs: %s)\n' "$PASS" "$FAIL" "$WORKDIR"
-  trap - EXIT; cleanup >/dev/null 2>&1; exit 1
+  # $WORKDIR is retained by cleanup when KEEP_WORKDIR is set, and cleanup
+  # prints where it is -- so this no longer names a path that is about to go.
+  KEEP_WORKDIR=1
+  printf '\033[31mSUMMARY: %d passed, %d FAILED\033[0m\n' "$PASS" "$FAIL"
+  exit 1
 fi
