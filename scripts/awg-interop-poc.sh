@@ -52,6 +52,12 @@ readonly H4=1526332224-2026332223
 # only if we created it: it may be host-managed, and cleanup also runs when
 # preflight refuses to start, so removing it unconditionally would be a host
 # change the safety notice rules out.
+# Set to 1 immediately before the first resource is created. Cleanup runs on
+# every exit path including a preflight refusal, and at that point this run
+# owns nothing -- tearing down links and sockets it did not create would be
+# the very clobbering preflight exists to prevent.
+SETUP_STARTED=0
+
 AWG_RUNDIR=/var/run/amneziawg
 if [ -d "$AWG_RUNDIR" ]; then readonly AWG_RUNDIR_PREEXISTING=1; else readonly AWG_RUNDIR_PREEXISTING=0; fi
 
@@ -75,17 +81,17 @@ kill_server() {
 cleanup() {
   local rc=$?
   set +e
-  kill_server
-  for ns in "$NS_SRV" "$NS_CLI" "$NS_CLI2"; do ip netns del "$ns" >/dev/null 2>&1; done
-  ip link del awgpoc-vs  >/dev/null 2>&1
-  ip link del awgpoc-vs2 >/dev/null 2>&1
-  # Only the sockets this run created. The amneziawg directory is deliberately
-  # left alone: cleanup also runs on preflight failure, and the directory may be
-  # host-managed, so removing it because it happens to be empty would be exactly
-  # the kind of host change this script promises not to make.
-  rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
-  # Remove the directory only when this run created it, and only if empty.
-  [ "$AWG_RUNDIR_PREEXISTING" -eq 0 ] && rmdir "$AWG_RUNDIR" >/dev/null 2>&1
+  # Only tear down what this run actually created.
+  if [ "$SETUP_STARTED" -eq 1 ]; then
+    kill_server
+    for ns in "$NS_SRV" "$NS_CLI" "$NS_CLI2"; do ip netns del "$ns" >/dev/null 2>&1; done
+    ip link del awgpoc-vs  >/dev/null 2>&1
+    ip link del awgpoc-vs2 >/dev/null 2>&1
+    rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
+    # Remove the runtime directory only when this run created it, and only if empty.
+    [ "$AWG_RUNDIR_PREEXISTING" -eq 0 ] && rmdir "$AWG_RUNDIR" >/dev/null 2>&1
+  fi
+  # Always ours: mktemp gave it a unique name.
   [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"
   return $rc
 }
@@ -115,6 +121,12 @@ for ns in "$NS_SRV" "$NS_CLI" "$NS_CLI2"; do
   ip netns list 2>/dev/null | grep -qw "$ns" && die "namespace $ns already exists; refusing to touch it"
 done
 ip link show "$IF_SRV" >/dev/null 2>&1 && die "interface $IF_SRV already exists; refusing to touch it"
+for veth in awgpoc-vs awgpoc-vc awgpoc-vs2 awgpoc-vc2; do
+  ip link show "$veth" >/dev/null 2>&1 && die "interface $veth already exists; refusing to touch it"
+done
+for sock in "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"; do
+  [ -e "$sock" ] && die "$sock already exists; refusing to touch it"
+done
 
 info "preflight OK  (binary: $BORINGTUN, kernel module present)"
 
@@ -125,6 +137,8 @@ cd "$WORKDIR" || die "cannot enter $WORKDIR"
 awg genkey > srv.key; awg pubkey < srv.key > srv.pub
 awg genkey > cli.key; awg pubkey < cli.key > cli.pub
 awg genkey > cli2.key; awg pubkey < cli2.key > cli2.pub
+
+SETUP_STARTED=1   # from here on, cleanup owns what it tears down
 
 ip netns add "$NS_SRV"; ip netns add "$NS_CLI"; ip netns add "$NS_CLI2"
 ip link add awgpoc-vs  type veth peer name awgpoc-vc
