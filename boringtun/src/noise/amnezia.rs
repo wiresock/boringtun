@@ -460,19 +460,29 @@ impl AmneziaConfig {
     /// Strip the AmneziaWG junk prefix from an inbound datagram, or reject it.
     ///
     /// Returns `None` when the datagram matches no configured packet shape.
-    /// With a junk prefix configured a conforming peer always pads, so an
-    /// unpadded datagram is not ours however plausible its first four bytes
-    /// look. Handing it back unmodified -- as this used to -- let the caller
-    /// re-read the tag at offset 0 and accept it, which made the S-prefix an
-    /// obfuscation rather than an input filter. The kernel module drops such
-    /// a datagram outright (`prepare_awg_message`, `src/receive.c`).
+    ///
+    /// The padding rule is *per packet kind*, not global: a kind whose S is
+    /// non-zero must arrive padded, while a kind whose S is zero must arrive
+    /// unpadded. A configuration with `S1 = 15, S4 = 0` therefore rejects a
+    /// bare initiation and accepts a bare transport packet, and both are
+    /// correct. Rejecting everything unpadded would break the second case.
+    ///
+    /// Handing a non-matching datagram back unmodified -- as this used to --
+    /// let the caller re-read the tag at offset 0 and accept it, which made
+    /// the S-prefix an obfuscation rather than an input filter. The kernel
+    /// module drops such a datagram outright (`prepare_awg_message`,
+    /// `src/receive.c`).
     ///
     /// A datagram cannot match two kinds: `ObfuscationRanges::new` validates
     /// the H ranges as non-overlapping, and the three handshake kinds have
     /// distinct fixed sizes. With every S at zero these tests reduce to the
     /// same (tag, length) pairs `Tunn::parse_incoming_packet` applies, so
     /// plain WireGuard is unaffected.
-    pub fn strip_inbound<'a>(&self, obf: ObfuscationRanges, packet: &'a [u8]) -> Option<&'a [u8]> {
+    pub(crate) fn strip_inbound<'a>(
+        &self,
+        obf: ObfuscationRanges,
+        packet: &'a [u8],
+    ) -> Option<&'a [u8]> {
         for (kind, base) in [
             (PacketKind::HandshakeInit, HANDSHAKE_INIT_SZ),
             (PacketKind::HandshakeResponse, HANDSHAKE_RESP_SZ),
@@ -511,7 +521,7 @@ impl AmneziaConfig {
         }
     }
 
-    pub fn prepend_outbound<'a>(
+    pub(crate) fn prepend_outbound<'a>(
         &self,
         obf: ObfuscationRanges,
         buffer: &'a mut [u8],
