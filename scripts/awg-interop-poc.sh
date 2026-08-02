@@ -67,6 +67,14 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 info() { printf '\033[1m==> %s\033[0m\n' "$1"; }
 die()  { printf '\033[31mpreflight: %s\033[0m\n' "$1" >&2; exit 2; }
 
+# Values parsed out of `awg` and `tcpdump` output are not guaranteed numeric:
+# an error message or unexpected token reaching a `[ -gt ]` or `$(( ))` makes
+# the shell print "integer expression expected", burying the real result in
+# noise. Validate first, so a malformed value is reported as the check failing
+# with the offending text quoted.
+is_uint() { case "${1:-}" in ""|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+is_hex8() { case "${1:-}" in *[!0-9a-fA-F]*) return 1 ;; *) [ "${#1}" -eq 8 ] ;; esac; }
+
 # Kill only what is inside our own namespace. `pkill -f "$IF_SRV"` matches on
 # the whole command line, so it would also reap unrelated host processes that
 # merely mention the interface name -- unacceptable in a script whose selling
@@ -228,10 +236,10 @@ info "4. Handshake timestamp is an epoch value, not an age"
 # treating a stale handshake as "peer down" saw every peer as dead.
 hs=$(ip netns exec "$NS_SRV" awg show "$IF_SRV" latest-handshakes | head -1 | cut -f2)
 now=$(date -u +%s)
-if [ "${hs:-0}" -gt $((now - 300)) ] && [ "${hs:-0}" -le "$now" ]; then
+if is_uint "$hs" && [ "$hs" -gt $((now - 300)) ] && [ "$hs" -le "$now" ]; then
   ok "handshake reported as a plausible epoch timestamp ($hs, now=$now)"
 else
-  bad "handshake timestamp is not an epoch value: got $hs, now=$now"
+  bad "handshake timestamp is not a plausible epoch value: got '${hs:-<empty>}', now=$now"
 fi
 
 info "5. Multi-peer: a second peer added live to the running server"
@@ -268,6 +276,7 @@ while read -r hex; do
   [ "${#hex}" -ge $((tag_off + 8)) ] || continue
   b0=${hex:$tag_off:2};       b1=${hex:$((tag_off+2)):2}
   b2=${hex:$((tag_off+4)):2}; b3=${hex:$((tag_off+6)):2}
+  is_hex8 "$b3$b2$b1$b0" || continue
   tag=$(( 0x$b3$b2$b1$b0 ))   # little-endian on the wire
   if [ "$tag" -ge "$h4_lo" ] && [ "$tag" -le "$h4_hi" ]; then
     ok "H4 tag $tag at offset $S4 is inside the configured range $H4"
