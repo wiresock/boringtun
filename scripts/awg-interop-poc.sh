@@ -124,6 +124,15 @@ BORINGTUN=${1:-}
 [ -n "$BORINGTUN" ] || BORINGTUN=$(command -v boringtun-cli 2>/dev/null)
 [ -n "$BORINGTUN" ] || BORINGTUN=target/release/boringtun-cli
 
+# Make it absolute before anything changes directory. The script cd's into
+# $WORKDIR, after which a relative path -- including the documented
+# target/release fallback -- no longer resolves: the server fails to start and
+# check 1 blames "awg setconf", having already reported preflight OK.
+case "$BORINGTUN" in
+  /*) ;;
+  *) BORINGTUN="$(cd "$(dirname "$BORINGTUN")" 2>/dev/null && pwd)/$(basename "$BORINGTUN")" ;;
+esac
+
 [ "$(id -u)" -eq 0 ]              || die "must run as root (creates network namespaces)"
 [ -x "$BORINGTUN" ]               || die "boringtun-cli not found or not executable: $BORINGTUN"
 command -v awg >/dev/null         || die "amneziawg-tools (awg) not installed"
