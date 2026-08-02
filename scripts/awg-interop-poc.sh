@@ -54,15 +54,29 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 info() { printf '\033[1m==> %s\033[0m\n' "$1"; }
 die()  { printf '\033[31mpreflight: %s\033[0m\n' "$1" >&2; exit 2; }
 
+# Kill only what is inside our own namespace. `pkill -f "$IF_SRV"` matches on
+# the whole command line, so it would also reap unrelated host processes that
+# merely mention the interface name -- unacceptable in a script whose selling
+# point is that it is safe to run on a shared host.
+kill_server() {
+  local pids
+  pids=$(ip netns pids "$NS_SRV" 2>/dev/null)
+  [ -n "$pids" ] && kill $pids >/dev/null 2>&1
+  return 0
+}
+
 cleanup() {
   local rc=$?
   set +e
-  pkill -f "$IF_SRV" >/dev/null 2>&1
+  kill_server
   for ns in "$NS_SRV" "$NS_CLI" "$NS_CLI2"; do ip netns del "$ns" >/dev/null 2>&1; done
   ip link del awgpoc-vs  >/dev/null 2>&1
   ip link del awgpoc-vs2 >/dev/null 2>&1
+  # Only the sockets this run created. The amneziawg directory is deliberately
+  # left alone: cleanup also runs on preflight failure, and the directory may be
+  # host-managed, so removing it because it happens to be empty would be exactly
+  # the kind of host change this script promises not to make.
   rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
-  rmdir /var/run/amneziawg >/dev/null 2>&1
   [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"
   return $rc
 }
@@ -78,13 +92,12 @@ BORINGTUN=${1:-}
 [ -x "$BORINGTUN" ]               || die "boringtun-cli not found or not executable: $BORINGTUN"
 command -v awg >/dev/null         || die "amneziawg-tools (awg) not installed"
 command -v ip  >/dev/null         || die "iproute2 (ip) not installed"
-# Asserted rather than assumed: absent, these do not merely skip a check --
-# tcpdump/timeout make check 6 report a wire-format failure that is really a
-# missing tool, and without pkill the cleanup cannot stop the server, which on
-# a shared host is the worst outcome this script can produce.
+# Asserted rather than assumed: absent, these do not merely skip a check.
+# Without tcpdump or timeout, check 6 reports a wire-format failure that is
+# really a missing tool, and a misleading failure is worse than none in a
+# script whose purpose is to be believed.
 command -v tcpdump >/dev/null     || die "tcpdump not installed (needed by the wire-format check)"
 command -v timeout >/dev/null     || die "timeout not installed (needed by the wire-format check)"
-command -v pkill   >/dev/null     || die "pkill not installed (needed to stop the server on cleanup)"
 lsmod | grep -q '^amneziawg'      || die "amneziawg kernel module not loaded -- the point of this test is a REAL client"
 [ -e /dev/net/tun ]               || die "/dev/net/tun missing"
 
@@ -148,7 +161,7 @@ start_server() {  # $1 = config file
   ip netns exec "$NS_SRV" sh -c "ip addr add 10.66.201.1/24 dev $IF_SRV; ip link set $IF_SRV up mtu 1420"
 }
 stop_server() {
-  pkill -f "$IF_SRV" >/dev/null 2>&1
+  kill_server
   ip netns exec "$NS_SRV" ip link del "$IF_SRV" >/dev/null 2>&1
   rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
   sleep 1
@@ -167,8 +180,8 @@ if start_server srv.conf; then
 else
   bad "awg setconf failed -- see $WORKDIR/srv.log"
   # `bad` already incremented FAIL; adding one here would over-report.
-  printf '[31mSUMMARY: %d passed, %d FAILED[0m
-' "$PASS" "$FAIL"; exit 1
+  printf '\033[31mSUMMARY: %d passed, %d FAILED\033[0m\n' "$PASS" "$FAIL"
+  exit 1
 fi
 
 info "2. UAPI: showconf round-trips every AmneziaWG parameter"
@@ -220,11 +233,32 @@ tcpdump_pid=$!
 sleep 1
 ip netns exec "$NS_CLI" ping -c2 -W2 -q 10.66.201.1 >/dev/null 2>&1
 wait $tcpdump_pid 2>/dev/null
-len=$(ip netns exec "$NS_SRV" tcpdump -r "$WORKDIR/wire.pcap" -nn 2>/dev/null | head -1 | sed 's/.*length \([0-9]*\).*/\1/')
-if [ "${len:-0}" -gt "$S4" ]; then
-  ok "captured datagram is $len bytes, larger than the S4 prefix ($S4)"
-else
-  bad "no captured datagram, or too small to carry an S4 prefix (got '${len:-none}')"
+# Decode each captured frame and test the four bytes at the S4 offset against
+# the configured H4 range. A length check alone would not do what this claims:
+# a vanilla transport packet is also larger than S4, so it would pass even with
+# obfuscation switched off. IPv4(20) + UDP(8) = 28 bytes precede the payload.
+h4_lo=${H4%-*}; h4_hi=${H4#*-}
+tag_off=$(( (28 + S4) * 2 ))
+tag_found=0; frames=0
+while read -r hex; do
+  frames=$((frames + 1))
+  [ "${#hex}" -ge $((tag_off + 8)) ] || continue
+  b0=${hex:$tag_off:2};       b1=${hex:$((tag_off+2)):2}
+  b2=${hex:$((tag_off+4)):2}; b3=${hex:$((tag_off+6)):2}
+  tag=$(( 0x$b3$b2$b1$b0 ))   # little-endian on the wire
+  if [ "$tag" -ge "$h4_lo" ] && [ "$tag" -le "$h4_hi" ]; then
+    ok "H4 tag $tag at offset $S4 is inside the configured range $H4"
+    tag_found=1
+    break
+  fi
+done <<EOF
+$(ip netns exec "$NS_SRV" tcpdump -r "$WORKDIR/wire.pcap" -nn -x 2>/dev/null | awk '
+  /^[^\t ]/ { if (h != "") print h; h = ""; next }
+  { for (i = 2; i <= NF; i++) h = h $i }
+  END { if (h != "") print h }')
+EOF
+if [ "$tag_found" -ne 1 ]; then
+  bad "no captured frame carried an H4 tag at offset $S4 (frames examined: $frames)"
 fi
 
 info "7. NEGATIVE CONTROL: a vanilla server must NOT serve an AmneziaWG client"
