@@ -487,7 +487,13 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
-        let datagram = self.amnezia.strip_inbound(self.handshake.obf, datagram);
+        // A datagram that matches no configured shape is rejected here rather
+        // than re-parsed at offset 0. With a junk prefix configured this is the
+        // S-prefix doing its job as an input filter.
+        let datagram = match self.amnezia.strip_inbound(self.handshake.obf, datagram) {
+            Some(d) => d,
+            None => return TunnResult::Err(WireGuardError::InvalidPacket),
+        };
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self.rate_limiter.verify_packet(
             self.handshake.obf,
