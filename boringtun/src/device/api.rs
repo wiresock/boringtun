@@ -387,8 +387,8 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
         }
     }
 
-    for (k, p) in d.peers.iter() {
-        let p = p.lock();
+    for (k, peer) in d.peers.iter() {
+        let p = peer.lock();
         writeln!(writer, "public_key={}", encode_hex(k.as_bytes()));
 
         if let Some(ref key) = p.preshared_key() {
@@ -403,7 +403,8 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             writeln!(writer, "endpoint={}", addr);
         }
 
-        for (ip, cidr) in p.allowed_ips() {
+        // Read from the device's trie: it is the only place prefixes live.
+        for (ip, cidr) in d.peer_allowed_ips(peer) {
             writeln!(writer, "allowed_ip={}/{}", ip, cidr);
         }
 
