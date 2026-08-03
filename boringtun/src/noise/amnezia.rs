@@ -457,48 +457,55 @@ impl AmneziaConfig {
             .unwrap_or(false)
     }
 
-    pub fn strip_inbound<'a>(&self, obf: ObfuscationRanges, packet: &'a [u8]) -> &'a [u8] {
-        if self.inbound_kind_at_offset(obf, packet, PacketKind::HandshakeInit, HANDSHAKE_INIT_SZ) {
-            return &packet[self.inbound_junk_size(PacketKind::HandshakeInit)..];
-        }
-        if self.inbound_kind_at_offset(
-            obf,
-            packet,
-            PacketKind::HandshakeResponse,
-            HANDSHAKE_RESP_SZ,
-        ) {
-            return &packet[self.inbound_junk_size(PacketKind::HandshakeResponse)..];
-        }
-        if self.inbound_kind_at_offset(obf, packet, PacketKind::CookieReply, COOKIE_REPLY_SZ) {
-            return &packet[self.inbound_junk_size(PacketKind::CookieReply)..];
+    /// Strip the AmneziaWG junk prefix from an inbound datagram, or reject it.
+    ///
+    /// Returns `None` when the datagram matches no configured packet shape.
+    ///
+    /// The padding rule is *per packet kind*, not global: a kind whose S is
+    /// non-zero must arrive padded, while a kind whose S is zero must arrive
+    /// unpadded. A configuration with `S1 = 15, S4 = 0` therefore rejects a
+    /// bare initiation and accepts a bare transport packet, and both are
+    /// correct. Rejecting everything unpadded would break the second case.
+    ///
+    /// Handing a non-matching datagram back unmodified -- as this used to --
+    /// let the caller re-read the tag at offset 0 and accept it, which made
+    /// the S-prefix an obfuscation rather than an input filter. The kernel
+    /// module drops such a datagram outright (`prepare_awg_message`,
+    /// `src/receive.c`).
+    ///
+    /// A datagram cannot match two kinds: `ObfuscationRanges::new` validates
+    /// the H ranges as non-overlapping, and the three handshake kinds have
+    /// distinct fixed sizes. With every S at zero these tests reduce to the
+    /// same (tag, length) pairs `Tunn::parse_incoming_packet` applies, so
+    /// plain WireGuard is unaffected.
+    pub(crate) fn strip_inbound<'a>(
+        &self,
+        obf: ObfuscationRanges,
+        packet: &'a [u8],
+    ) -> Option<&'a [u8]> {
+        for (kind, base) in [
+            (PacketKind::HandshakeInit, HANDSHAKE_INIT_SZ),
+            (PacketKind::HandshakeResponse, HANDSHAKE_RESP_SZ),
+            (PacketKind::CookieReply, COOKIE_REPLY_SZ),
+        ] {
+            if self.inbound_kind_at_offset(obf, packet, kind, base) {
+                return Some(&packet[self.inbound_junk_size(kind)..]);
+            }
         }
 
-        let junk_size = self.inbound_junk_size(PacketKind::TransportData);
-        if junk_size == 0 {
-            return packet;
-        }
-
-        // Strip at the configured S4 offset. There is deliberately no offset-0
-        // retry, because it could not change the outcome: it returned the packet
-        // unchanged, which is what falling through already does.
-        //
-        // Note this is *not* equivalent to the kernel, which drops an unpadded
-        // datagram outright (`prepare_awg_message`,
-        // `amneziawg-linux-kernel-module/src/receive.c`). Here the datagram is
-        // handed back unmodified, so a caller whose tag check reads offset 0 can
-        // still accept an unpadded transport packet even though S4 is
-        // configured. Closing that gap requires this function to become
-        // fallible so callers can drop instead of reparsing; until then the
-        // S-prefix is an obfuscation, not an input filter.
-        if packet.len() >= junk_size + DATA_OVERHEAD_SZ
-            && Self::read_tag(packet, junk_size)
+        // Transport data is variable length, so this is a minimum rather than
+        // an exact size. With S4 = 0 the offset is 0 and this is exactly the
+        // vanilla check.
+        let junk = self.inbound_junk_size(PacketKind::TransportData);
+        if packet.len() >= junk + DATA_OVERHEAD_SZ
+            && Self::read_tag(packet, junk)
                 .map(|tag| Self::tag_matches(obf, PacketKind::TransportData, tag))
                 .unwrap_or(false)
         {
-            return &packet[junk_size..];
+            return Some(&packet[junk..]);
         }
 
-        packet
+        None
     }
 
     fn classify_outbound(&self, obf: ObfuscationRanges, packet: &[u8]) -> Option<PacketKind> {
@@ -514,7 +521,7 @@ impl AmneziaConfig {
         }
     }
 
-    pub fn prepend_outbound<'a>(
+    pub(crate) fn prepend_outbound<'a>(
         &self,
         obf: ObfuscationRanges,
         buffer: &'a mut [u8],
@@ -1258,15 +1265,100 @@ mod tests {
                         "unexpected padded size: protocol={protocol:?} tag={tag} junk={junk}"
                     );
 
+                    // Every shape produced by prepend_outbound must be accepted:
+                    // this is the property that makes the stricter filter safe.
                     let stripped = cfg.strip_inbound(obf, &padded);
                     assert_eq!(
                         stripped,
-                        original.as_slice(),
+                        Some(original.as_slice()),
                         "roundtrip mismatch: protocol={protocol:?} tag={tag} junk={junk}"
                     );
                 }
             }
         }
+    }
+
+    /// The full input matrix for `strip_inbound`, written before the change
+    /// that made it fallible rather than after. The risk of that change is
+    /// dropping *valid* traffic, so every configuration shape is enumerated:
+    /// all-zero (plain WireGuard), fully padded, and mixed.
+    #[test]
+    fn strip_inbound_accepts_every_conforming_shape_and_rejects_the_rest() {
+        let obf = ObfuscationRanges::default();
+
+        // --- all S zero: must behave exactly like plain WireGuard ---------
+        let vanilla = AmneziaConfig::new(0, 0, 0, 0);
+        for (tag, size) in [
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ),
+            (DATA, DATA_OVERHEAD_SZ + 48),
+        ] {
+            let mut p = vec![0xaa; size];
+            write_tag(&mut p, tag);
+            assert_eq!(
+                vanilla.strip_inbound(obf, &p).map(|d| d.len()),
+                Some(size),
+                "vanilla must accept tag {:#x} unchanged",
+                tag
+            );
+        }
+        // Too short to be anything, and a tag that matches no range.
+        assert_eq!(vanilla.strip_inbound(obf, &[0u8; 10]), None);
+        let mut bogus = vec![0xaa; HANDSHAKE_INIT_SZ];
+        write_tag(&mut bogus, 0x5555_5555);
+        assert_eq!(vanilla.strip_inbound(obf, &bogus), None, "unknown tag");
+
+        // --- every S configured -------------------------------------------
+        let padded = AmneziaConfig::new(120, 130, 110, 80);
+        for (tag, size, junk) in [
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ, 120usize),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ, 130),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ, 110),
+            (DATA, DATA_OVERHEAD_SZ + 48, 80),
+        ] {
+            let mut p = vec![0xaa; junk + size];
+            write_tag(&mut p[junk..], tag);
+            assert_eq!(
+                padded.strip_inbound(obf, &p).map(|d| d.len()),
+                Some(size),
+                "padded tag {:#x} must strip to its base size",
+                tag
+            );
+
+            // The same packet *unpadded* is not ours and must be rejected.
+            let mut bare = vec![0xaa; size];
+            write_tag(&mut bare, tag);
+            assert_eq!(
+                padded.strip_inbound(obf, &bare),
+                None,
+                "unpadded tag {:#x} must be dropped when its S is configured",
+                tag
+            );
+        }
+
+        // --- mixed: S1 set, S4 zero ----------------------------------------
+        let mixed = AmneziaConfig::new(15, 0, 0, 0);
+        let mut init = vec![0xaa; 15 + HANDSHAKE_INIT_SZ];
+        write_tag(&mut init[15..], HANDSHAKE_INIT);
+        assert_eq!(
+            mixed.strip_inbound(obf, &init).map(|d| d.len()),
+            Some(HANDSHAKE_INIT_SZ)
+        );
+        // S4 = 0, so unpadded transport is still the conforming shape and must
+        // keep working. This is the case a naive 'reject anything unpadded'
+        // would break.
+        let mut data = vec![0xaa; DATA_OVERHEAD_SZ + 16];
+        write_tag(&mut data, DATA);
+        assert_eq!(
+            mixed.strip_inbound(obf, &data).map(|d| d.len()),
+            Some(DATA_OVERHEAD_SZ + 16),
+            "S4 = 0 means unpadded transport is conforming"
+        );
+        // But an unpadded init is not, because S1 is set.
+        let mut bare_init = vec![0xaa; HANDSHAKE_INIT_SZ];
+        write_tag(&mut bare_init, HANDSHAKE_INIT);
+        assert_eq!(mixed.strip_inbound(obf, &bare_init), None);
     }
 
     #[test]
@@ -1279,47 +1371,64 @@ mod tests {
             &mut init[cfg.init_packet_junk_size as usize..],
             HANDSHAKE_INIT,
         );
-        assert_eq!(cfg.strip_inbound(obf, &init).len(), HANDSHAKE_INIT_SZ);
+        assert_eq!(
+            cfg.strip_inbound(obf, &init).map(|d| d.len()),
+            Some(HANDSHAKE_INIT_SZ)
+        );
 
         let mut resp = vec![0xaa; cfg.response_packet_junk_size as usize + HANDSHAKE_RESP_SZ];
         write_tag(
             &mut resp[cfg.response_packet_junk_size as usize..],
             HANDSHAKE_RESP,
         );
-        assert_eq!(cfg.strip_inbound(obf, &resp).len(), HANDSHAKE_RESP_SZ);
+        assert_eq!(
+            cfg.strip_inbound(obf, &resp).map(|d| d.len()),
+            Some(HANDSHAKE_RESP_SZ)
+        );
 
         let mut cookie = vec![0xaa; cfg.cookie_packet_junk_size as usize + COOKIE_REPLY_SZ];
         write_tag(
             &mut cookie[cfg.cookie_packet_junk_size as usize..],
             COOKIE_REPLY,
         );
-        assert_eq!(cfg.strip_inbound(obf, &cookie).len(), COOKIE_REPLY_SZ);
+        assert_eq!(
+            cfg.strip_inbound(obf, &cookie).map(|d| d.len()),
+            Some(COOKIE_REPLY_SZ)
+        );
 
         let mut data = vec![0xaa; cfg.transport_packet_junk_size as usize + DATA_OVERHEAD_SZ + 8];
         write_tag(&mut data[cfg.transport_packet_junk_size as usize..], DATA);
-        assert_eq!(cfg.strip_inbound(obf, &data).len(), DATA_OVERHEAD_SZ + 8);
+        assert_eq!(
+            cfg.strip_inbound(obf, &data).map(|d| d.len()),
+            Some(DATA_OVERHEAD_SZ + 8)
+        );
     }
 
     #[test]
-    fn leaves_inbound_packet_unchanged_when_magic_does_not_match() {
+    fn rejects_inbound_packet_whose_magic_does_not_match_its_shape() {
         let obf = ObfuscationRanges::default();
         let cfg = AmneziaConfig::new(7, 11, 13, 17);
         let mut resp = vec![0xaa; cfg.response_packet_junk_size as usize + HANDSHAKE_RESP_SZ];
         write_tag(&mut resp[cfg.response_packet_junk_size as usize..], DATA);
 
-        assert_eq!(cfg.strip_inbound(obf, &resp).len(), resp.len());
+        // The size says handshake response, the tag says transport data: it
+        // matches no configured shape. Previously this was handed back for
+        // the caller to reject; rejecting it here is the same outcome reached
+        // one layer earlier, and without a second chance to be misread.
+        assert_eq!(cfg.strip_inbound(obf, &resp), None);
     }
 
     #[test]
-    fn leaves_unpadded_transport_unchanged_when_s4_candidate_is_absent() {
+    fn rejects_unpadded_transport_when_s4_is_configured() {
         let obf = ObfuscationRanges::default();
         let cfg = AmneziaConfig::new(0, 0, 0, 17);
         let mut data = vec![0xaa; DATA_OVERHEAD_SZ + 32];
         write_tag(&mut data, DATA);
 
-        let stripped = cfg.strip_inbound(obf, &data);
-
-        assert_eq!(stripped, data.as_slice());
+        // S4 is configured, so a conforming peer always pads. Handing this
+        // back would let the caller re-read the tag at offset 0 and accept
+        // it, which is the filtering gap this rejection closes.
+        assert_eq!(cfg.strip_inbound(obf, &data), None);
     }
 
     #[test]
@@ -1335,7 +1444,7 @@ mod tests {
 
         let stripped = cfg.strip_inbound(obf, &data);
 
-        assert_eq!(stripped, &data[junk_size..]);
+        assert_eq!(stripped, Some(&data[junk_size..]));
     }
 
     #[test]

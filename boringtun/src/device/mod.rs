@@ -803,6 +803,7 @@ impl Device {
                         .config
                         .amnezia
                         .strip_inbound(obf, &t.src_buf[..packet_len]);
+                    let Some(packet) = packet else { continue };
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
                         obf,
@@ -1138,7 +1139,9 @@ mod ingress_tests {
         // RFC 5737 TEST-NET-3, so the value is obviously a fixture.
         let src_addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
 
-        let stripped = amnezia.strip_inbound(obf, datagram);
+        // A datagram matching no configured shape is dropped, exactly as the
+        // real ingress path does.
+        let stripped = amnezia.strip_inbound(obf, datagram)?;
         let parsed = limiter
             .verify_packet(obf, &mut OsRng, Some(src_addr), stripped, &mut scratch)
             .ok()?;
