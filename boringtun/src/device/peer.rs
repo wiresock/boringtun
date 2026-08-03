@@ -142,12 +142,6 @@ impl Peer {
         Ok(udp_conn)
     }
 
-    /// Replace this peer's allowed-IP set.
-    ///
-    /// Only updates the peer's own trie. The device keeps a second, global
-    /// `peers_by_ip` index used for routing, and the caller must remove this
-    /// peer's stale entries there first — otherwise a prefix that was just
-    /// removed still routes to this peer.
     /// Replace this peer's pre-shared key, discarding sessions if it changed.
     pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
         self.preshared_key = preshared_key;
