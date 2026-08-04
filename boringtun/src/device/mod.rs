@@ -227,10 +227,11 @@ fn index_prefixes<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>) -> Vec<(IpAddr,
 /// Required for correctness, not tidiness. `EventGuard::Drop` re-arms the fd
 /// with `EPOLL_CTL_MOD`, and for socket events it does *not* read first
 /// (`needs_read` is false, `epoll.rs:94`). So a handler that returns without
-/// consuming the datagram leaves the socket readable, epoll re-dispatches it
-/// immediately, and the worker spins at 100% CPU for as long as traffic keeps
-/// arriving. The window is not necessarily brief either: a daemon started and
-/// never given a private key stays in it indefinitely.
+/// consuming the datagram leaves the socket readable, and epoll re-dispatches
+/// it immediately -- on the *same* queued datagram. No further traffic is
+/// needed: one datagram is enough to spin a worker at 100% CPU indefinitely,
+/// and a daemon that is started but never given a private key never leaves
+/// that state on its own.
 ///
 /// Bounded by `MAX_ITR` so a flood yields between batches instead of being
 /// drained inside one dispatch -- the same budget the keyed path uses.
