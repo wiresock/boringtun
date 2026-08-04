@@ -339,6 +339,27 @@ else
   bad "adding a peer disturbed the existing one"
 fi
 
+# `get=1` reads allowed IPs out of the device's routing trie, which is keyed
+# by prefix rather than by peer. Getting each peer its own prefixes back --
+# and nobody else's -- is the part that a grouping bug would silently break,
+# and neither ping proves it: the datapath would still work if `awg show`
+# attributed every prefix to one peer.
+aips=$(ip netns exec "$NS_SRV" awg show "$IF_SRV" allowed-ips)
+check_allowed_ips() { # <pubkey-file> <expected-prefix-list>
+  local line got
+  line=$(grep -F "$(cat "$1")" <<<"$aips" || true)
+  # Compare the whole field list, so an extra prefix fails as loudly as a
+  # missing one -- attributing another peer's prefix here is the worse bug.
+  got=$(cut -f2- <<<"$line")
+  if [ "$got" = "$2" ]; then
+    ok "awg show attributes $2 to its own peer, and only that"
+  else
+    bad "wrong allowed-ips for $1: expected '$2', got '${got:-<no line>}'"
+  fi
+}
+check_allowed_ips cli.pub 10.66.201.2/32
+check_allowed_ips cli2.pub 10.66.201.3/32
+
 info "6. Wire format: the S-prefix and H-range tag are really on the wire"
 # Without this, tests 3 and 5 would also pass if both ends silently agreed to
 # speak vanilla WireGuard -- which would prove nothing about obfuscation.

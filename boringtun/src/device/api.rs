@@ -10,11 +10,14 @@ use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
 use libc::*;
+use std::collections::HashMap;
 use std::fs::{create_dir, remove_file};
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SOCK_DIR: &str = "/var/run/wireguard/";
@@ -387,8 +390,21 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
         }
     }
 
-    for (k, p) in d.peers.iter() {
-        let p = p.lock();
+    // Walk the trie once and group by owner. `peers_by_ip` remains the only
+    // place prefixes live, but `AllowedIps::iter` materialises the whole
+    // index into a VecDeque, so asking it per peer would be O(peers x
+    // prefixes) with a fresh allocation each time -- visible on `awg show`
+    // for a server with many peers.
+    let mut prefixes_by_peer: HashMap<usize, Vec<(IpAddr, u8)>> = HashMap::new();
+    for (owner, addr, cidr) in d.peers_by_ip.iter() {
+        prefixes_by_peer
+            .entry(Arc::as_ptr(owner) as usize)
+            .or_default()
+            .push((addr, cidr));
+    }
+
+    for (k, peer) in d.peers.iter() {
+        let p = peer.lock();
         writeln!(writer, "public_key={}", encode_hex(k.as_bytes()));
 
         if let Some(ref key) = p.preshared_key() {
@@ -403,7 +419,10 @@ fn api_get(writer: &mut BufWriter<&UnixStream>, d: &Device) -> i32 {
             writeln!(writer, "endpoint={}", addr);
         }
 
-        for (ip, cidr) in p.allowed_ips() {
+        for (ip, cidr) in prefixes_by_peer
+            .get(&(Arc::as_ptr(peer) as usize))
+            .map_or(&[][..], Vec::as_slice)
+        {
             writeln!(writer, "allowed_ip={}/{}", ip, cidr);
         }
 

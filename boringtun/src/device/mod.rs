@@ -196,6 +196,26 @@ struct ThreadData {
     junk_rng: ChaCha8Rng,
 }
 
+/// Does `addr` route to `owner` in this index?
+///
+/// Free and generic so the rule can be tested without a `Device`, which needs
+/// a TUN device and root to construct. An untestable ownership check is how
+/// the divergence this replaces went unnoticed.
+fn index_owns<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>, addr: IpAddr) -> bool {
+    index
+        .find(addr)
+        .is_some_and(|found| Arc::ptr_eq(found, owner))
+}
+
+/// Every prefix in `index` that routes to `owner`.
+fn index_prefixes<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>) -> Vec<(IpAddr, u8)> {
+    index
+        .iter()
+        .filter(|(found, _, _)| Arc::ptr_eq(found, owner))
+        .map(|(_, addr, cidr)| (addr, cidr))
+        .collect()
+}
+
 /// The device's key pair, or an error naming what is missing.
 ///
 /// Extracted from `update_peer` so the guard sits behind a name that a test can
@@ -351,6 +371,27 @@ impl Device {
     /// re-sends unchanged values is inert. That matters because the underlying
     /// setters are not all free: changing the pre-shared key discards live
     /// sessions.
+    /// Does `addr` route to this peer?
+    ///
+    /// `peers_by_ip` is the single authority for which peer owns a prefix.
+    /// `Peer` used to keep its own copy for this check, which meant moving a
+    /// prefix between peers updated the global index but left the old owner's
+    /// copy intact -- so the previous owner could still source-spoof an address
+    /// it no longer held. One index cannot disagree with itself.
+    fn peer_owns(&self, peer: &Arc<Mutex<Peer>>, addr: IpAddr) -> bool {
+        index_owns(&self.peers_by_ip, peer, addr)
+    }
+
+    /// The prefixes currently routed to this peer, for reporting and for the
+    /// additive form of a peer update.
+    ///
+    /// Derived rather than stored: a cached copy is what allowed the two to
+    /// drift. This walks the whole trie, which is fine for `get=1` and for a
+    /// peer update, neither of which is on the data path.
+    fn peer_allowed_ips(&self, peer: &Arc<Mutex<Peer>>) -> Vec<(IpAddr, u8)> {
+        index_prefixes(&self.peers_by_ip, peer)
+    }
+
     fn merge_peer(
         &mut self,
         peer: &Arc<Mutex<Peer>>,
@@ -378,24 +419,19 @@ impl Device {
         // set"; without it the new prefixes are additive. Either way the stale
         // global index entries have to go first, or a prefix that was just
         // dropped keeps routing here.
-        if replace_ips {
-            self.peers_by_ip
-                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(peer, p));
-            peer.lock().set_allowed_ips(allowed_ips);
-        } else if !allowed_ips.is_empty() {
-            let mut merged: Vec<AllowedIP> = peer
-                .lock()
-                .allowed_ips()
-                .map(|(addr, cidr)| AllowedIP { addr, cidr })
-                .collect();
-            merged.extend_from_slice(allowed_ips);
-            self.peers_by_ip
-                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(peer, p));
-            peer.lock().set_allowed_ips(&merged);
-        }
-
         if replace_ips || !allowed_ips.is_empty() {
-            let prefixes: Vec<(IpAddr, u8)> = peer.lock().allowed_ips().collect();
+            // Additive updates keep what the trie already routes here; a
+            // replace starts from nothing. Either way the peer's existing
+            // entries come out first, or a dropped prefix keeps routing here.
+            let mut prefixes: Vec<(IpAddr, u8)> = if replace_ips {
+                Vec::new()
+            } else {
+                self.peer_allowed_ips(peer)
+            };
+            prefixes.extend(allowed_ips.iter().map(|ip| (ip.addr, ip.cidr)));
+
+            self.peers_by_ip
+                .remove(&|p: &Arc<Mutex<Peer>>| Arc::ptr_eq(peer, p));
             for (addr, cidr) in prefixes {
                 self.peers_by_ip.insert(addr, cidr as _, Arc::clone(peer));
             }
@@ -478,7 +514,7 @@ impl Device {
         )
         .map_err(Error::PeerSetup)?;
 
-        let peer = Peer::new(tunn, next_index, endpoint, allowed_ips, preshared_key);
+        let peer = Peer::new(tunn, next_index, endpoint, preshared_key);
 
         let peer = Arc::new(Mutex::new(peer));
         self.peers.insert(pub_key, Arc::clone(&peer));
@@ -864,12 +900,12 @@ impl Device {
                             let _: Result<_, _> = udp.send_to(packet, &addr);
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if d.peer_owns(peer, addr.into()) {
                                 t.iface.write4(packet);
                             }
                         }
                         TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if d.peer_owns(peer, addr.into()) {
                                 t.iface.write6(packet);
                             }
                         }
@@ -914,7 +950,7 @@ impl Device {
     ) -> Result<(), Error> {
         self.queue.new_event(
             udp.as_raw_fd(),
-            Box::new(move |_, t| {
+            Box::new(move |d, t| {
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
@@ -941,12 +977,12 @@ impl Device {
                             let _: Result<_, _> = udp.send(packet);
                         }
                         TunnResult::WriteToTunnelV4(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if d.peer_owns(&peer, addr.into()) {
                                 iface.write4(packet);
                             }
                         }
                         TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if p.is_allowed_ip(addr) {
+                            if d.peer_owns(&peer, addr.into()) {
                                 iface.write6(packet);
                             }
                         }
@@ -1109,6 +1145,55 @@ mod ingress_tests {
     //! an anonymous datagram.
 
     use super::*;
+
+    /// Moving a prefix from one peer to another must transfer ownership
+    /// completely. The old owner keeping its own copy is what let it carry on
+    /// source-spoofing an address the trie had already reassigned.
+    #[test]
+    fn moving_a_prefix_transfers_ownership_completely() {
+        let a = Arc::new("peer-a");
+        let b = Arc::new("peer-b");
+        let addr: IpAddr = "10.66.66.2".parse().unwrap();
+
+        let mut index: AllowedIps<Arc<&str>> = AllowedIps::new();
+        index.insert(addr, 32, Arc::clone(&a));
+        assert!(index_owns(&index, &a, addr), "a owns it to begin with");
+
+        // The move: b claims the same prefix.
+        index.insert(addr, 32, Arc::clone(&b));
+
+        assert!(index_owns(&index, &b, addr), "b owns it now");
+        assert!(
+            !index_owns(&index, &a, addr),
+            "a must not still own a prefix it lost -- this is the spoofing gap"
+        );
+        assert!(index_prefixes(&index, &a).is_empty(), "a has no prefixes");
+        assert_eq!(index_prefixes(&index, &b), vec![(addr, 32)]);
+    }
+
+    /// Overlapping prefixes stay independent: a /32 inside another peer's /24
+    /// does not displace it, matching the kernel's separate-node behaviour.
+    #[test]
+    fn overlapping_prefixes_belong_to_their_own_owners() {
+        let wide = Arc::new("peer-wide");
+        let narrow = Arc::new("peer-narrow");
+        let inside: IpAddr = "10.66.66.7".parse().unwrap();
+        let elsewhere: IpAddr = "10.66.66.9".parse().unwrap();
+
+        let mut index: AllowedIps<Arc<&str>> = AllowedIps::new();
+        index.insert("10.66.66.0".parse().unwrap(), 24, Arc::clone(&wide));
+        index.insert(inside, 32, Arc::clone(&narrow));
+
+        // Longest prefix wins for the specific address...
+        assert!(index_owns(&index, &narrow, inside));
+        assert!(!index_owns(&index, &wide, inside));
+        // ...while the rest of the /24 still belongs to its owner.
+        assert!(index_owns(&index, &wide, elsewhere));
+        assert!(!index_owns(&index, &narrow, elsewhere));
+        // And neither displaced the other from the index.
+        assert_eq!(index_prefixes(&index, &narrow), vec![(inside, 32)]);
+        assert_eq!(index_prefixes(&index, &wide).len(), 1);
+    }
     use crate::noise::handshake::parse_handshake_anon;
     use crate::x25519;
     use rand_core::OsRng;

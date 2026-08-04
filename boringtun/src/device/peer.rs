@@ -7,7 +7,7 @@ use socket2::{Domain, Protocol, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 
-use crate::device::{AllowedIps, Error};
+use crate::device::Error;
 use crate::noise::{Tunn, TunnResult};
 
 #[derive(Default, Debug)]
@@ -22,7 +22,6 @@ pub struct Peer {
     /// The index the tunnel uses
     index: u32,
     endpoint: RwLock<Endpoint>,
-    allowed_ips: AllowedIps<()>,
     preshared_key: Option<[u8; 32]>,
 }
 
@@ -51,11 +50,11 @@ impl FromStr for AllowedIP {
 }
 
 impl Peer {
+    /// Allowed IPs are deliberately absent: `Device::peers_by_ip` owns them.
     pub fn new(
         tunnel: Tunn,
         index: u32,
         endpoint: Option<SocketAddr>,
-        allowed_ips: &[AllowedIP],
         preshared_key: Option<[u8; 32]>,
     ) -> Peer {
         Peer {
@@ -65,7 +64,6 @@ impl Peer {
                 addr: endpoint,
                 conn: None,
             }),
-            allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
             preshared_key,
         }
     }
@@ -144,16 +142,6 @@ impl Peer {
         Ok(udp_conn)
     }
 
-    /// Replace this peer's allowed-IP set.
-    ///
-    /// Only updates the peer's own trie. The device keeps a second, global
-    /// `peers_by_ip` index used for routing, and the caller must remove this
-    /// peer's stale entries there first — otherwise a prefix that was just
-    /// removed still routes to this peer.
-    pub(crate) fn set_allowed_ips(&mut self, allowed_ips: &[AllowedIP]) {
-        self.allowed_ips = allowed_ips.iter().map(|ip| (ip, ())).collect();
-    }
-
     /// Replace this peer's pre-shared key, discarding sessions if it changed.
     pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
         self.preshared_key = preshared_key;
@@ -165,13 +153,12 @@ impl Peer {
         self.tunnel.set_persistent_keepalive(keepalive);
     }
 
-    pub fn is_allowed_ip<I: Into<IpAddr>>(&self, addr: I) -> bool {
-        self.allowed_ips.find(addr.into()).is_some()
-    }
-
-    pub fn allowed_ips(&self) -> impl Iterator<Item = (IpAddr, u8)> + '_ {
-        self.allowed_ips.iter().map(|(_, ip, cidr)| (ip, cidr))
-    }
+    // Deliberately no `is_allowed_ip` / `allowed_ips` here. Which prefixes
+    // route to a peer is a property of `Device::peers_by_ip`, and keeping a
+    // second copy on the peer is what let the two disagree: a prefix moved
+    // between peers updated the trie and left the old owner's copy behind,
+    // so it could still source-spoof an address it no longer held. Use
+    // `Device::peer_owns` and `Device::peer_allowed_ips`.
 
     pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
         self.tunnel.time_since_last_handshake()
