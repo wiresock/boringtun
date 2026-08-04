@@ -816,9 +816,36 @@ impl Device {
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
                 let mut iter = MAX_ITR;
-                let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
-
-                let rate_limiter = d.rate_limiter.as_ref().unwrap();
+                // `DeviceHandle::new` binds this socket (`:237`) before any
+                // `private_key=` can arrive over the UAPI, so a datagram in
+                // that window reaches a device that has no key yet.
+                //
+                // Panicking here did not merely lose a worker: `wait` joins
+                // the workers with `thread.join().unwrap()` (`:258`), so a
+                // panicked worker panics the main thread and the whole daemon
+                // exits. One unauthenticated datagram, no key required, and
+                // the interface is gone -- measured, not inferred: with the
+                // panic restored the interop harness reports "Unable to modify
+                // interface: No such device" at the next `awg setconf`.
+                //
+                // `set_key` establishes `key_pair` and `rate_limiter`
+                // together, so neither can be observed without the other; both
+                // are checked anyway rather than unwrapping the second on the
+                // strength of the first.
+                let (private_key, public_key) = match d.key_pair.as_ref() {
+                    Some(pair) => pair,
+                    None => {
+                        tracing::debug!("dropping datagram: no private key set yet");
+                        return Action::Continue;
+                    }
+                };
+                let rate_limiter = match d.rate_limiter.as_ref() {
+                    Some(limiter) => limiter,
+                    None => {
+                        tracing::debug!("dropping datagram: no rate limiter yet");
+                        return Action::Continue;
+                    }
+                };
                 // Interface-wide AmneziaWG tag ranges. `ObfuscationRanges` is
                 // `Copy`, so this is a cheap snapshot for the whole batch.
                 let obf = d.config.obf;
