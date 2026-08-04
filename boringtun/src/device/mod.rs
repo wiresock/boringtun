@@ -224,14 +224,15 @@ fn index_prefixes<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>) -> Vec<(IpAddr,
 /// tests -- and an untestable guard is how it silently regresses to a panic.
 /// Read and discard up to `MAX_ITR` queued datagrams.
 ///
-/// Required for correctness, not tidiness. `EventGuard::Drop` re-arms the fd
-/// with `EPOLL_CTL_MOD`, and for socket events it does *not* read first
-/// (`needs_read` is false, `epoll.rs:94`). So a handler that returns without
-/// consuming the datagram leaves the socket readable, and epoll re-dispatches
-/// it immediately -- on the *same* queued datagram. No further traffic is
-/// needed: one datagram is enough to spin a worker at 100% CPU indefinitely,
-/// and a daemon that is started but never given a private key never leaves
-/// that state on its own.
+/// Required for correctness, not tidiness. `EventPoll::new_event` documents
+/// that the event "will keep triggering until a Read operation is no longer
+/// possible on the trigger", and it registers socket events with
+/// `needs_read: false`, so `EventGuard::Drop` re-arms the fd without reading
+/// it. A handler that returns without consuming the datagram therefore leaves
+/// the socket readable and is re-dispatched immediately -- on the *same*
+/// queued datagram. No further traffic is needed: one datagram spins a worker
+/// at 100% CPU indefinitely, and a daemon that is started but never given a
+/// private key never leaves that state on its own.
 ///
 /// Bounded by `MAX_ITR` so a flood yields between batches instead of being
 /// drained inside one dispatch -- the same budget the keyed path uses.
@@ -840,14 +841,15 @@ impl Device {
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
                 let mut iter = MAX_ITR;
-                // `DeviceHandle::new` binds this socket (`:237`) before any
-                // `private_key=` can arrive over the UAPI, so a datagram in
-                // that window reaches a device that has no key yet.
+                // `DeviceHandle::new` binds this socket, via its
+                // `open_listen_socket(0)` call, before any `private_key=` can
+                // arrive over the UAPI -- so a datagram in that window reaches
+                // a device that has no key yet.
                 //
-                // Panicking here did not merely lose a worker: `wait` joins
-                // the workers with `thread.join().unwrap()` (`:258`), so a
-                // panicked worker panics the main thread and the whole daemon
-                // exits. One unauthenticated datagram, no key required, and
+                // Panicking here did not merely lose a worker:
+                // `DeviceHandle::wait` joins the workers with
+                // `thread.join().unwrap()`, so a panicked worker panics the
+                // main thread and the whole daemon exits. One unauthenticated datagram, no key required, and
                 // the interface is gone -- measured, not inferred: with the
                 // panic restored the interop harness reports "Unable to modify
                 // interface: No such device" at the next `awg setconf`.
