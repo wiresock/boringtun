@@ -222,6 +222,29 @@ fn index_prefixes<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>) -> Vec<(IpAddr,
 /// call. A free function rather than a method because constructing a `Device`
 /// needs a TUN device and root, which would put this out of reach of ordinary
 /// tests -- and an untestable guard is how it silently regresses to a panic.
+/// Read and discard up to `MAX_ITR` queued datagrams.
+///
+/// Required for correctness, not tidiness. `EventGuard::Drop` re-arms the fd
+/// with `EPOLL_CTL_MOD`, and for socket events it does *not* read first
+/// (`needs_read` is false, `epoll.rs:94`). So a handler that returns without
+/// consuming the datagram leaves the socket readable, epoll re-dispatches it
+/// immediately, and the worker spins at 100% CPU for as long as traffic keeps
+/// arriving. The window is not necessarily brief either: a daemon started and
+/// never given a private key stays in it indefinitely.
+///
+/// Bounded by `MAX_ITR` so a flood yields between batches instead of being
+/// drained inside one dispatch -- the same budget the keyed path uses.
+fn drain_datagrams(udp: &socket2::Socket, buf: &mut [u8]) {
+    // Safety: as in the keyed path below -- `recv_from` promises not to write
+    // uninitialised bytes to the buffer.
+    let uninit = unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) };
+    for _ in 0..MAX_ITR {
+        if udp.recv_from(uninit).is_err() {
+            break;
+        }
+    }
+}
+
 fn require_key_pair(
     key_pair: &Option<(x25519::StaticSecret, x25519::PublicKey)>,
 ) -> Result<&(x25519::StaticSecret, x25519::PublicKey), Error> {
@@ -835,14 +858,16 @@ impl Device {
                 let (private_key, public_key) = match d.key_pair.as_ref() {
                     Some(pair) => pair,
                     None => {
-                        tracing::debug!("dropping datagram: no private key set yet");
+                        tracing::debug!("dropping datagrams: no private key set yet");
+                        drain_datagrams(&udp, &mut t.src_buf);
                         return Action::Continue;
                     }
                 };
                 let rate_limiter = match d.rate_limiter.as_ref() {
                     Some(limiter) => limiter,
                     None => {
-                        tracing::debug!("dropping datagram: no rate limiter yet");
+                        tracing::debug!("dropping datagrams: no rate limiter yet");
+                        drain_datagrams(&udp, &mut t.src_buf);
                         return Action::Continue;
                     }
                 };

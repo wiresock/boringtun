@@ -268,13 +268,18 @@ start_server() {  # $1 = config file
     PRE_KEY_PID=$(ip netns pids "$NS_SRV" 2>/dev/null | head -1)
     if is_uint "$PRE_KEY_PORT" && [ "$PRE_KEY_PORT" -gt 0 ] && [ -d "/proc/$PRE_KEY_PID/task" ]; then
       PRE_KEY_THREADS_BEFORE=$(ls "/proc/$PRE_KEY_PID/task" | wc -l)
+      # utime+stime in clock ticks, fields 14 and 15 of /proc/<pid>/stat.
+      # Read from after the last ')' so a comm containing spaces or parens
+      # cannot shift the field offsets.
+      PRE_KEY_CPU_BEFORE=$(awk -F')' '{split($NF,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
       # Anything at all: with no key configured the daemon cannot classify it,
       # which is the point.
       # bash's /dev/udp rather than socat or nc: no new preflight dependency,
       # and the harness already requires bash.
       ip netns exec "$NS_SRV" timeout 2 bash -c         "printf 'x' > /dev/udp/127.0.0.1/$PRE_KEY_PORT" >/dev/null 2>&1
-      sleep 0.5
+      sleep 1
       PRE_KEY_THREADS_AFTER=$(ls "/proc/$PRE_KEY_PID/task" | wc -l)
+      PRE_KEY_CPU_AFTER=$(awk -F')' '{split($NF,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
     else
       PRE_KEY_THREADS_BEFORE=skip
       PRE_KEY_THREADS_AFTER=skip
@@ -324,6 +329,16 @@ case "$PRE_KEY_THREADS_BEFORE" in
       ok "thread count unchanged across a pre-key datagram ($PRE_KEY_THREADS_AFTER)"
     else
       bad "worker died on a pre-key datagram: $PRE_KEY_THREADS_BEFORE -> $PRE_KEY_THREADS_AFTER threads"
+    fi
+    # Surviving is not enough: a handler that returns without consuming the
+    # datagram leaves the socket readable, epoll re-arms it on guard drop and
+    # re-dispatches immediately, and the worker spins. Over a 1 s idle window a
+    # healthy daemon burns ~0 ticks; a spinning one burns ~100 per busy core.
+    cpu_delta=$(( PRE_KEY_CPU_AFTER - PRE_KEY_CPU_BEFORE ))
+    if [ "$cpu_delta" -le 20 ]; then
+      ok "no busy-loop after a pre-key datagram (${cpu_delta} ticks over 1s)"
+    else
+      bad "daemon is spinning after a pre-key datagram: ${cpu_delta} ticks over 1s"
     fi ;;
 esac
 
