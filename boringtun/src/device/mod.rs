@@ -216,12 +216,6 @@ fn index_prefixes<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>) -> Vec<(IpAddr,
         .collect()
 }
 
-/// The device's key pair, or an error naming what is missing.
-///
-/// Extracted from `update_peer` so the guard sits behind a name that a test can
-/// call. A free function rather than a method because constructing a `Device`
-/// needs a TUN device and root, which would put this out of reach of ordinary
-/// tests -- and an untestable guard is how it silently regresses to a panic.
 /// Read and discard up to `MAX_ITR` queued datagrams.
 ///
 /// Required for correctness, not tidiness. `EventPoll::new_event` documents
@@ -247,6 +241,12 @@ fn drain_datagrams(udp: &socket2::Socket, buf: &mut [u8]) {
     }
 }
 
+/// The device's key pair, or an error naming what is missing.
+///
+/// Extracted from `update_peer` so the guard sits behind a name that a test can
+/// call. A free function rather than a method because constructing a `Device`
+/// needs a TUN device and root, which would put this out of reach of ordinary
+/// tests -- and an untestable guard is how it silently regresses to a panic.
 fn require_key_pair(
     key_pair: &Option<(x25519::StaticSecret, x25519::PublicKey)>,
 ) -> Result<&(x25519::StaticSecret, x25519::PublicKey), Error> {

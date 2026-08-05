@@ -334,11 +334,19 @@ case "$PRE_KEY_THREADS_BEFORE" in
     # datagram leaves the socket readable, epoll re-arms it on guard drop and
     # re-dispatches immediately, and the worker spins. Over a 1 s idle window a
     # healthy daemon burns ~0 ticks; a spinning one burns ~100 per busy core.
-    cpu_delta=$(( PRE_KEY_CPU_AFTER - PRE_KEY_CPU_BEFORE ))
-    if [ "$cpu_delta" -le 20 ]; then
-      ok "no busy-loop after a pre-key datagram (${cpu_delta} ticks over 1s)"
+    # Guard the arithmetic: an unreadable /proc entry yields an empty string,
+    # and `$(( ))` would print a shell error rather than a check result. Every
+    # other numeric read in this script goes through `is_uint` for the same
+    # reason.
+    if ! is_uint "$PRE_KEY_CPU_BEFORE" || ! is_uint "$PRE_KEY_CPU_AFTER"; then
+      bad "could not read CPU time (before='${PRE_KEY_CPU_BEFORE:-}', after='${PRE_KEY_CPU_AFTER:-}')"
     else
-      bad "daemon is spinning after a pre-key datagram: ${cpu_delta} ticks over 1s"
+      cpu_delta=$(( PRE_KEY_CPU_AFTER - PRE_KEY_CPU_BEFORE ))
+      if [ "$cpu_delta" -le 20 ]; then
+        ok "no busy-loop after a pre-key datagram (${cpu_delta} ticks over 1s)"
+      else
+        bad "daemon is spinning after a pre-key datagram: ${cpu_delta} ticks over 1s"
+      fi
     fi ;;
 esac
 
