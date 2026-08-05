@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_is_maps_onto_the_config_enum() {
+    fn probe_maps_onto_the_config_enum() {
         assert!(Probe::Dns.is(AmneziaImitationProtocol::Dns));
         assert!(Probe::Quic.is(AmneziaImitationProtocol::Quic));
         assert!(Probe::Sip.is(AmneziaImitationProtocol::Sip));

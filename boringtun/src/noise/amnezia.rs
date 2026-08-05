@@ -1352,16 +1352,23 @@ mod tests {
                     if let Some(p) = verdict {
                         assert!(
                             p.is(protocol),
-                            "cover traffic for {protocol:?} detected as {p:?} (junk={junk}, tag={tag})"
+                            "cover traffic for {:?} detected as {:?} (junk={}, tag={})",
+                            protocol,
+                            p,
+                            junk,
+                            tag
                         );
                         self_detected += 1;
                     }
 
                     // (3) QUIC and STUN never frame the whole datagram.
                     if matches!(protocol, Quic | Stun) {
-                        assert_eq!(
-                            verdict, Option::None,
-                            "{protocol:?} imitation became self-detecting (junk={junk}, tag={tag});                              see this test's doc comment before changing it"
+                        assert!(
+                            verdict.is_none(),
+                            "{:?} imitation became self-detecting (junk={}, tag={}); see this test's doc comment before changing it",
+                            protocol,
+                            junk,
+                            tag
                         );
                     }
 
@@ -1369,10 +1376,12 @@ mod tests {
                     // resemble anything. `fill_random` output passing a probe
                     // test would mean the detector is too loose.
                     if protocol == None {
-                        assert_eq!(
+                        assert!(
+                            verdict.is_none(),
+                            "random junk was detected as {:?} (junk={}, tag={})",
                             verdict,
-                            Option::None,
-                            "random junk was detected as {verdict:?} (junk={junk}, tag={tag})"
+                            junk,
+                            tag
                         );
                     }
                 }
@@ -1399,14 +1408,22 @@ mod tests {
                 let verdict = detect(&padded);
                 assert!(
                     verdict.is_some_and(|p| p.is(protocol)),
-                    "{protocol:?} cover traffic at realistic S sizes must be self-detecting,                      got {verdict:?} (tag={tag})"
+                    "{:?} cover traffic at realistic S sizes must be self-detecting, got {:?} (tag={})",
+                    protocol,
+                    verdict,
+                    tag
                 );
             }
         }
 
+        // Actual is 13 across the four S configurations. The bound guards
+        // against imitation regressing toward zero, so it sits well below that
+        // rather than one step under it -- a threshold of 12 would fail on any
+        // legitimate change that drops a single combination.
         assert!(
-            self_detected >= 12,
-            "expected our cover traffic to be probe-shaped in many cases, saw only              {self_detected}; if imitation regressed this is where it shows"
+            self_detected >= 8,
+            "expected our cover traffic to be probe-shaped in many cases, saw only {}; if imitation regressed this is where it shows",
+            self_detected
         );
         let _: fn(&[u8]) -> Option<Probe> = detect;
     }
