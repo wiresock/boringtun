@@ -158,11 +158,20 @@ fn is_plausible_dns_query(data: &[u8]) -> bool {
 /// SIP request methods and the response prefix, longest first so a shorter
 /// keyword cannot shadow a longer one.
 ///
-/// Covers every method this crate can emit: `INVITE`/`CANCEL` from the
-/// INVITE-plus-CANCEL burst, and `REGISTER`/`OPTIONS`/`SUBSCRIBE`/`NOTIFY` from
-/// the pre-handshake junk packets. `SIP/` matches a *response* line, which a
-/// client never sends — it is here only so the detector's view of "is this SIP"
-/// matches a reader's.
+/// Deliberately wider than what this crate emits. Our own request lines are
+/// only `INVITE` and `CANCEL` (the pre-handshake burst, [`super::sip`]) plus
+/// `OPTIONS`, `REGISTER` and `MESSAGE` (the S-padding filler's seeds in
+/// [`crate::noise::amnezia`]) — five of the eleven below.
+///
+/// The rest are here because detection classifies traffic arriving from
+/// *outside*, where a prober picks the method, not us. `SUBSCRIBE`, `NOTIFY`,
+/// `INFO`, `ACK` and `BYE` appear in our datagrams only inside `Allow:` header
+/// values, never as a request line, and `SIP/` is a response prefix a client
+/// never sends at all.
+///
+/// Recognising more than we emit is the right asymmetry: a missed method is a
+/// probe answered as though it were nothing, while an extra one costs a string
+/// compare.
 const SIP_PREFIXES: [&str; 11] = [
     "SUBSCRIBE ",
     "REGISTER ",
@@ -339,6 +348,32 @@ mod tests {
         assert_eq!(detect(&q), None);
         // Truncated mid-QNAME
         assert_eq!(detect(&q[..14]), None);
+    }
+
+    /// Pins the `SIP_PREFIXES` doc to the code it describes.
+    ///
+    /// The claim "our request lines are INVITE and CANCEL" is prose, and prose
+    /// drifts -- this comment previously named four methods that this crate
+    /// does not emit as request lines at all. Generating the real datagrams and
+    /// classifying them keeps the claim honest: if `sip::generate` ever emits a
+    /// method the detector does not know, this fails.
+    #[test]
+    fn our_pre_handshake_sip_is_detected_as_sip() {
+        use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+
+        for seed in 0..16u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let packets = super::super::sip::generate("example.com", &mut rng);
+            assert!(!packets.is_empty(), "generator produced nothing");
+            for pkt in &packets {
+                assert_eq!(
+                    detect(pkt),
+                    Some(Probe::Sip),
+                    "our own pre-handshake SIP was not detected as SIP: {:?}",
+                    std::str::from_utf8(&pkt[..pkt.len().min(24)])
+                );
+            }
+        }
     }
 
     #[test]
