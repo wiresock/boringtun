@@ -1278,6 +1278,139 @@ mod tests {
         }
     }
 
+    /// What our own outbound cover traffic looks like to the probe detector.
+    ///
+    /// This table is the reason a server must classify AmneziaWG *before* it
+    /// considers answering a probe. Three properties, all observed rather than
+    /// assumed -- the verdicts were printed first and locked in afterwards:
+    ///
+    /// 1. **No cross-protocol confusion.** Across every protocol x packet kind
+    ///    x S-size combination, the verdict is either `None` or the protocol we
+    ///    configured. Our DNS cover traffic is never mistaken for STUN, and so
+    ///    on. This is the safety property and it holds unconditionally.
+    ///
+    /// 2. **DNS and SIP cover traffic is detected as a probe.** At realistic S
+    ///    sizes -- the installer rolls S1-S4 in 15..150 -- a datagram we emit
+    ///    under `ip=dns` is a well-formed DNS query, because `fill_dns` frames
+    ///    the WireGuard ciphertext inside an EDNS OPT padding option. A server
+    ///    that asked "is this a probe?" first would answer its own clients
+    ///    instead of handshaking with them, and would do so *more* often the
+    ///    better the imitation became.
+    ///
+    /// 3. **QUIC and STUN are never self-detected**, and both are structural
+    ///    rather than incidental:
+    ///    - `fill_quic_short` writes a 1-RTT short header, so the leading two
+    ///      bits are `0b01` and the long-header test cannot fire.
+    ///    - `fill_stun` frames `msg_len` over the junk region only, while the
+    ///      datagram continues with the WireGuard packet, so the detector's
+    ///      `len == 20 + msg_len` check fails.
+    ///
+    ///    Both are worth pinning: this test fails the day someone extends
+    ///    `fill_stun` to frame the whole datagram, or reverts S2/S3 to a QUIC
+    ///    long header -- changes that would look like fidelity improvements
+    ///    while silently making the server answer its own peers.
+    #[test]
+    fn our_cover_traffic_is_detected_as_the_protocol_we_imitate() {
+        use crate::noise::imitation::detect::{detect, Probe};
+        use AmneziaImitationProtocol::*;
+
+        let obf = ObfuscationRanges::default();
+        let kinds: [(u32, usize); 4] = [
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ),
+            (DATA, DATA_OVERHEAD_SZ + 48),
+        ];
+        // The last entry mirrors what `amneziawg-install` actually generates.
+        let bases = [
+            AmneziaConfig::new(7, 11, 13, 17),
+            AmneziaConfig::new(1, 1, 1, 1),
+            AmneziaConfig::new(64, 0, 0, 200),
+            AmneziaConfig::new(120, 130, 110, 80),
+        ];
+
+        let mut self_detected = 0usize;
+
+        for base in &bases {
+            for protocol in [None, Dns, Quic, Sip, Stun] {
+                let cfg = base
+                    .clone()
+                    .with_protocol_imitation(protocol, Some("example.com".to_owned()));
+                let mut rng = ChaCha8Rng::seed_from_u64(0xA53);
+
+                for &(tag, base_size) in &kinds {
+                    let mut buffer = vec![0u8; base_size + 1280];
+                    write_tag(&mut buffer, tag);
+                    let padded = cfg
+                        .prepend_outbound(obf, &mut buffer, base_size, &mut rng)
+                        .unwrap()
+                        .to_vec();
+                    let junk = expected_junk(&cfg, tag);
+                    let verdict = detect(&padded);
+
+                    // (1) never a *different* protocol.
+                    if let Some(p) = verdict {
+                        assert!(
+                            p.is(protocol),
+                            "cover traffic for {protocol:?} detected as {p:?} (junk={junk}, tag={tag})"
+                        );
+                        self_detected += 1;
+                    }
+
+                    // (3) QUIC and STUN never frame the whole datagram.
+                    if matches!(protocol, Quic | Stun) {
+                        assert_eq!(
+                            verdict, Option::None,
+                            "{protocol:?} imitation became self-detecting (junk={junk}, tag={tag});                              see this test's doc comment before changing it"
+                        );
+                    }
+
+                    // (1) again, for the unimitated case: random junk must not
+                    // resemble anything. `fill_random` output passing a probe
+                    // test would mean the detector is too loose.
+                    if protocol == None {
+                        assert_eq!(
+                            verdict,
+                            Option::None,
+                            "random junk was detected as {verdict:?} (junk={junk}, tag={tag})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // (2) the hazard is real, not hypothetical: at installer-realistic S
+        // sizes every DNS and SIP datagram we emit is a valid probe. Asserted
+        // as a count so the test fails if imitation quietly stops working, not
+        // only if it starts misfiring.
+        let realistic = AmneziaConfig::new(120, 130, 110, 80);
+        for protocol in [Dns, Sip] {
+            let cfg = realistic
+                .clone()
+                .with_protocol_imitation(protocol, Some("example.com".to_owned()));
+            let mut rng = ChaCha8Rng::seed_from_u64(0xA53);
+            for &(tag, base_size) in &kinds {
+                let mut buffer = vec![0u8; base_size + 1280];
+                write_tag(&mut buffer, tag);
+                let padded = cfg
+                    .prepend_outbound(obf, &mut buffer, base_size, &mut rng)
+                    .unwrap()
+                    .to_vec();
+                let verdict = detect(&padded);
+                assert!(
+                    verdict.is_some_and(|p| p.is(protocol)),
+                    "{protocol:?} cover traffic at realistic S sizes must be self-detecting,                      got {verdict:?} (tag={tag})"
+                );
+            }
+        }
+
+        assert!(
+            self_detected >= 12,
+            "expected our cover traffic to be probe-shaped in many cases, saw only              {self_detected}; if imitation regressed this is where it shows"
+        );
+        let _: fn(&[u8]) -> Option<Probe> = detect;
+    }
+
     /// The full input matrix for `strip_inbound`, written before the change
     /// that made it fallible rather than after. The risk of that change is
     /// dropping *valid* traffic, so every configuration shape is enumerated:
