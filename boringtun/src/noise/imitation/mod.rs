@@ -13,6 +13,7 @@
 //! QUIC imitation they are always compiled. The QUIC imitation lives in
 //! [`super::quic`].
 
+pub(crate) mod detect;
 pub(crate) mod dns;
 pub(crate) mod sip;
 pub(crate) mod stun;
