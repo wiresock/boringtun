@@ -254,6 +254,41 @@ start_server() {  # $1 = config file
     waited=$((waited + 1))
     [ "$waited" -ge 50 ] && return 1   # 10s
   done
+  # Optional: exercise the window between binding the UDP socket and having a
+  # private key. `DeviceHandle::new` binds before any `private_key=` can
+  # arrive, so a datagram here reaches a keyless device. It used to hit
+  # `expect("Key not set")` in the ingress handler and kill an ingress worker
+  # for the life of the process.
+  #
+  # Thread count is the observable, not "does the tunnel still work": the
+  # daemon runs several ingress workers, so losing one leaves the others
+  # serving traffic and every downstream check still passes.
+  if [ "${PRE_KEY_PROBE:-0}" = "1" ]; then
+    PRE_KEY_PORT=$(ip netns exec "$NS_SRV" awg show "$IF_SRV" listen-port 2>/dev/null)
+    PRE_KEY_PID=$(ip netns pids "$NS_SRV" 2>/dev/null | head -1)
+    if is_uint "$PRE_KEY_PORT" && [ "$PRE_KEY_PORT" -gt 0 ] && [ -d "/proc/$PRE_KEY_PID/task" ]; then
+      PRE_KEY_THREADS_BEFORE=$(ls "/proc/$PRE_KEY_PID/task" | wc -l)
+      # utime+stime in clock ticks, fields 14 and 15 of /proc/<pid>/stat.
+      # Read from after the last ')' so a comm containing spaces or parens
+      # cannot shift the field offsets, and strip the leading blank explicitly.
+      # POSIX makes a single-blank separator mean "split on runs of blanks,
+      # ignoring leading ones" -- verified against gawk and mawk -- so the sub()
+      # is redundant, but it states the intent without relying on that rule.
+      PRE_KEY_CPU_BEFORE=$(awk -F')' '{s=$NF; sub(/^[[:blank:]]+/,"",s); split(s,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
+      # Anything at all: with no key configured the daemon cannot classify it,
+      # which is the point.
+      # bash's /dev/udp rather than socat or nc: no new preflight dependency,
+      # and the harness already requires bash.
+      ip netns exec "$NS_SRV" timeout 2 bash -c         "printf 'x' > /dev/udp/127.0.0.1/$PRE_KEY_PORT" >/dev/null 2>&1
+      sleep 1
+      PRE_KEY_THREADS_AFTER=$(ls "/proc/$PRE_KEY_PID/task" | wc -l)
+      PRE_KEY_CPU_AFTER=$(awk -F')' '{s=$NF; sub(/^[[:blank:]]+/,"",s); split(s,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
+    else
+      PRE_KEY_THREADS_BEFORE=skip
+      PRE_KEY_THREADS_AFTER=skip
+    fi
+  fi
+
   ip netns exec "$NS_SRV" awg setconf "$IF_SRV" "$1" || return 1
   ip netns exec "$NS_SRV" sh -c "ip addr add 10.66.201.1/24 dev $IF_SRV && ip link set $IF_SRV up mtu 1420"
 }
@@ -279,7 +314,7 @@ set +e
 # --------------------------------------------------------------------- tests --
 
 info "1. UAPI: awg setconf against a userspace implementation"
-if start_server srv.conf; then
+if PRE_KEY_PROBE=1 start_server srv.conf; then
   ok "awg setconf accepted (implies the UAPI socket was discoverable)"
 else
   bad "awg setconf failed -- see $WORKDIR/srv.log"
@@ -288,6 +323,35 @@ else
   printf '\033[31mSUMMARY: %d passed, %d FAILED\033[0m\n' "$PASS" "$FAIL"
   exit 1
 fi
+
+info "1b. A datagram arriving before the private key must not kill a worker"
+case "$PRE_KEY_THREADS_BEFORE" in
+  skip|"") bad "could not probe the pre-key window (port='${PRE_KEY_PORT:-}', pid='${PRE_KEY_PID:-}')" ;;
+  *)
+    if [ "$PRE_KEY_THREADS_BEFORE" = "$PRE_KEY_THREADS_AFTER" ]; then
+      ok "thread count unchanged across a pre-key datagram ($PRE_KEY_THREADS_AFTER)"
+    else
+      bad "worker died on a pre-key datagram: $PRE_KEY_THREADS_BEFORE -> $PRE_KEY_THREADS_AFTER threads"
+    fi
+    # Surviving is not enough: a handler that returns without consuming the
+    # datagram leaves the socket readable, epoll re-arms it on guard drop and
+    # re-dispatches immediately, and the worker spins. Over a 1 s idle window a
+    # healthy daemon burns ~0 ticks; a spinning one burns ~100 per busy core.
+    # Guard the arithmetic: an unreadable /proc entry yields an empty string,
+    # and `$(( ))` would print a shell error rather than a check result. Every
+    # other numeric read in this script goes through `is_uint` for the same
+    # reason.
+    if ! is_uint "$PRE_KEY_CPU_BEFORE" || ! is_uint "$PRE_KEY_CPU_AFTER"; then
+      bad "could not read CPU time (before='${PRE_KEY_CPU_BEFORE:-}', after='${PRE_KEY_CPU_AFTER:-}')"
+    else
+      cpu_delta=$(( PRE_KEY_CPU_AFTER - PRE_KEY_CPU_BEFORE ))
+      if [ "$cpu_delta" -le 20 ]; then
+        ok "no busy-loop after a pre-key datagram (${cpu_delta} ticks over 1s)"
+      else
+        bad "daemon is spinning after a pre-key datagram: ${cpu_delta} ticks over 1s"
+      fi
+    fi ;;
+esac
 
 info "2. UAPI: showconf round-trips every AmneziaWG parameter"
 # Capture stderr and test the exit status: if showconf itself fails, every one

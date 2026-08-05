@@ -30,7 +30,7 @@ use std::io::{self, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -214,6 +214,31 @@ fn index_prefixes<D>(index: &AllowedIps<Arc<D>>, owner: &Arc<D>) -> Vec<(IpAddr,
         .filter(|(found, _, _)| Arc::ptr_eq(found, owner))
         .map(|(_, addr, cidr)| (addr, cidr))
         .collect()
+}
+
+/// Read and discard up to `MAX_ITR` queued datagrams.
+///
+/// Required for correctness, not tidiness. `EventPoll::new_event` documents
+/// that the event "will keep triggering until a Read operation is no longer
+/// possible on the trigger", and it registers socket events with
+/// `needs_read: false`, so `EventGuard::Drop` re-arms the fd without reading
+/// it. A handler that returns without consuming the datagram therefore leaves
+/// the socket readable and is re-dispatched immediately -- on the *same*
+/// queued datagram. No further traffic is needed: one datagram spins a worker
+/// at 100% CPU indefinitely, and a daemon that is started but never given a
+/// private key never leaves that state on its own.
+///
+/// Bounded by `MAX_ITR` so a flood yields between batches instead of being
+/// drained inside one dispatch -- the same budget the keyed path uses.
+fn drain_datagrams(udp: &socket2::Socket, buf: &mut [u8]) {
+    // Safety: as in the keyed path below -- `recv_from` promises not to write
+    // uninitialised bytes to the buffer.
+    let uninit = unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) };
+    for _ in 0..MAX_ITR {
+        if udp.recv_from(uninit).is_err() {
+            break;
+        }
+    }
 }
 
 /// The device's key pair, or an error naming what is missing.
@@ -811,14 +836,55 @@ impl Device {
     }
 
     fn register_udp_handler(&self, udp: socket2::Socket) -> Result<(), Error> {
+        // Logged at most once per socket. The keyless path is re-dispatched
+        // for every batch of arriving datagrams, and a daemon that is never
+        // given a key stays on it indefinitely, so logging per dispatch would
+        // turn one misconfiguration into unbounded log volume. Once carries
+        // the whole signal: the operator needs to know traffic arrived before
+        // the key, not how much of it did.
+        let warned_keyless = AtomicBool::new(false);
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
                 let mut iter = MAX_ITR;
-                let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
-
-                let rate_limiter = d.rate_limiter.as_ref().unwrap();
+                // `DeviceHandle::new` binds this socket, via its
+                // `open_listen_socket(0)` call, before any `private_key=` can
+                // arrive over the UAPI -- so a datagram in that window reaches
+                // a device that has no key yet.
+                //
+                // Panicking here did not merely lose a worker:
+                // `DeviceHandle::wait` joins the workers with
+                // `thread.join().unwrap()`, so a panicked worker panics the
+                // main thread and the whole daemon exits. One unauthenticated datagram, no key required, and
+                // the interface is gone -- measured, not inferred: with the
+                // panic restored the interop harness reports "Unable to modify
+                // interface: No such device" at the next `awg setconf`.
+                //
+                // `set_key` establishes `key_pair` and `rate_limiter`
+                // together, so neither can be observed without the other; both
+                // are checked anyway rather than unwrapping the second on the
+                // strength of the first.
+                let (private_key, public_key) = match d.key_pair.as_ref() {
+                    Some(pair) => pair,
+                    None => {
+                        if !warned_keyless.swap(true, Ordering::Relaxed) {
+                            tracing::debug!("dropping datagrams: no private key set yet");
+                        }
+                        drain_datagrams(&udp, &mut t.src_buf);
+                        return Action::Continue;
+                    }
+                };
+                let rate_limiter = match d.rate_limiter.as_ref() {
+                    Some(limiter) => limiter,
+                    None => {
+                        if !warned_keyless.swap(true, Ordering::Relaxed) {
+                            tracing::debug!("dropping datagrams: no rate limiter yet");
+                        }
+                        drain_datagrams(&udp, &mut t.src_buf);
+                        return Action::Continue;
+                    }
+                };
                 // Interface-wide AmneziaWG tag ranges. `ObfuscationRanges` is
                 // `Copy`, so this is a cheap snapshot for the whole batch.
                 let obf = d.config.obf;
