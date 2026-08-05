@@ -29,7 +29,18 @@ const SOFTWARE_POOL: [&str; 5] = [
 const HEADER_LEN: usize = 20;
 const MI_ATTR_LEN: usize = 4 + 20; // type+len + HMAC-SHA1
 const FP_ATTR_LEN: usize = 4 + 4; // type+len + CRC-32
-const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+/// RFC 8489 §5, and the crate's single definition of it.
+///
+/// `pub(crate)` because three modules need it: this one to frame requests and
+/// responses, `imitation::detect` to gate the DNS arm, and `noise::amnezia`
+/// for the S-padding filler. Each used to restate the value. A second copy of
+/// a constant is the same drift risk as a second copy of a rule, just slower
+/// to notice.
+///
+/// Correctness is pinned separately, by a test asserting the literal bytes on
+/// a generated packet. Deriving everything from one place makes the copies
+/// consistent; it cannot make them right.
+pub(crate) const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 const BINDING_REQUEST: u16 = 0x0001;
 
 struct BindingRequest<'a> {

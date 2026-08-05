@@ -39,7 +39,8 @@ const SIP_JUNK_SIZE_MAX: usize = 1200;
 const STUN_JUNK_SIZE_MIN: usize = 28;
 const STUN_JUNK_SIZE_MAX: usize = 100;
 /// RFC 5389 STUN magic cookie, present at bytes 4..8 of every STUN message.
-const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+/// Re-exported rather than restated -- see [`imitation::stun::MAGIC_COOKIE`].
+use crate::noise::imitation::stun::MAGIC_COOKIE as STUN_MAGIC_COOKIE;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]

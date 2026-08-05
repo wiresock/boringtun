@@ -69,10 +69,11 @@ impl Probe {
     }
 }
 
-/// Kept only to gate the DNS arm below: a datagram carrying the STUN cookie
-/// is not a DNS query whatever else it is. The Binding-Request framing rules
-/// live in `stun::binding_request_len`, not here.
-const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+/// Derived from [`super::stun::MAGIC_COOKIE`], not restated. Used only to gate
+/// the DNS arm below -- a datagram carrying the STUN cookie is not a DNS
+/// query whatever else it is. The Binding-Request framing rules live in
+/// `stun::binding_request_len`, not here.
+const STUN_MAGIC_COOKIE: u32 = u32::from_be_bytes(super::stun::MAGIC_COOKIE);
 /// RFC 9000 §17.2: a connection ID is at most 20 bytes.
 const QUIC_MAX_CID_LEN: usize = 20;
 
