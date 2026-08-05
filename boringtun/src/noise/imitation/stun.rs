@@ -14,6 +14,7 @@
 use super::random_token;
 use rand_core::RngCore;
 use ring::hmac;
+use std::net::SocketAddr;
 
 /// Plausible SOFTWARE values; deliberately generic ICE/VoIP stacks, never a
 /// product-specific string that would itself be a fingerprint.
@@ -170,6 +171,147 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
     vec![first, second]
 }
 
+// The response side has no caller yet -- the ingress hook that will reach it
+// is the next commit. Scoped to these four items rather than the module, so
+// the request side stays covered by the lint.
+#[allow(dead_code)]
+/// Walk `msg`'s attributes and report whether a FINGERPRINT (0x8028) is present.
+///
+/// Parsing attacker-controlled bytes, so every step is bounds-checked and a
+/// malformed attribute ends the walk rather than being skipped over: a length
+/// that overruns the buffer is not a reason to keep guessing at offsets.
+fn has_fingerprint(msg: &[u8]) -> bool {
+    let mut off = HEADER_LEN;
+    while off + 4 <= msg.len() {
+        let attr_type = u16::from_be_bytes([msg[off], msg[off + 1]]);
+        let attr_len = u16::from_be_bytes([msg[off + 2], msg[off + 3]]) as usize;
+        if attr_type == 0x8028 {
+            return true;
+        }
+        let advance = match padded(attr_len).checked_add(4) {
+            Some(a) => a,
+            None => return false,
+        };
+        off = match off.checked_add(advance) {
+            Some(o) if o <= msg.len() => o,
+            _ => return false,
+        };
+    }
+    false
+}
+
+#[allow(dead_code)]
+/// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
+///
+/// The port is XORed with the top half of the magic cookie and the address with
+/// the cookie itself; IPv6 continues the XOR into the transaction id, which is
+/// why the id has to be passed in rather than read back from the header.
+fn write_xor_mapped_address(pkt: &mut [u8], off: usize, client: SocketAddr, trans_id: &[u8; 12]) {
+    let cookie = u32::from_be_bytes(MAGIC_COOKIE);
+    let x_port = client.port() ^ (cookie >> 16) as u16;
+
+    match client {
+        SocketAddr::V4(v4) => {
+            write_tlv(pkt, off, 0x0020, 8);
+            pkt[off + 4] = 0;
+            pkt[off + 5] = 0x01; // IPv4
+            pkt[off + 6..off + 8].copy_from_slice(&x_port.to_be_bytes());
+            let x_addr = u32::from(*v4.ip()) ^ cookie;
+            pkt[off + 8..off + 12].copy_from_slice(&x_addr.to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            write_tlv(pkt, off, 0x0020, 20);
+            pkt[off + 4] = 0;
+            pkt[off + 5] = 0x02; // IPv6
+            pkt[off + 6..off + 8].copy_from_slice(&x_port.to_be_bytes());
+            let mut key = [0u8; 16];
+            key[..4].copy_from_slice(&MAGIC_COOKIE);
+            key[4..].copy_from_slice(trans_id);
+            let addr = v6.ip().octets();
+            for i in 0..16 {
+                pkt[off + 8 + i] = addr[i] ^ key[i];
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+/// Attribute size of XOR-MAPPED-ADDRESS for this address family.
+fn xor_mapped_len(client: SocketAddr) -> usize {
+    4 + if client.is_ipv4() { 8 } else { 20 }
+}
+
+#[allow(dead_code)]
+/// Build a Binding Success Response to `request`, reporting `client` as the
+/// reflexive address.
+///
+/// Returns `None` if `request` is not a Binding Request this should answer.
+///
+/// **Presents as an unauthenticated public STUN server**, which is the
+/// deployment that answers Binding Requests from strangers at all — the kind a
+/// prober would expect to find. So a MESSAGE-INTEGRITY attribute in the request
+/// is ignored rather than answered with 401: we hold no credential, and a
+/// server that demanded one would refuse every unauthenticated check, which no
+/// public STUN server does.
+///
+/// FINGERPRINT is echoed when the request carries one, because RFC 5389 §15.5
+/// requires it and its absence is a one-attribute tell.
+///
+/// **Size**: 20-byte header + 12 (IPv4) or 24 (IPv6) + SOFTWARE + 8 if
+/// FINGERPRINT. Against a minimal 20-byte Binding Request that is larger than
+/// the request; against a real ICE connectivity check — which carries SOFTWARE,
+/// USERNAME, PRIORITY, ICE-CONTROLLING, MESSAGE-INTEGRITY and FINGERPRINT — it
+/// is smaller. The caller decides whether a given ratio is acceptable; this
+/// function does not send.
+pub(crate) fn binding_success(
+    request: &[u8],
+    client: SocketAddr,
+    software: &str,
+) -> Option<Vec<u8>> {
+    if request.len() < HEADER_LEN {
+        return None;
+    }
+    if u16::from_be_bytes([request[0], request[1]]) != 0x0001 {
+        return None;
+    }
+    if request[4..8] != MAGIC_COOKIE {
+        return None;
+    }
+    let mut trans_id = [0u8; 12];
+    trans_id.copy_from_slice(&request[8..20]);
+
+    let echo_fingerprint = has_fingerprint(request);
+    let software_padded = padded(software.len());
+    let attrs_len = xor_mapped_len(client)
+        + (4 + software_padded)
+        + if echo_fingerprint { FP_ATTR_LEN } else { 0 };
+
+    // Zero-initialised: attribute padding bytes must be zero for the CRC.
+    let mut pkt = vec![0u8; HEADER_LEN + attrs_len];
+    pkt[0..2].copy_from_slice(&0x0101u16.to_be_bytes()); // Binding Success
+    pkt[2..4].copy_from_slice(&(attrs_len as u16).to_be_bytes());
+    pkt[4..8].copy_from_slice(&MAGIC_COOKIE);
+    pkt[8..20].copy_from_slice(&trans_id);
+
+    let mut off = HEADER_LEN;
+    write_xor_mapped_address(&mut pkt, off, client, &trans_id);
+    off += xor_mapped_len(client);
+
+    write_tlv(&mut pkt, off, 0x8022, software.len() as u16); // SOFTWARE
+    pkt[off + 4..off + 4 + software.len()].copy_from_slice(software.as_bytes());
+    off += 4 + software_padded;
+
+    if echo_fingerprint {
+        // RFC 5389 §15.5: computed with the length field already covering the
+        // FINGERPRINT attribute, which it does -- `attrs_len` included it.
+        let crc = crc32_ieee(&pkt[..off]) ^ 0x5354_554e;
+        write_tlv(&mut pkt, off, 0x8028, 4);
+        pkt[off + 4..off + 8].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    Some(pkt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +403,165 @@ mod tests {
         verify_packet(&packets[1], &ice_pwd, true);
         // The two checks use distinct transaction ids.
         assert_ne!(packets[0][8..20], packets[1][8..20]);
+    }
+
+    fn parse_attrs(msg: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut off = HEADER_LEN;
+        while off + 4 <= msg.len() {
+            let t = u16::from_be_bytes([msg[off], msg[off + 1]]);
+            let l = u16::from_be_bytes([msg[off + 2], msg[off + 3]]) as usize;
+            let end = off + 4 + l;
+            if end > msg.len() {
+                break;
+            }
+            out.push((t, msg[off + 4..end].to_vec()));
+            off += 4 + padded(l);
+        }
+        out
+    }
+
+    /// Answering our own client's ICE check is the realistic case: the request
+    /// carries FINGERPRINT, so the response must too.
+    #[test]
+    fn binding_success_answers_our_own_connectivity_check() {
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let request = &generate(&mut rng)[0];
+        let client: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+
+        let resp = binding_success(request, client, "Chromium").expect("must answer");
+
+        assert_eq!(&resp[0..2], &0x0101u16.to_be_bytes(), "Binding Success");
+        assert_eq!(&resp[4..8], &MAGIC_COOKIE, "magic cookie");
+        assert_eq!(&resp[8..20], &request[8..20], "transaction id echoed");
+        assert_eq!(
+            u16::from_be_bytes([resp[2], resp[3]]) as usize,
+            resp.len() - HEADER_LEN,
+            "length field covers exactly the attributes"
+        );
+
+        let attrs = parse_attrs(&resp);
+        let types: Vec<u16> = attrs.iter().map(|(t, _)| *t).collect();
+        assert!(types.contains(&0x0020), "XOR-MAPPED-ADDRESS present");
+        assert!(types.contains(&0x8022), "SOFTWARE present");
+        assert!(
+            types.contains(&0x8028),
+            "FINGERPRINT must be echoed when the request carries one (RFC 5389 s15.5)"
+        );
+    }
+
+    /// The reflexive address is the point of the response: a client reads its
+    /// own public address out of it, so a wrong XOR is not cosmetic.
+    #[test]
+    fn xor_mapped_address_decodes_back_to_the_client() {
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        let request = &generate(&mut rng)[0];
+
+        for addr in ["198.51.100.42:1234", "[2001:db8::dead:beef]:4321"] {
+            let client: SocketAddr = addr.parse().unwrap();
+            let resp = binding_success(request, client, "Mozilla").unwrap();
+            let attrs = parse_attrs(&resp);
+            let (_, v) = attrs.iter().find(|(t, _)| *t == 0x0020).expect("XMA");
+
+            let cookie = u32::from_be_bytes(MAGIC_COOKIE);
+            let port = u16::from_be_bytes([v[2], v[3]]) ^ (cookie >> 16) as u16;
+            assert_eq!(port, client.port(), "port for {addr}");
+
+            match client {
+                SocketAddr::V4(v4) => {
+                    assert_eq!(v[1], 0x01, "family");
+                    let x = u32::from_be_bytes([v[4], v[5], v[6], v[7]]);
+                    assert_eq!(std::net::Ipv4Addr::from(x ^ cookie), *v4.ip());
+                }
+                SocketAddr::V6(v6) => {
+                    assert_eq!(v[1], 0x02, "family");
+                    let mut key = [0u8; 16];
+                    key[..4].copy_from_slice(&MAGIC_COOKIE);
+                    key[4..].copy_from_slice(&resp[8..20]);
+                    let mut out = [0u8; 16];
+                    for i in 0..16 {
+                        out[i] = v[4 + i] ^ key[i];
+                    }
+                    assert_eq!(std::net::Ipv6Addr::from(out), *v6.ip());
+                }
+            }
+        }
+    }
+
+    /// A FINGERPRINT that is present but wrong is a worse tell than one that is
+    /// absent: any real STUN stack validates it and drops the message. Checked
+    /// with the same CRC the request-side test uses.
+    #[test]
+    fn echoed_fingerprint_validates() {
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let request = &generate(&mut rng)[0];
+
+        for addr in ["203.0.113.9:1", "[2001:db8::1]:65535"] {
+            let client: SocketAddr = addr.parse().unwrap();
+            let resp = binding_success(request, client, "PJSIP 2.13.0").unwrap();
+
+            let fp_off = resp.len() - FP_ATTR_LEN;
+            assert_eq!(
+                be16(&resp[fp_off..]),
+                0x8028,
+                "FINGERPRINT must be the last attribute"
+            );
+            let expected = crc32_ieee(&resp[..fp_off]) ^ 0x5354_554e;
+            let got = u32::from_be_bytes([
+                resp[fp_off + 4],
+                resp[fp_off + 5],
+                resp[fp_off + 6],
+                resp[fp_off + 7],
+            ]);
+            assert_eq!(got, expected, "FINGERPRINT CRC for {addr}");
+        }
+    }
+
+    /// A bare Binding Request without FINGERPRINT must not gain one: echoing an
+    /// attribute the peer did not send is as much a tell as omitting one it did.
+    #[test]
+    fn fingerprint_is_echoed_only_when_requested() {
+        let mut bare = vec![0u8; HEADER_LEN];
+        bare[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        bare[4..8].copy_from_slice(&MAGIC_COOKIE);
+        bare[8..20].copy_from_slice(&[0xAB; 12]);
+
+        let client: SocketAddr = "192.0.2.1:9999".parse().unwrap();
+        let resp = binding_success(&bare, client, "libnice 0.1.21").unwrap();
+        let types: Vec<u16> = parse_attrs(&resp).iter().map(|(t, _)| *t).collect();
+        assert!(!types.contains(&0x8028), "no FINGERPRINT was requested");
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_binding_request() {
+        let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        // Too short.
+        assert!(binding_success(&[0u8; 19], client, "x").is_none());
+        // Right length, wrong message type (a Binding *Success*, not a request).
+        let mut resp_shaped = vec![0u8; HEADER_LEN];
+        resp_shaped[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
+        resp_shaped[4..8].copy_from_slice(&MAGIC_COOKIE);
+        assert!(
+            binding_success(&resp_shaped, client, "x").is_none(),
+            "answering our own response shape would be a reflection loop"
+        );
+        // Right type, no magic cookie.
+        let mut no_cookie = vec![0u8; HEADER_LEN];
+        no_cookie[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        assert!(binding_success(&no_cookie, client, "x").is_none());
+    }
+
+    /// `has_fingerprint` walks attacker-controlled bytes; a length that overruns
+    /// the buffer must end the walk rather than wrap or index out of bounds.
+    #[test]
+    fn attribute_walk_survives_malformed_lengths() {
+        let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let mut m = vec![0u8; HEADER_LEN + 8];
+        m[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        m[4..8].copy_from_slice(&MAGIC_COOKIE);
+        // An attribute claiming 0xFFFF bytes inside a 28-byte datagram.
+        m[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0x0006u16.to_be_bytes());
+        m[HEADER_LEN + 2..HEADER_LEN + 4].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        assert!(binding_success(&m, client, "x").is_some(), "must not panic");
     }
 }
