@@ -198,6 +198,11 @@ enum Fingerprint {
 /// Parsing attacker-controlled bytes, so every step is bounds-checked and a
 /// length that overruns the buffer ends the walk: a bad length is not a reason
 /// to keep guessing at offsets.
+///
+/// `msg.len()` is the authoritative end of the message here because
+/// [`binding_success`] has already checked it equals `HEADER_LEN + msg_len`.
+/// Calling this on an unvalidated datagram would let trailing bytes change
+/// which attribute counts as last.
 #[allow(dead_code)]
 fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     let mut off = HEADER_LEN;
@@ -232,12 +237,20 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     Fingerprint::Absent
 }
 
-/// RFC 5389 §15.10: a SOFTWARE value is under 128 characters, which is at most
-/// 763 bytes once encoded. Bounding it keeps `software.len() as u16` and the
-/// message-length cast lossless by construction rather than by assumption --
-/// the same failure this branch already hit once, where a documented limit was
-/// never enforced.
-const MAX_SOFTWARE_LEN: usize = 763;
+/// Upper bound on the SOFTWARE value this encoder will emit, in bytes.
+///
+/// Two jobs. It keeps `software.len() as u16` and the message-length cast
+/// lossless by construction rather than by assumption -- the failure this
+/// branch has now hit twice, where a limit was documented and never enforced.
+/// And it keeps what we emit inside the spec's limit, which is expressed in
+/// *characters* (fewer than 128) rather than bytes: every value we pass comes
+/// from `SOFTWARE_POOL` and is short ASCII, so a 128-byte ceiling cannot exceed
+/// the character limit for anything this crate produces.
+///
+/// Deliberately not derived from a byte figure. The character-to-byte
+/// conversion depends on which UTF-8 revision the reader has in mind, and being
+/// stricter than necessary on a value we choose ourselves costs nothing.
+const MAX_SOFTWARE_LEN: usize = 128;
 
 #[allow(dead_code)]
 /// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
@@ -316,6 +329,17 @@ pub(crate) fn binding_success(
         return None;
     }
     if request[4..8] != MAGIC_COOKIE {
+        return None;
+    }
+    // The length field is authoritative, and a real agent checks it: RFC 8489
+    // §6.3 has a receiver verify "that the message length is sensible" before
+    // anything else. Without this, a datagram whose length disagrees with its
+    // size gets answered where a real server discards it -- and it would also
+    // move where `check_fingerprint` believes the message ends, changing what
+    // counts as the last attribute. `detect` already requires this exact
+    // equality for STUN; the responder was the looser of the two.
+    let msg_len = u16::from_be_bytes([request[2], request[3]]) as usize;
+    if request.len() != HEADER_LEN + msg_len {
         return None;
     }
     let mut trans_id = [0u8; 12];
@@ -579,6 +603,7 @@ mod tests {
     fn fingerprint_is_echoed_only_when_requested() {
         let mut bare = vec![0u8; HEADER_LEN];
         bare[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        bare[2..4].copy_from_slice(&0u16.to_be_bytes()); // no attributes
         bare[4..8].copy_from_slice(&MAGIC_COOKIE);
         bare[8..20].copy_from_slice(&[0xAB; 12]);
 
@@ -638,6 +663,55 @@ mod tests {
         );
     }
 
+    /// RFC 8489 §6.3 has a receiver check "that the message length is sensible"
+    /// before anything else, so a datagram whose length field disagrees with its
+    /// size is discarded by a real agent. Answering one would be a distinguisher,
+    /// and it would also move where `check_fingerprint` thinks the message ends.
+    ///
+    /// `detect` already required this exact equality for STUN; the responder was
+    /// the looser of the two, which is the wrong way round.
+    ///
+    /// Built **without** a FINGERPRINT on purpose. My first version of this test
+    /// used a real ICE check and passed even with the length validation removed,
+    /// because the FINGERPRINT "must be last" rule caught both cases first. With
+    /// no FINGERPRINT present, only the length check can reject these.
+    #[test]
+    fn a_message_length_that_disagrees_with_the_datagram_gets_no_answer() {
+        let client: SocketAddr = "198.51.100.3:5060".parse().unwrap();
+
+        // A well-framed bare Binding Request: no attributes, length 0.
+        let mut bare = vec![0u8; HEADER_LEN];
+        bare[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        bare[2..4].copy_from_slice(&0u16.to_be_bytes());
+        bare[4..8].copy_from_slice(&MAGIC_COOKIE);
+        bare[8..20].copy_from_slice(&[0x5A; 12]);
+        assert_eq!(
+            check_fingerprint(&bare),
+            Fingerprint::Absent,
+            "no FP to hide behind"
+        );
+        assert!(
+            binding_success(&bare, client, "Chromium").is_some(),
+            "control"
+        );
+
+        // Trailing byte: longer than the header declares.
+        let mut trailing = bare.clone();
+        trailing.push(0);
+        assert!(
+            binding_success(&trailing, client, "Chromium").is_none(),
+            "a datagram longer than its declared length must be discarded"
+        );
+
+        // Length field overstates a payload that is not there.
+        let mut overstated = bare.clone();
+        overstated[2..4].copy_from_slice(&8u16.to_be_bytes());
+        assert!(
+            binding_success(&overstated, client, "Chromium").is_none(),
+            "a length field larger than the datagram must be discarded"
+        );
+    }
+
     #[test]
     fn refuses_what_is_not_a_binding_request() {
         let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
@@ -665,6 +739,11 @@ mod tests {
         let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
         let mut m = vec![0u8; HEADER_LEN + 8];
         m[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        // Header length is correct -- 8 bytes of attributes follow. It is the
+        // *attribute* length that is malformed, which is the thing under test;
+        // a wrong header length is rejected earlier and would never reach the
+        // attribute walk.
+        m[2..4].copy_from_slice(&8u16.to_be_bytes());
         m[4..8].copy_from_slice(&MAGIC_COOKIE);
         // An attribute claiming 0xFFFF bytes inside a 28-byte datagram.
         m[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0x0006u16.to_be_bytes());
