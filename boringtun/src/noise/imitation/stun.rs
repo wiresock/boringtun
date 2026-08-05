@@ -30,6 +30,7 @@ const HEADER_LEN: usize = 20;
 const MI_ATTR_LEN: usize = 4 + 20; // type+len + HMAC-SHA1
 const FP_ATTR_LEN: usize = 4 + 4; // type+len + CRC-32
 const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+const BINDING_REQUEST: u16 = 0x0001;
 
 struct BindingRequest<'a> {
     software: &'a str,
@@ -175,6 +176,38 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
 // is the next commit. Scoped to these items rather than the module, so the
 // request side stays covered by the lint.
 
+/// Validate `data` as a well-framed STUN Binding Request and return the
+/// declared attribute length.
+///
+/// One function so the classifier and the responder cannot disagree. They did:
+/// `detect` enforced 32-bit alignment and `binding_success` did not, so a
+/// misaligned-length request was answered by the half that emits bytes and
+/// dropped by the half that decides whether to look. Three review rounds found
+/// three separate instances of that same asymmetry, which is a sign the checks
+/// wanted to be one thing rather than two lists kept in step by hand.
+///
+/// RFC 8489 §5: the length excludes the 20-byte header, and "since all STUN
+/// attributes are padded to a multiple of 4 bytes, the last 2 bits of this
+/// field are always zero". §6.3 has a receiver check "that the message length
+/// is sensible" before anything else.
+pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
+    if data.len() < HEADER_LEN {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    if msg_type != BINDING_REQUEST {
+        return None;
+    }
+    if data[4..8] != MAGIC_COOKIE {
+        return None;
+    }
+    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if !msg_len.is_multiple_of(4) || data.len() != HEADER_LEN + msg_len {
+        return None;
+    }
+    Some(msg_len)
+}
+
 /// What `msg` carries in place of a FINGERPRINT attribute.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,13 +277,14 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
 /// branch has now hit twice, where a limit was documented and never enforced.
 /// And it keeps what we emit inside the spec's limit, which is expressed in
 /// *characters* (fewer than 128) rather than bytes: every value we pass comes
-/// from `SOFTWARE_POOL` and is short ASCII, so a 128-byte ceiling cannot exceed
-/// the character limit for anything this crate produces.
+/// from `SOFTWARE_POOL` and is short ASCII, so 127 bytes is 127 characters and
+/// satisfies "fewer than 128" exactly. 128 would have permitted a value the
+/// spec forbids.
 ///
 /// Deliberately not derived from a byte figure. The character-to-byte
 /// conversion depends on which UTF-8 revision the reader has in mind, and being
 /// stricter than necessary on a value we choose ourselves costs nothing.
-const MAX_SOFTWARE_LEN: usize = 128;
+const MAX_SOFTWARE_LEN: usize = 127;
 
 #[allow(dead_code)]
 /// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
@@ -322,26 +356,8 @@ pub(crate) fn binding_success(
     client: SocketAddr,
     software: &str,
 ) -> Option<Vec<u8>> {
-    if request.len() < HEADER_LEN {
-        return None;
-    }
-    if u16::from_be_bytes([request[0], request[1]]) != 0x0001 {
-        return None;
-    }
-    if request[4..8] != MAGIC_COOKIE {
-        return None;
-    }
-    // The length field is authoritative, and a real agent checks it: RFC 8489
-    // §6.3 has a receiver verify "that the message length is sensible" before
-    // anything else. Without this, a datagram whose length disagrees with its
-    // size gets answered where a real server discards it -- and it would also
-    // move where `check_fingerprint` believes the message ends, changing what
-    // counts as the last attribute. `detect` already requires this exact
-    // equality for STUN; the responder was the looser of the two.
-    let msg_len = u16::from_be_bytes([request[2], request[3]]) as usize;
-    if request.len() != HEADER_LEN + msg_len {
-        return None;
-    }
+    // Shared with `detect`, so the two cannot drift apart again.
+    binding_request_len(request)?;
     let mut trans_id = [0u8; 12];
     trans_id.copy_from_slice(&request[8..20]);
 
@@ -661,6 +677,20 @@ mod tests {
             binding_success(request, client, &over).is_none(),
             "an oversized SOFTWARE must be refused, not silently truncated"
         );
+
+        // Literals, not `MAX_SOFTWARE_LEN`: the assertions above move with the
+        // constant, so they prove the bound is enforced but not that it is the
+        // right number. The spec limit is "fewer than 128 characters", and our
+        // values are ASCII, so 127 bytes must pass and 128 must not. Raising
+        // the constant to 128 leaves every symbolic assertion green.
+        assert!(
+            binding_success(request, client, &"s".repeat(127)).is_some(),
+            "127 ASCII characters is within \"fewer than 128\""
+        );
+        assert!(
+            binding_success(request, client, &"s".repeat(128)).is_none(),
+            "128 characters is not \"fewer than 128\""
+        );
     }
 
     /// RFC 8489 §6.3 has a receiver check "that the message length is sensible"
@@ -710,6 +740,42 @@ mod tests {
             binding_success(&overstated, client, "Chromium").is_none(),
             "a length field larger than the datagram must be discarded"
         );
+    }
+
+    /// STUN lengths are 32-bit aligned (RFC 8489 §5: "the last 2 bits of this
+    /// field are always zero"). `detect` enforced that and `binding_success` did
+    /// not, so a misaligned request was answered by the half that emits bytes
+    /// and dropped by the half that decides whether to look. Both now go through
+    /// `binding_request_len`, so this asserts they agree rather than asserting
+    /// each separately.
+    #[test]
+    fn a_misaligned_length_is_rejected_by_both_halves() {
+        use crate::noise::imitation::detect::{detect, Probe};
+
+        let mut m = vec![0u8; HEADER_LEN + 6];
+        m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        m[2..4].copy_from_slice(&6u16.to_be_bytes()); // 6 is not a multiple of 4
+        m[4..8].copy_from_slice(&MAGIC_COOKIE);
+
+        assert!(
+            binding_request_len(&m).is_none(),
+            "a length that is not 32-bit aligned is malformed"
+        );
+        let client: SocketAddr = "192.0.2.4:1".parse().unwrap();
+        assert!(
+            binding_success(&m, client, "x").is_none(),
+            "responder refuses"
+        );
+        assert_ne!(detect(&m), Some(Probe::Stun), "classifier refuses");
+
+        // The same datagram with an aligned length is accepted by both.
+        let mut ok = vec![0u8; HEADER_LEN + 8];
+        ok[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        ok[2..4].copy_from_slice(&8u16.to_be_bytes());
+        ok[4..8].copy_from_slice(&MAGIC_COOKIE);
+        assert!(binding_request_len(&ok).is_some());
+        assert_eq!(detect(&ok), Some(Probe::Stun));
+        assert!(binding_success(&ok, client, "x").is_some());
     }
 
     #[test]
