@@ -34,7 +34,15 @@
 
 // Edition 2018: `TryFrom` is not in the prelude (it arrived in 2021).
 use std::convert::TryFrom;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+// `portable_atomic`, not `std`, and specifically for the 64-bit width:
+// `AtomicU64` does not exist on targets without native 64-bit atomics, which
+// includes 32-bit ARM. The crate already depends on portable-atomic with the
+// `fallback` feature for exactly this, and every other `AtomicU64` here --
+// `noise::session` and `noise::rate_limiter` -- takes it from there. The
+// `AtomicBool`/`AtomicUsize` in `device::mod` stay on `std` because those
+// widths are available everywhere.
+use portable_atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
