@@ -172,33 +172,72 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
 }
 
 // The response side has no caller yet -- the ingress hook that will reach it
-// is the next commit. Scoped to these four items rather than the module, so
-// the request side stays covered by the lint.
+// is the next commit. Scoped to these items rather than the module, so the
+// request side stays covered by the lint.
+
+/// What `msg` carries in place of a FINGERPRINT attribute.
 #[allow(dead_code)]
-/// Walk `msg`'s attributes and report whether a FINGERPRINT (0x8028) is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fingerprint {
+    /// No FINGERPRINT attribute. Nothing to echo, nothing to check.
+    Absent,
+    /// Present, last, four bytes, and the CRC matches.
+    Valid,
+    /// Present but malformed or wrong. RFC 5389 §15.5: an agent receiving a
+    /// message whose FINGERPRINT is incorrect MUST discard it.
+    Invalid,
+}
+
+/// Classify `msg`'s FINGERPRINT attribute.
+///
+/// Presence alone is not enough. A real STUN stack validates the CRC and drops
+/// the message when it fails, so a responder that answers a deliberately
+/// corrupted FINGERPRINT is distinguishable from a real server in one packet --
+/// which is the whole thing this is trying not to be.
 ///
 /// Parsing attacker-controlled bytes, so every step is bounds-checked and a
-/// malformed attribute ends the walk rather than being skipped over: a length
-/// that overruns the buffer is not a reason to keep guessing at offsets.
-fn has_fingerprint(msg: &[u8]) -> bool {
+/// length that overruns the buffer ends the walk: a bad length is not a reason
+/// to keep guessing at offsets.
+#[allow(dead_code)]
+fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     let mut off = HEADER_LEN;
     while off + 4 <= msg.len() {
         let attr_type = u16::from_be_bytes([msg[off], msg[off + 1]]);
         let attr_len = u16::from_be_bytes([msg[off + 2], msg[off + 3]]) as usize;
+
         if attr_type == 0x8028 {
-            return true;
+            // RFC 5389 §15.5: four bytes, and the last attribute in the
+            // message. Anything else is malformed rather than merely unusual.
+            if attr_len != 4 || off + FP_ATTR_LEN != msg.len() {
+                return Fingerprint::Invalid;
+            }
+            let expected = crc32_ieee(&msg[..off]) ^ 0x5354_554e;
+            let got = u32::from_be_bytes([msg[off + 4], msg[off + 5], msg[off + 6], msg[off + 7]]);
+            return if got == expected {
+                Fingerprint::Valid
+            } else {
+                Fingerprint::Invalid
+            };
         }
+
         let advance = match padded(attr_len).checked_add(4) {
             Some(a) => a,
-            None => return false,
+            None => return Fingerprint::Absent,
         };
         off = match off.checked_add(advance) {
             Some(o) if o <= msg.len() => o,
-            _ => return false,
+            _ => return Fingerprint::Absent,
         };
     }
-    false
+    Fingerprint::Absent
 }
+
+/// RFC 5389 §15.10: a SOFTWARE value is under 128 characters, which is at most
+/// 763 bytes once encoded. Bounding it keeps `software.len() as u16` and the
+/// message-length cast lossless by construction rather than by assumption --
+/// the same failure this branch already hit once, where a documented limit was
+/// never enforced.
+const MAX_SOFTWARE_LEN: usize = 763;
 
 #[allow(dead_code)]
 /// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
@@ -254,8 +293,10 @@ fn xor_mapped_len(client: SocketAddr) -> usize {
 /// server that demanded one would refuse every unauthenticated check, which no
 /// public STUN server does.
 ///
-/// FINGERPRINT is echoed when the request carries one, because RFC 5389 §15.5
-/// requires it and its absence is a one-attribute tell.
+/// FINGERPRINT is echoed when the request carries a *valid* one, because RFC
+/// 5389 §15.5 requires it and its absence is a one-attribute tell. A request
+/// whose FINGERPRINT is present but wrong gets no answer at all: a real stack
+/// discards such a message, so replying would distinguish us in one packet.
 ///
 /// **Size**: 20-byte header + 12 (IPv4) or 24 (IPv6) + SOFTWARE + 8 if
 /// FINGERPRINT. Against a minimal 20-byte Binding Request that is larger than
@@ -280,13 +321,28 @@ pub(crate) fn binding_success(
     let mut trans_id = [0u8; 12];
     trans_id.copy_from_slice(&request[8..20]);
 
-    let echo_fingerprint = has_fingerprint(request);
+    // A wrong FINGERPRINT means a real server would have discarded this, so
+    // answering it is a distinguisher. Silence is the correct imitation.
+    let echo_fingerprint = match check_fingerprint(request) {
+        Fingerprint::Absent => false,
+        Fingerprint::Valid => true,
+        Fingerprint::Invalid => return None,
+    };
+
+    // Keeps every `as u16` below lossless. A truncated SOFTWARE length would
+    // frame the attribute wrongly and the whole message with it.
+    if software.len() > MAX_SOFTWARE_LEN {
+        return None;
+    }
     let software_padded = padded(software.len());
     let attrs_len = xor_mapped_len(client)
         + (4 + software_padded)
         + if echo_fingerprint { FP_ATTR_LEN } else { 0 };
 
     // Zero-initialised: attribute padding bytes must be zero for the CRC.
+    // `attrs_len` is bounded by MAX_SOFTWARE_LEN plus two fixed attributes, so
+    // it fits u16 by construction -- asserted rather than assumed.
+    debug_assert!(attrs_len <= u16::MAX as usize);
     let mut pkt = vec![0u8; HEADER_LEN + attrs_len];
     pkt[0..2].copy_from_slice(&0x0101u16.to_be_bytes()); // Binding Success
     pkt[2..4].copy_from_slice(&(attrs_len as u16).to_be_bytes());
@@ -532,6 +588,56 @@ mod tests {
         assert!(!types.contains(&0x8028), "no FINGERPRINT was requested");
     }
 
+    /// A real STUN stack validates FINGERPRINT and discards the message when it
+    /// fails (RFC 5389 §15.5). Answering a deliberately corrupted one would
+    /// distinguish us from a real server in a single packet, which is precisely
+    /// what a prober is looking for.
+    #[test]
+    fn a_corrupt_fingerprint_gets_no_answer() {
+        let mut rng = ChaCha8Rng::seed_from_u64(21);
+        let request = generate(&mut rng)[0].clone();
+        let client: SocketAddr = "203.0.113.5:443".parse().unwrap();
+
+        // Intact: answered, and the request-side FP really is valid.
+        assert_eq!(check_fingerprint(&request), Fingerprint::Valid);
+        assert!(binding_success(&request, client, "Chromium").is_some());
+
+        // One bit flipped in the CRC: a real server drops it, so must we.
+        let mut corrupt = request.clone();
+        let n = corrupt.len();
+        corrupt[n - 1] ^= 0x01;
+        assert_eq!(check_fingerprint(&corrupt), Fingerprint::Invalid);
+        assert!(
+            binding_success(&corrupt, client, "Chromium").is_none(),
+            "a wrong FINGERPRINT must produce silence, not a reply"
+        );
+
+        // Present but not last: also malformed per §15.5.
+        let mut trailing = request.clone();
+        trailing.extend_from_slice(&[0u8; 4]);
+        assert_eq!(check_fingerprint(&trailing), Fingerprint::Invalid);
+        assert!(binding_success(&trailing, client, "Chromium").is_none());
+    }
+
+    /// `software.len()` and the message length are cast to `u16`. An oversized
+    /// value would truncate and frame the packet wrongly, so it is refused --
+    /// the same shape as the budget rate that was documented but unenforced.
+    #[test]
+    fn an_oversized_software_value_is_refused() {
+        let mut rng = ChaCha8Rng::seed_from_u64(22);
+        let request = &generate(&mut rng)[0];
+        let client: SocketAddr = "192.0.2.8:1".parse().unwrap();
+
+        let at_limit = "s".repeat(MAX_SOFTWARE_LEN);
+        assert!(binding_success(request, client, &at_limit).is_some());
+
+        let over = "s".repeat(MAX_SOFTWARE_LEN + 1);
+        assert!(
+            binding_success(request, client, &over).is_none(),
+            "an oversized SOFTWARE must be refused, not silently truncated"
+        );
+    }
+
     #[test]
     fn refuses_what_is_not_a_binding_request() {
         let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
@@ -551,8 +657,9 @@ mod tests {
         assert!(binding_success(&no_cookie, client, "x").is_none());
     }
 
-    /// `has_fingerprint` walks attacker-controlled bytes; a length that overruns
-    /// the buffer must end the walk rather than wrap or index out of bounds.
+    /// `check_fingerprint` walks attacker-controlled bytes; a length that
+    /// overruns the buffer must end the walk rather than wrap or index out of
+    /// bounds.
     #[test]
     fn attribute_walk_survives_malformed_lengths() {
         let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
