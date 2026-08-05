@@ -270,8 +270,11 @@ start_server() {  # $1 = config file
       PRE_KEY_THREADS_BEFORE=$(ls "/proc/$PRE_KEY_PID/task" | wc -l)
       # utime+stime in clock ticks, fields 14 and 15 of /proc/<pid>/stat.
       # Read from after the last ')' so a comm containing spaces or parens
-      # cannot shift the field offsets.
-      PRE_KEY_CPU_BEFORE=$(awk -F')' '{split($NF,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
+      # cannot shift the field offsets, and strip the leading blank explicitly.
+      # POSIX makes a single-blank separator mean "split on runs of blanks,
+      # ignoring leading ones" -- verified against gawk and mawk -- so the sub()
+      # is redundant, but it states the intent without relying on that rule.
+      PRE_KEY_CPU_BEFORE=$(awk -F')' '{s=$NF; sub(/^[[:blank:]]+/,"",s); split(s,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
       # Anything at all: with no key configured the daemon cannot classify it,
       # which is the point.
       # bash's /dev/udp rather than socat or nc: no new preflight dependency,
@@ -279,7 +282,7 @@ start_server() {  # $1 = config file
       ip netns exec "$NS_SRV" timeout 2 bash -c         "printf 'x' > /dev/udp/127.0.0.1/$PRE_KEY_PORT" >/dev/null 2>&1
       sleep 1
       PRE_KEY_THREADS_AFTER=$(ls "/proc/$PRE_KEY_PID/task" | wc -l)
-      PRE_KEY_CPU_AFTER=$(awk -F')' '{split($NF,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
+      PRE_KEY_CPU_AFTER=$(awk -F')' '{s=$NF; sub(/^[[:blank:]]+/,"",s); split(s,f," "); print f[12]+f[13]}' "/proc/$PRE_KEY_PID/stat")
     else
       PRE_KEY_THREADS_BEFORE=skip
       PRE_KEY_THREADS_AFTER=skip

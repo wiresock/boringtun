@@ -30,7 +30,7 @@ use std::io::{self, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -836,6 +836,13 @@ impl Device {
     }
 
     fn register_udp_handler(&self, udp: socket2::Socket) -> Result<(), Error> {
+        // Logged at most once per socket. The keyless path is re-dispatched
+        // for every batch of arriving datagrams, and a daemon that is never
+        // given a key stays on it indefinitely, so logging per dispatch would
+        // turn one misconfiguration into unbounded log volume. Once carries
+        // the whole signal: the operator needs to know traffic arrived before
+        // the key, not how much of it did.
+        let warned_keyless = AtomicBool::new(false);
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -861,7 +868,9 @@ impl Device {
                 let (private_key, public_key) = match d.key_pair.as_ref() {
                     Some(pair) => pair,
                     None => {
-                        tracing::debug!("dropping datagrams: no private key set yet");
+                        if !warned_keyless.swap(true, Ordering::Relaxed) {
+                            tracing::debug!("dropping datagrams: no private key set yet");
+                        }
                         drain_datagrams(&udp, &mut t.src_buf);
                         return Action::Continue;
                     }
@@ -869,7 +878,9 @@ impl Device {
                 let rate_limiter = match d.rate_limiter.as_ref() {
                     Some(limiter) => limiter,
                     None => {
-                        tracing::debug!("dropping datagrams: no rate limiter yet");
+                        if !warned_keyless.swap(true, Ordering::Relaxed) {
+                            tracing::debug!("dropping datagrams: no rate limiter yet");
+                        }
                         drain_datagrams(&udp, &mut t.src_buf);
                         return Action::Continue;
                     }
