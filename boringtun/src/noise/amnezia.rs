@@ -38,8 +38,13 @@ const SIP_JUNK_SIZE_MIN: usize = 200;
 const SIP_JUNK_SIZE_MAX: usize = 1200;
 const STUN_JUNK_SIZE_MIN: usize = 28;
 const STUN_JUNK_SIZE_MAX: usize = 100;
-/// RFC 5389 STUN magic cookie, present at bytes 4..8 of every STUN message.
-/// Re-exported rather than restated -- see [`imitation::stun::MAGIC_COOKIE`].
+// RFC 5389 STUN magic cookie, present at bytes 4..8 of every STUN message.
+// Imported rather than restated: `crate::noise::imitation::stun::MAGIC_COOKIE`
+// is the crate's single definition. A private alias, not a re-export -- that
+// would be `pub use` and would put the constant in this module's public API.
+//
+// A line comment, not a doc comment: rustdoc does not process docs on a
+// private `use`, so a `///` here documents nothing and cannot be checked.
 use crate::noise::imitation::stun::MAGIC_COOKIE as STUN_MAGIC_COOKIE;
 
 #[repr(u8)]
