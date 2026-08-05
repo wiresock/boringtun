@@ -51,9 +51,19 @@ use mock_instant::Instant;
 use crate::sleepyinstant::Instant;
 
 /// Fixed-point scale for the token count, so sub-byte refill increments are not
-/// rounded away. A 32-bit token field at this scale tops out around 4.2 MB/s of
-/// allowance, far above anything camouflage needs.
+/// rounded away.
 const MILLI: u64 = 1000;
+
+/// The largest rate the packed 32-bit token field can represent.
+///
+/// Above this, a full second of refill exceeds `u32::MAX` millibytes and the
+/// balance truncates on store -- 10 MB/s would silently behave as roughly
+/// 1.4 MB/s, which is worse than refusing the value because the operator gets
+/// a number they never chose. [`ProbeBudget::new`] clamps to it.
+///
+/// ~4.29 MB/s, which is three orders of magnitude above anything camouflage
+/// needs; the clamp exists for correctness, not as a policy.
+const MAX_BYTES_PER_SEC: u32 = (u32::MAX as u64 / MILLI) as u32;
 
 pub(crate) struct ProbeBudget {
     /// Packed: high 32 bits = millibytes available, low 32 = milliseconds since
@@ -76,8 +86,11 @@ fn unpack(v: u64) -> (u32, u32) {
 
 impl ProbeBudget {
     pub(crate) fn new(bytes_per_sec: u32) -> Self {
+        // Clamp here rather than at the use sites: with this held, `cap` fits
+        // u32 by construction and every later `as u32` is lossless.
+        let bytes_per_sec = bytes_per_sec.min(MAX_BYTES_PER_SEC);
         Self {
-            state: AtomicU64::new(pack(bytes_per_sec.saturating_mul(MILLI as u32), 0)),
+            state: AtomicU64::new(pack((bytes_per_sec as u64 * MILLI) as u32, 0)),
             start: Instant::now(),
             bytes_per_sec,
         }
@@ -192,6 +205,42 @@ mod tests {
         assert!(!b.try_consume_at(101, 0));
         // And the allowance is intact for replies that do fit.
         assert!(b.try_consume_at(100, 0));
+    }
+
+    /// A rate the packed 32-bit token field cannot represent must not silently
+    /// become an unrelated smaller one.
+    ///
+    /// `cap` is computed in u64 but stored through a u32 cast, so an unclamped
+    /// rate above ~4.29 MB/s truncates on refill: 10 MB/s would wrap to about
+    /// 1.4 MB/s, and the operator gets a number they never asked for. The
+    /// constructor clamps instead, so an out-of-range rate behaves exactly as
+    /// the maximum representable one.
+    #[test]
+    fn a_rate_beyond_the_packing_limit_is_clamped_not_truncated() {
+        let drain_then_measure = |rate: u32| -> u64 {
+            let b = ProbeBudget::new(rate);
+            while b.try_consume_at(1_000, 0) {}
+            let mut got = 0u64;
+            // One second later a full second's allowance must be available.
+            while b.try_consume_at(1_000, 1_000) {
+                got += 1_000;
+            }
+            got
+        };
+
+        let clamped = drain_then_measure(MAX_BYTES_PER_SEC);
+        let over = drain_then_measure(10_000_000);
+
+        assert!(
+            clamped >= MAX_BYTES_PER_SEC as u64 - 1_000,
+            "a second of refill at the maximum rate should yield ~{} bytes, got {}",
+            MAX_BYTES_PER_SEC,
+            clamped
+        );
+        assert_eq!(
+            over, clamped,
+            "an over-range rate must behave as the clamped maximum, not wrap to something smaller"
+        );
     }
 
     #[test]
