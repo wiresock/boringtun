@@ -5,16 +5,23 @@
 //!
 //! The sibling modules in [`super`] generate protocol-shaped cover traffic; this
 //! one recognises it arriving. The two halves are deliberately adjacent, because
-//! the property that matters is a relationship between them and is asserted by
-//! the invariant table in [`crate::noise::amnezia`]'s tests: **every datagram
-//! this crate emits under `ip=<proto>` is detected as `<proto>`**.
+//! what matters is the relationship between them, and that is pinned by the
+//! invariant table in [`crate::noise::amnezia`]'s tests. Three findings, none
+//! of them assumed — the table was printed first and locked in afterwards:
 //!
-//! That relationship is why a server must classify AmneziaWG *first* and only
-//! then consider probe detection. Our own `fill_dns` output is a complete,
-//! well-formed DNS query by construction — it frames the WireGuard ciphertext
-//! inside an EDNS OPT padding option — so it satisfies [`is_plausible_dns_query`]
-//! with probability 1. A server that asked "is this a probe?" before "is this
-//! one of my peers?" would answer its own clients' cover traffic instead of
+//! - A datagram is **never** detected as a protocol other than the one
+//!   configured, and random junk (`ip=none`) is never detected at all.
+//! - Under `ip=dns` or `ip=sip`, at the S sizes an installer actually
+//!   generates, our cover traffic **is** a valid probe.
+//! - Under `ip=quic` or `ip=stun` it never is, for structural reasons the
+//!   table documents.
+//!
+//! The second finding is why a server must classify AmneziaWG *first* and only
+//! then consider probe detection. `fill_dns` output is a complete, well-formed
+//! DNS query by construction — it frames the WireGuard ciphertext inside an
+//! EDNS OPT padding option — so it satisfies [`is_plausible_dns_query`] with
+//! probability 1. A server that asked "is this a probe?" before "is this one of
+//! my peers?" would answer its own clients' cover traffic instead of
 //! handshaking with them, and would do so *more* often the better the imitation
 //! got.
 //!

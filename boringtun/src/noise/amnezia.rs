@@ -1348,6 +1348,22 @@ mod tests {
                     let junk = expected_junk(&cfg, tag);
                     let verdict = detect(&padded);
 
+                    // Checked before the generic cross-protocol assertion
+                    // below, which would otherwise fire first here and report
+                    // "cover traffic for None detected as Dns" -- true, but a
+                    // worse description of the failure than this one. Random
+                    // junk resembling any probe means the detector is too
+                    // loose, and that is what a reader needs told.
+                    if protocol == None {
+                        assert!(
+                            verdict.is_none(),
+                            "random junk was detected as {:?} (junk={}, tag={})",
+                            verdict,
+                            junk,
+                            tag
+                        );
+                    }
+
                     // (1) never a *different* protocol.
                     if let Some(p) = verdict {
                         assert!(
@@ -1367,19 +1383,6 @@ mod tests {
                             verdict.is_none(),
                             "{:?} imitation became self-detecting (junk={}, tag={}); see this test's doc comment before changing it",
                             protocol,
-                            junk,
-                            tag
-                        );
-                    }
-
-                    // (1) again, for the unimitated case: random junk must not
-                    // resemble anything. `fill_random` output passing a probe
-                    // test would mean the detector is too loose.
-                    if protocol == None {
-                        assert!(
-                            verdict.is_none(),
-                            "random junk was detected as {:?} (junk={}, tag={})",
-                            verdict,
                             junk,
                             tag
                         );
