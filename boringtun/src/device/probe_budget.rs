@@ -83,6 +83,16 @@ impl ProbeBudget {
     pub(crate) fn new(bytes_per_sec: u32) -> Self {
         // Clamp here rather than at the use sites: with this held, `cap` fits
         // u32 by construction and every later `as u32` is lossless.
+        if bytes_per_sec > MAX_BYTES_PER_SEC {
+            // The module doc argues the clamp beats truncation because the
+            // operator would otherwise "get a number they never chose". They
+            // still get one -- just a different one -- so say so.
+            tracing::warn!(
+                message = "probe reply rate clamped",
+                requested = bytes_per_sec,
+                using = MAX_BYTES_PER_SEC
+            );
+        }
         let bytes_per_sec = bytes_per_sec.min(MAX_BYTES_PER_SEC);
         Self {
             state: AtomicU64::new(pack((bytes_per_sec as u64 * MILLI) as u32, 0)),
@@ -101,11 +111,34 @@ impl ProbeBudget {
     /// leaves a window in which an unbounded burst is admitted between the
     /// check and the accounting.
     pub(crate) fn try_consume(&self, bytes: usize) -> bool {
-        self.try_consume_at(bytes, self.now_millis())
+        // The clock is read *inside* the retry loop, not snapshotted here.
+        //
+        // One budget is shared by every worker (`Device::probe_budget`), so a
+        // thread that read the clock at millisecond 99 can find millisecond 100
+        // already stored by a thread that read it later. With a snapshot taken
+        // once up front, that thread sees `now < old_ts` on every retry and
+        // takes the wrap branch below -- which grants a *full* refill. That is
+        // not the rare 49-day event the branch was written for; it is ordinary
+        // contention under exactly the flood this ceiling exists to bound.
+        //
+        // Reading after the state load makes it impossible: whatever `old_ts`
+        // we observe was stored by a thread whose own read happened before our
+        // load, so a monotonic clock cannot hand us anything smaller.
+        self.consume(bytes, || self.now_millis())
     }
 
     /// Same, with an injectable clock so tests need no real sleeps.
+    ///
+    /// `#[cfg(test)]`: production always uses the real clock, and the whole
+    /// point of `try_consume` is *where* it reads that clock.
+    #[cfg(test)]
     pub(crate) fn try_consume_at(&self, bytes: usize, now: u32) -> bool {
+        self.consume(bytes, || now)
+    }
+
+    /// `clock` is called once per attempt, after the state load. See
+    /// [`Self::try_consume`] for why that ordering is load-bearing.
+    fn consume(&self, bytes: usize, clock: impl Fn() -> u32) -> bool {
         let cap = (self.bytes_per_sec as u64).saturating_mul(MILLI);
         // A single reply larger than the whole per-second allowance can never
         // be admitted; refuse rather than spin.
@@ -117,15 +150,20 @@ impl ProbeBudget {
         loop {
             let old = self.state.load(Ordering::Acquire);
             let (old_tokens, old_ts) = unpack(old);
+            let now = clock();
 
-            // `now < old_ts` means the millisecond counter wrapped (~49 days) or
-            // the clock moved oddly. Treat it as a full refill and re-anchor:
-            // self-healing, and at worst it grants one extra second's worth.
-            let elapsed = if now >= old_ts {
-                now - old_ts
-            } else {
-                u32::MAX
-            };
+            // `now < old_ts` means the millisecond counter wrapped (~49 days),
+            // the clock moved oddly, or two workers interleaved their reads.
+            // Grant *no* refill and re-anchor on `now`, rather than treating it
+            // as a full second's worth.
+            //
+            // The earlier `u32::MAX` here was a ceiling bypass: it saturated the
+            // bucket back to `cap`, so any thread whose clock read landed behind
+            // another's stored timestamp handed itself a full allowance. Costing
+            // one refill-less call instead is strictly safer -- the store below
+            // re-anchors immediately, so the stall lasts exactly one call, and
+            // an attacker gains nothing from provoking it.
+            let elapsed = now.saturating_sub(old_ts);
             let refill = (elapsed as u64).saturating_mul(self.bytes_per_sec as u64);
             let available = ((old_tokens as u64).saturating_add(refill)).min(cap);
 
@@ -238,15 +276,121 @@ mod tests {
         );
     }
 
+    /// The wrap must re-anchor rather than stall forever — but it must not pay
+    /// for the recovery with a free bucket.
+    ///
+    /// The previous version of this test asserted the call immediately after the
+    /// wrap *succeeds*, which pinned the full-refill branch as correct. That
+    /// branch was reachable by ordinary worker contention, not just once every
+    /// 49 days, and it was a ceiling bypass. See
+    /// [`a_lagging_clock_read_cannot_refill_the_bucket`].
     #[test]
-    fn survives_the_millisecond_counter_wrapping() {
+    fn the_millisecond_wrap_re_anchors_without_granting_a_free_refill() {
         let b = ProbeBudget::new(1000);
         assert!(b.try_consume_at(1000, u32::MAX - 10));
-        // Wrap: `now` is now less than the stored timestamp. Must recover
-        // rather than stall forever with zero elapsed time.
+
+        // Wrap: `now` is below the stored timestamp. No refill is owed — no
+        // time has demonstrably passed — so this is refused.
         assert!(
-            b.try_consume_at(1000, 5),
-            "wrap must not deadlock the budget"
+            !b.try_consume_at(1000, 5),
+            "a wrap must not hand out a second's allowance"
+        );
+        // But it re-anchored on the new clock, so the next real second works.
+        // Recovery costs exactly one call, not a deadlock.
+        assert!(
+            b.try_consume_at(1000, 1005),
+            "after re-anchoring, a full second of elapsed time must refill"
+        );
+    }
+
+    /// The ceiling bypass this module exists to prevent, in the form it actually
+    /// occurs: several workers sharing one budget, whose clock reads interleave.
+    ///
+    /// Worker A reads millisecond 99 and worker B reads 100. If A's stale read
+    /// is compared against B's stored timestamp, A sees `now < old_ts` and — in
+    /// the original code — took the wrap branch, saturating the bucket back to
+    /// `cap`. Alternating like that admitted 50x the configured rate inside a
+    /// single millisecond.
+    ///
+    /// `try_consume_at` is the single-threaded stand-in for that interleaving:
+    /// it feeds exactly the sequence of `now` values two racing workers produce,
+    /// which is deterministic where spawning threads would not be.
+    #[test]
+    fn a_lagging_clock_read_cannot_refill_the_bucket() {
+        let b = ProbeBudget::new(1000);
+
+        // Spend the whole allowance at t=100.
+        assert!(b.try_consume_at(1000, 100));
+        assert!(!b.try_consume_at(1, 100), "the allowance is spent");
+
+        // Now the lagging worker arrives with its earlier reading, 50 times.
+        let mut admitted = 0;
+        for _ in 0..50 {
+            if b.try_consume_at(1000, 99) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 0,
+            "a clock read behind the stored timestamp must not refill; \
+             {admitted} of 50 lagging calls were admitted"
+        );
+    }
+
+    /// The same property against the real clock, through the public entry point,
+    /// with every worker charging one shared budget the way `Device` does.
+    ///
+    /// Deliberately not a deterministic test — it is the one that would have
+    /// caught the bug without anyone first suspecting it. It cannot produce a
+    /// false failure: the assertion is a ceiling, and the ceiling is generous.
+    #[test]
+    fn concurrent_workers_cannot_exceed_the_ceiling() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use std::sync::Arc;
+
+        const RATE: u32 = 1000;
+        const WORKERS: usize = 4;
+        const PER_WORKER: usize = 20_000;
+
+        let budget = Arc::new(ProbeBudget::new(RATE));
+        let admitted = Arc::new(AtomicUsize::new(0));
+
+        let start = Instant::now();
+        let threads: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let budget = Arc::clone(&budget);
+                let admitted = Arc::clone(&admitted);
+                std::thread::spawn(move || {
+                    for _ in 0..PER_WORKER {
+                        if budget.try_consume(10) {
+                            admitted.fetch_add(10, O::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        // One second's worth to start, plus the refill actually earned, plus a
+        // whole extra second of slack so timing jitter can never fail this.
+        let ceiling = RATE as u64 * 2 + (elapsed_ms * RATE as u64) / 1000;
+        let got = admitted.load(O::Relaxed) as u64;
+        // Explicit arguments, not inline captures: in edition 2018 a
+        // two-argument `assert!` is the legacy panic form and prints `{got}`
+        // verbatim instead of interpolating. `assert_eq!` routes through
+        // `format_args!` and does not have this problem, which is why only the
+        // `assert!` sites need it.
+        assert!(
+            got <= ceiling,
+            "{} workers admitted {} bytes in {} ms against a {} B/s ceiling              (bound {}); the budget is not aggregate",
+            WORKERS,
+            got,
+            elapsed_ms,
+            RATE,
+            ceiling
         );
     }
 }

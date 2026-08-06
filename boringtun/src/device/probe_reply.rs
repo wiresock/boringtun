@@ -13,10 +13,15 @@
 //! that is, after the datagram has failed to be AmneziaWG. The reverse order
 //! answers our own clients: the invariant table in [`crate::noise::amnezia`]
 //! shows that under `ip=dns` or `ip=sip`, at the S sizes an installer
-//! generates, our cover traffic *is* a valid probe. A server that asked "is
-//! this a probe?" first would reply to its own peers' pre-handshake junk
-//! instead of handshaking with them, and would do so more often the better the
-//! imitation became.
+//! generates, our cover traffic *is* a valid probe.
+//!
+//! Under `ip=dns` that is immediately fatal — a probe-first server SERVFAILs
+//! its own peers' handshake initiations. Under `ip=sip` it would be, except
+//! that [`reply_to`] has no SIP responder, so the datagram is merely dropped
+//! rather than answered; a probe-first server would still lose the handshake,
+//! just more quietly. Either way the failure gets *more* reliable the better
+//! the imitation becomes, which is why the order lives in one tested function
+//! and not in the event loop.
 //!
 //! # One protocol, not four
 //!
@@ -27,7 +32,7 @@
 //!
 //! [`AmneziaConfig::strip_inbound`]: crate::noise::amnezia::AmneziaConfig
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 use rand_core::RngCore;
 
@@ -40,20 +45,55 @@ use crate::noise::quic::version_negotiation;
 
 /// A reply larger than this is refused outright.
 ///
-/// Not a substitute for [`ProbeBudget`], which is the amplification control.
-/// This is a backstop against a generator changing shape unnoticed: every
-/// current reply is well under it (a STUN Binding Success with a long SOFTWARE
-/// tops out near 200 bytes, a DNS SERVFAIL never exceeds its query, and a
-/// Version Negotiation is under 60), so tripping it means something has changed
-/// that should have been noticed.
+/// Not the amplification control — [`ProbeBudget`] is that, and each generator
+/// carries its own bound, asserted where it is derived rather than restated
+/// here as a number that would go stale: a DNS SERVFAIL is never larger than
+/// its query, a STUN Binding Success is capped by `stun::MAX_SOFTWARE_LEN`, and
+/// a Version Negotiation by [`version_negotiation::MAX_LEN`] (525 bytes, and
+/// pinned there against `MIN_INITIAL_DATAGRAM`).
+///
+/// This is the backstop for a generator changing shape unnoticed. It must stay
+/// **below** `MIN_INITIAL_DATAGRAM` (1200): the QUIC responder only answers
+/// datagrams of at least that size, so a ceiling under it is what keeps a reply
+/// from ever exceeding the smallest request able to elicit one. Raising this to
+/// buy a test some margin would give that away.
 const MAX_REPLY_LEN: usize = 1024;
 
-/// The SOFTWARE value advertised in a STUN Binding Success.
+// Both relationships are between constants, so they are enforced by the
+// compiler rather than by a test that someone could delete. The second is the
+// one that carries the security meaning: a reply can never be larger than the
+// smallest datagram able to elicit one.
+const _: () = assert!(version_negotiation::MAX_LEN < MAX_REPLY_LEN);
+const _: () = assert!(MAX_REPLY_LEN < version_negotiation::MIN_INITIAL_DATAGRAM);
+
+/// Device-scoped state for answering probes.
 ///
-/// Deliberately a generic stack rather than anything identifying: the value is
-/// visible to whoever probed us, so a product-specific string would be its own
-/// fingerprint.
-const STUN_SOFTWARE: &str = "Chromium";
+/// Exists so the reply path takes one parameter instead of three, and so the
+/// SOFTWARE value below can be chosen once per device rather than per reply.
+pub(crate) struct ProbeResponder {
+    budget: ProbeBudget,
+    /// The SOFTWARE advertised in a STUN Binding Success.
+    ///
+    /// Drawn from `stun::SOFTWARE_POOL` — the same curated list the outbound
+    /// Binding Requests use — rather than restated here. A second literal was
+    /// both a duplicate and a mismatch: a device configured `ip=stun` would send
+    /// checks announcing one of five stacks and answer as a hardcoded sixth.
+    ///
+    /// Chosen **once per device**, not per reply. Under `ip=stun` this port is
+    /// an ICE agent, not a STUN server — ICE peers send Binding Requests to each
+    /// other and answer with Binding Success — and a single agent has one
+    /// SOFTWARE. Re-rolling it per reply would be the anomaly.
+    software: &'static str,
+}
+
+impl ProbeResponder {
+    pub(crate) fn new(bytes_per_sec: u32, rng: &mut impl RngCore) -> Self {
+        Self {
+            budget: ProbeBudget::new(bytes_per_sec),
+            software: stun::pick_software(rng),
+        }
+    }
+}
 
 /// Rewrite an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as the IPv4 address
 /// it denotes.
@@ -69,16 +109,14 @@ const STUN_SOFTWARE: &str = "Chromium";
 ///   16-byte address to a client that reached us over IPv4. Real servers report
 ///   the family they saw, so the mapped form is its own fingerprint.
 ///
-/// `Ipv6Addr::to_ipv4` also unwraps the deprecated IPv4-*compatible* form
-/// (`::a.b.c.d`), which is not what arrives from a dual-stack socket; only the
-/// mapped prefix is matched here.
+/// `Ipv6Addr::to_ipv4_mapped`, not `to_ipv4`: the latter also unwraps the
+/// deprecated IPv4-*compatible* form (`::a.b.c.d`), which a dual-stack socket
+/// never produces and which should keep failing the v6 rules below.
 fn unmap(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
-        IpAddr::V6(v6) => match v6.octets() {
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a, b, c, d] => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), addr.port())
-            }
-            _ => addr,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+            None => addr,
         },
         IpAddr::V4(_) => addr,
     }
@@ -95,21 +133,48 @@ fn unmap(addr: SocketAddr) -> SocketAddr {
 ///   every host on the segment, a multiplier no byte-based ceiling models;
 /// - **link-local** — not routable, and reachable only by an on-segment host
 ///   that could have addressed us directly;
-/// - **port 0** — not a real source;
-/// - **our own listen port** — the reflection-loop case. Two servers pointed at
-///   each other must not trade replies indefinitely, and this is the cheap
-///   structural half of preventing it.
-fn may_reply_to(from: SocketAddr, listen_port: u16) -> bool {
-    if from.port() == 0 || from.port() == listen_port {
+/// - **`0.0.0.0/8` and `240.0.0.0/4`** — "this network" and reserved space; a
+///   reply to either dies at the first hop, so it is budget spent on nothing;
+/// - **port 0** — not a real source.
+///
+/// What it does **not** catch is a directed broadcast (`192.168.1.255`), which
+/// needs the local prefix to recognise. Linux refuses `sendto` to a
+/// locally-recognised broadcast address without `SO_BROADCAST`, which this
+/// socket does not set, and RFC 2644 has routers drop remote ones — so the
+/// defence there is the kernel's, not this function's. Said plainly because the
+/// list above otherwise reads as exhaustive.
+///
+/// There is deliberately **no check on the source port matching our own listen
+/// port**. It was here to stop two imitating servers trading replies, but that
+/// loop cannot form: no reply this crate generates is classifiable as a probe,
+/// so a reply arriving at a second server is simply dropped. That is asserted by
+/// [`tests::no_generated_reply_can_itself_be_detected_as_a_probe`], which holds
+/// for servers on *different* ports too — a source-port test never did.
+///
+/// What the check did buy was a fingerprint. A prober knows our listen port; it
+/// is the port it is dialling. Sending one probe from source port 51820 and one
+/// from 40000 got silence and a SERVFAIL — a one-packet discriminator that no
+/// real DNS, STUN or QUIC server exhibits, in a module whose entire purpose is
+/// not to be discriminable.
+fn may_reply_to(from: SocketAddr) -> bool {
+    if from.port() == 0 {
         return false;
     }
     match from.ip() {
         IpAddr::V4(v4) => {
+            // `is_unspecified` is only 0.0.0.0 exactly, and `is_broadcast` only
+            // 255.255.255.255, so 0.0.0.0/8 ("this network") and 240.0.0.0/4
+            // (reserved) are spelled out. Neither can be a real source; a reply
+            // to one is budget spent on a datagram that dies at the first hop.
+            let this_network = v4.octets()[0] == 0;
+            let reserved = v4.octets()[0] >= 240;
             !(v4.is_unspecified()
                 || v4.is_loopback()
                 || v4.is_multicast()
                 || v4.is_broadcast()
-                || v4.is_link_local())
+                || v4.is_link_local()
+                || this_network
+                || reserved)
         }
         IpAddr::V6(v6) => {
             // `is_unicast_link_local` is unstable, so the fe80::/10 test is
@@ -121,51 +186,47 @@ fn may_reply_to(from: SocketAddr, listen_port: u16) -> bool {
 }
 
 /// What ingress should do with a datagram that has not been authenticated.
+///
+/// Three flat variants rather than `Foreign(Option<Vec<u8>>)`: the two-level
+/// form made the caller destructure twice, and let a test assert on the payload
+/// (`Foreign(reply)` then `reply.is_none()`) where it should assert on the
+/// outcome. `Drop` is a distinct variant, so "answered" and "stayed silent"
+/// cannot be confused by a test that only looks one level deep.
 pub(crate) enum Ingress<'a> {
     /// AmneziaWG framing recognised. This is the payload to verify, with any
     /// S-prefix already removed.
     Wireguard(&'a [u8]),
-    /// Not ours. Send this back if it is `Some`, then drop the datagram.
-    Foreign(Option<Vec<u8>>),
+    /// Not ours, and worth answering. Send this, then drop the datagram.
+    Reply(Vec<u8>),
+    /// Not ours, and not worth answering. Drop it in silence — which is what a
+    /// bare WireGuard port does with everything.
+    Drop,
 }
 
 /// The whole per-datagram decision, in the one order that is correct.
 ///
-/// This exists as a function rather than as two calls in the event handler so
-/// the order is testable. It is not a stylistic preference: under `ip=dns` at
-/// installer S sizes, a conforming AmneziaWG initiation *is* a well-formed DNS
-/// query, and nothing in [`reply_to`] can tell it from a prober's. Ask "is this
-/// a probe?" first and the server answers its own clients' handshakes with
-/// SERVFAIL — and does so more reliably the better the imitation gets. The test
-/// below asserts both halves: that the collision is real, and that this
-/// function resolves it in favour of the tunnel.
+/// A function rather than two calls in the event handler so that the order is
+/// testable — see the module docs for why it is mandatory, and
+/// [`tests::a_conforming_initiation_is_tunnel_traffic_even_though_it_is_a_valid_dns_query`]
+/// for the test that pins it.
 ///
-/// `from` is an `Option` because that is what `socket2` yields; a datagram whose
-/// source address will not convert cannot be replied to, but can still be
-/// tunnel traffic.
+/// `responder` is `None` when probe replies are switched off, which is the
+/// default and the only state a vanilla WireGuard interface has.
 pub(crate) fn classify<'a>(
     datagram: &'a [u8],
     amnezia: &AmneziaConfig,
     obf: ObfuscationRanges,
-    from: Option<SocketAddr>,
-    listen_port: u16,
-    budget: Option<&ProbeBudget>,
+    from: SocketAddr,
+    responder: Option<&ProbeResponder>,
     rng: &mut impl RngCore,
 ) -> Ingress<'a> {
     if let Some(packet) = amnezia.strip_inbound(obf, datagram) {
         return Ingress::Wireguard(packet);
     }
-    let reply = budget.zip(from).and_then(|(budget, from)| {
-        reply_to(
-            datagram,
-            from,
-            listen_port,
-            amnezia.imitation.protocol,
-            budget,
-            rng,
-        )
-    });
-    Ingress::Foreign(reply)
+    match responder.and_then(|r| reply_to(datagram, from, amnezia.imitation.protocol, r, rng)) {
+        Some(reply) => Ingress::Reply(reply),
+        None => Ingress::Drop,
+    }
 }
 
 /// Build the reply to an unauthenticated `request`, or `None` to stay silent.
@@ -177,18 +238,30 @@ pub(crate) fn classify<'a>(
 /// has actually been built. Charging on the classifier's verdict instead would
 /// bill for replies never sent: a QUIC detection does not imply a QUIC reply,
 /// because `version_negotiation` refuses v1 and v2.
-pub(crate) fn reply_to(
+/// Private, not `pub(crate)`: [`classify`] is the only door. This function
+/// deliberately does *not* check whether the datagram was AmneziaWG first, so a
+/// crate-visible version would advertise the one entry point that bypasses the
+/// invariant the module exists to enforce.
+fn reply_to(
     request: &[u8],
     from: SocketAddr,
-    listen_port: u16,
     imitation: AmneziaImitationProtocol,
-    budget: &ProbeBudget,
+    responder: &ProbeResponder,
     rng: &mut impl RngCore,
 ) -> Option<Vec<u8>> {
+    // Cheapest test first, and the one that short-circuits the common case: a
+    // vanilla interface, or one imitating nothing, never runs the classifier at
+    // all. `detect` walks a DNS QNAME and eleven SIP prefixes, and it would run
+    // on every datagram that fails `strip_inbound` — for a verdict that
+    // `probe.is(imitation)` was always going to discard.
+    if imitation == AmneziaImitationProtocol::None {
+        return None;
+    }
+
     // Before the hygiene rules, not after: a dual-stack socket reports IPv4
     // sources in the mapped form, and the v6 rules cannot see through it.
     let from = unmap(from);
-    if !may_reply_to(from, listen_port) {
+    if !may_reply_to(from) {
         return None;
     }
 
@@ -200,7 +273,7 @@ pub(crate) fn reply_to(
 
     let reply = match probe {
         Probe::Dns => dns::servfail(request)?,
-        Probe::Stun => stun::binding_success(request, from, STUN_SOFTWARE)?,
+        Probe::Stun => stun::binding_success(request, from, responder.software)?,
         Probe::Quic => version_negotiation::version_negotiation(request, rng)?,
         // SIP has no responder. Its replies are stateful in a way a synthetic
         // cannot fake -- a real UAS absorbs INVITE retransmissions and answers
@@ -210,11 +283,20 @@ pub(crate) fn reply_to(
     };
 
     if reply.len() > MAX_REPLY_LEN {
+        // Logged, not silent. Every generator is bounded well under this and
+        // there is a test asserting so, which means reaching here is a change
+        // nobody noticed -- and the symptom would otherwise be a port that goes
+        // quiet for one protocol with nothing to explain it.
+        tracing::debug!(
+            message = "probe reply exceeds the size backstop; dropping",
+            len = reply.len(),
+            max = MAX_REPLY_LEN
+        );
         return None;
     }
     // Charged last, on the real length, and only for a reply we are about to
     // send. Charging earlier would let refused replies drain the ceiling.
-    if !budget.try_consume(reply.len()) {
+    if !responder.budget.try_consume(reply.len()) {
         return None;
     }
     Some(reply)
@@ -223,12 +305,22 @@ pub(crate) fn reply_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::noise::amnezia::conforming_initiation;
+    use crate::noise::quic::version_negotiation::{MAX_LEN as VN_MAX_LEN, MIN_INITIAL_DATAGRAM};
     use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
 
-    const PORT: u16 = 51820;
+    /// Large enough that no test hits the ceiling by accident; the tests that
+    /// mean to exercise it build their own.
+    fn responder() -> ProbeResponder {
+        ProbeResponder::new(1 << 20, &mut ChaCha8Rng::seed_from_u64(0))
+    }
 
-    fn budget() -> ProbeBudget {
-        ProbeBudget::new(1 << 20)
+    fn cfg(protocol: AmneziaImitationProtocol) -> AmneziaConfig {
+        AmneziaConfig::default().with_protocol_imitation(protocol, Some("example.com".to_owned()))
+    }
+
+    fn peer(addr: &str) -> SocketAddr {
+        addr.parse().unwrap()
     }
 
     fn dns_query() -> Vec<u8> {
@@ -236,8 +328,34 @@ mod tests {
         crate::noise::imitation::dns::generate("example.com", &mut rng).remove(0)
     }
 
-    fn peer(addr: &str) -> SocketAddr {
-        addr.parse().unwrap()
+    /// A minimal, well-framed Binding Request: header, magic cookie,
+    /// transaction id, no attributes.
+    fn stun_request() -> Vec<u8> {
+        let mut m = vec![0u8; 20];
+        m[0..2].copy_from_slice(&[0x00, 0x01]);
+        m[4..8].copy_from_slice(&stun::MAGIC_COOKIE);
+        for (i, b) in m[8..20].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        m
+    }
+
+    /// A long-header Initial offering `version`, with `cid_len`-byte connection
+    /// IDs, padded to the RFC 9000 section 14.1 floor.
+    fn quic_initial(version: u32, cid_len: usize) -> Vec<u8> {
+        let mut p = vec![0xC3];
+        p.extend_from_slice(&version.to_be_bytes());
+        p.push(cid_len as u8);
+        p.extend(std::iter::repeat_n(0xAB, cid_len));
+        p.push(cid_len as u8);
+        p.extend(std::iter::repeat_n(0xCD, cid_len));
+        p.resize(MIN_INITIAL_DATAGRAM.max(p.len()), 0);
+        p
+    }
+
+    fn reply(request: &[u8], from: &str, protocol: AmneziaImitationProtocol) -> Option<Vec<u8>> {
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        reply_to(request, peer(from), protocol, &responder(), &mut rng)
     }
 
     /// The invariant the whole design rests on, in two halves.
@@ -252,62 +370,37 @@ mod tests {
     /// 2. [`classify`] nevertheless routes it to the tunnel, byte for byte.
     ///
     /// Reordering the two calls inside `classify` fails the second assertion.
-    /// This is deliberately a unit test: the same thing observed through a live
-    /// socket depends on a handshake completing, which is not something a test
-    /// should have to wait on to learn about a pure ordering rule.
+    /// Deliberately a unit test: the same thing observed through a live socket
+    /// depends on a handshake completing, which is not something a test should
+    /// have to wait on to learn about a pure ordering rule.
     #[test]
     fn a_conforming_initiation_is_tunnel_traffic_even_though_it_is_a_valid_dns_query() {
-        use crate::noise::{HANDSHAKE_INIT, HANDSHAKE_INIT_SZ};
-
         let obf = ObfuscationRanges::default();
         // S1 = 150: large enough that the DNS filler builds a real query rather
         // than falling back to random padding, and in the range an installer
         // writes.
-        let cfg = AmneziaConfig::new(150, 130, 110, 80).with_protocol_imitation(
+        let config = AmneziaConfig::new(150, 130, 110, 80).with_protocol_imitation(
             AmneziaImitationProtocol::Dns,
             Some("example.com".to_owned()),
         );
-
-        let mut original = vec![0u8; HANDSHAKE_INIT_SZ];
-        original[..4].copy_from_slice(&HANDSHAKE_INIT.to_le_bytes());
-        for (i, byte) in original[4..].iter_mut().enumerate() {
-            *byte = (i as u8) ^ 0x5a;
-        }
-
-        let mut buffer = vec![0u8; HANDSHAKE_INIT_SZ + 1280];
-        buffer[..HANDSHAKE_INIT_SZ].copy_from_slice(&original);
-        let mut junk_rng = ChaCha8Rng::seed_from_u64(0xA53);
-        let padded = cfg
-            .prepend_outbound(obf, &mut buffer, HANDSHAKE_INIT_SZ, &mut junk_rng)
-            .expect("S1 is large enough for the initiation")
-            .to_vec();
-
-        let client = peer("203.0.113.5:40000");
-        let mut rng = ChaCha8Rng::seed_from_u64(12);
+        let (original, padded) =
+            conforming_initiation(&config, obf, &mut ChaCha8Rng::seed_from_u64(0xA53));
 
         // Half one: the collision is real, so half two is not vacuous.
         assert!(
-            reply_to(
-                &padded,
-                client,
-                PORT,
-                AmneziaImitationProtocol::Dns,
-                &budget(),
-                &mut rng
-            )
-            .is_some(),
+            reply(&padded, "203.0.113.5:40000", AmneziaImitationProtocol::Dns).is_some(),
             "our own padded initiation is supposed to be a valid DNS query; if it \
              is not, this test no longer guards anything"
         );
 
         // Half two: and yet it is tunnel traffic.
+        let mut rng = ChaCha8Rng::seed_from_u64(12);
         match classify(
             &padded,
-            &cfg,
+            &config,
             obf,
-            Some(client),
-            PORT,
-            Some(&budget()),
+            peer("203.0.113.5:40000"),
+            Some(&responder()),
             &mut rng,
         ) {
             Ingress::Wireguard(packet) => assert_eq!(
@@ -315,9 +408,8 @@ mod tests {
                 &original[..],
                 "the initiation must come back exactly as it went in"
             ),
-            Ingress::Foreign(_) => {
-                panic!("a conforming AmneziaWG initiation was treated as foreign traffic")
-            }
+            Ingress::Reply(_) => panic!("a conforming initiation was answered as a probe"),
+            Ingress::Drop => panic!("a conforming initiation was dropped"),
         }
     }
 
@@ -325,62 +417,67 @@ mod tests {
     /// which is what a bare WireGuard port already does.
     #[test]
     fn noise_is_dropped_without_a_reply() {
-        let cfg = AmneziaConfig::default().with_protocol_imitation(
-            AmneziaImitationProtocol::Dns,
-            Some("example.com".to_owned()),
-        );
         let mut rng = ChaCha8Rng::seed_from_u64(13);
         match classify(
             &[0x5a; 64],
-            &cfg,
+            &cfg(AmneziaImitationProtocol::Dns),
             ObfuscationRanges::default(),
-            Some(peer("203.0.113.5:40000")),
-            PORT,
-            Some(&budget()),
+            peer("203.0.113.5:40000"),
+            Some(&responder()),
             &mut rng,
         ) {
-            Ingress::Foreign(reply) => assert!(reply.is_none(), "junk must not be answered"),
+            Ingress::Drop => {}
+            Ingress::Reply(r) => panic!("64 bytes of junk drew a {}-byte reply", r.len()),
             Ingress::Wireguard(_) => panic!("64 bytes of junk parsed as AmneziaWG"),
+        }
+    }
+
+    /// With no responder configured — the default, and every vanilla WireGuard
+    /// interface — a probe is dropped rather than answered.
+    #[test]
+    fn a_device_without_a_responder_answers_nothing() {
+        let mut rng = ChaCha8Rng::seed_from_u64(14);
+        match classify(
+            &dns_query(),
+            &cfg(AmneziaImitationProtocol::Dns),
+            ObfuscationRanges::default(),
+            peer("203.0.113.5:40000"),
+            None,
+            &mut rng,
+        ) {
+            Ingress::Drop => {}
+            Ingress::Reply(_) => panic!("replies are off; nothing may be sent"),
+            Ingress::Wireguard(_) => panic!("a DNS query parsed as AmneziaWG"),
         }
     }
 
     #[test]
     fn answers_a_dns_probe_when_imitating_dns() {
-        let mut rng = ChaCha8Rng::seed_from_u64(2);
-        let reply = reply_to(
-            &dns_query(),
-            peer("203.0.113.5:40000"),
-            PORT,
-            AmneziaImitationProtocol::Dns,
-            &budget(),
-            &mut rng,
+        assert!(
+            reply(
+                &dns_query(),
+                "203.0.113.5:40000",
+                AmneziaImitationProtocol::Dns
+            )
+            .is_some(),
+            "a DNS probe under ip=dns must be answered"
         );
-        assert!(reply.is_some(), "a DNS probe under ip=dns must be answered");
     }
 
     /// Answering every protocol on one port describes a host that does not
     /// exist. A DNS probe against a STUN-imitating server gets silence.
     #[test]
     fn does_not_answer_a_protocol_we_are_not_imitating() {
-        let mut rng = ChaCha8Rng::seed_from_u64(3);
-        for ip in [
+        for protocol in [
             AmneziaImitationProtocol::None,
             AmneziaImitationProtocol::Stun,
             AmneziaImitationProtocol::Quic,
             AmneziaImitationProtocol::Sip,
         ] {
             assert!(
-                reply_to(
-                    &dns_query(),
-                    peer("203.0.113.5:40000"),
-                    PORT,
-                    ip,
-                    &budget(),
-                    &mut rng
-                )
-                .is_none(),
+                reply(&dns_query(), "203.0.113.5:40000", protocol).is_none(),
                 "{:?} must not answer a DNS probe",
-                ip
+                protocol
             );
         }
     }
@@ -389,13 +486,14 @@ mod tests {
     /// datagram into a reply somewhere it must never go.
     #[test]
     fn refuses_source_addresses_a_reply_must_never_target() {
-        let mut rng = ChaCha8Rng::seed_from_u64(4);
         let cases = [
             ("0.0.0.0:40000", "unspecified"),
             ("127.0.0.1:40000", "loopback"),
             ("224.0.0.1:40000", "multicast"),
             ("255.255.255.255:40000", "broadcast"),
             ("169.254.1.1:40000", "link-local"),
+            ("0.1.2.3:40000", "0.0.0.0/8 this-network"),
+            ("240.0.0.1:40000", "240.0.0.0/4 reserved"),
             ("203.0.113.5:0", "port 0"),
             ("[::]:40000", "v6 unspecified"),
             ("[::1]:40000", "v6 loopback"),
@@ -412,33 +510,77 @@ mod tests {
         ];
         for (addr, what) in cases {
             assert!(
-                reply_to(
-                    &dns_query(),
-                    peer(addr),
-                    PORT,
-                    AmneziaImitationProtocol::Dns,
-                    &budget(),
-                    &mut rng
-                )
-                .is_none(),
+                reply(&dns_query(), addr, AmneziaImitationProtocol::Dns).is_none(),
                 "{} must not be replied to",
                 what
             );
         }
+    }
 
-        // The reflection-loop case: a source claiming our own listen port.
-        assert!(
-            reply_to(
-                &dns_query(),
-                peer("203.0.113.5:51820"),
-                PORT,
-                AmneziaImitationProtocol::Dns,
-                &budget(),
-                &mut rng
-            )
-            .is_none(),
-            "a source on our own listen port would trade replies forever"
+    /// The source port is not part of the decision, and specifically a source on
+    /// our own listen port is answered like any other.
+    ///
+    /// The reverse — silence for that one port — was a one-packet discriminator:
+    /// a prober knows the port it is dialling, so it can send the same probe
+    /// twice and read the difference. No real server behaves that way. See
+    /// [`may_reply_to`], and
+    /// [`no_generated_reply_can_itself_be_detected_as_a_probe`] for the property
+    /// that makes the check unnecessary.
+    #[test]
+    fn the_source_port_does_not_change_the_answer() {
+        let q = dns_query();
+        let from_ephemeral = reply(&q, "203.0.113.5:40000", AmneziaImitationProtocol::Dns);
+        let from_listen_port = reply(&q, "203.0.113.5:51820", AmneziaImitationProtocol::Dns);
+        assert!(from_ephemeral.is_some(), "the ordinary case is answered");
+        assert_eq!(
+            from_ephemeral, from_listen_port,
+            "a probe from our own listen port must get the same reply as any other"
         );
+    }
+
+    /// The property that makes the reflection loop impossible, and therefore
+    /// makes a source-port check unnecessary: nothing this crate emits in reply
+    /// is itself classifiable as a probe.
+    ///
+    /// Stronger than the check it replaces, which only covered two servers that
+    /// happened to share a listen port. This covers any pair, on any ports.
+    #[test]
+    fn no_generated_reply_can_itself_be_detected_as_a_probe() {
+        let mut rng = ChaCha8Rng::seed_from_u64(21);
+        let client = peer("203.0.113.5:40000");
+
+        let servfail = dns::servfail(&dns_query()).expect("a generated query is answerable");
+        assert_eq!(
+            detect(&servfail),
+            None,
+            "a SERVFAIL must not read as a probe"
+        );
+
+        let success = stun::binding_success(&stun_request(), client, "Chromium")
+            .expect("a minimal Binding Request is answerable");
+        assert_eq!(
+            detect(&success),
+            None,
+            "a Binding Success must not read as a probe"
+        );
+
+        // Both answerable QUIC version classes, and both connection-ID extremes.
+        for version in [0xff00_001du32, 0x0a0a_0a0au32] {
+            for cid_len in [0usize, 255] {
+                let vn = version_negotiation::version_negotiation(
+                    &quic_initial(version, cid_len),
+                    &mut rng,
+                )
+                .unwrap_or_else(|| panic!("version {:#x} must be answered", version));
+                assert_eq!(
+                    detect(&vn),
+                    None,
+                    "a Version Negotiation ({:#x}, {}-byte CIDs) must not read as a probe",
+                    version,
+                    cid_len
+                );
+            }
+        }
     }
 
     /// The mirror of the rejection list: a legitimate IPv4 source arriving via
@@ -448,32 +590,16 @@ mod tests {
     /// XOR-MAPPED-ADDRESS, reporting an IPv6 family to an IPv4 client.
     #[test]
     fn a_v4_mapped_source_gets_the_same_reply_as_the_plain_v4_one() {
-        let client = peer("203.0.113.5:40000");
-        let mapped = peer("[::ffff:203.0.113.5]:40000");
-
-        let mut request = vec![0u8; 20];
-        request[0..2].copy_from_slice(&[0x00, 0x01]);
-        request[4..8].copy_from_slice(&stun::MAGIC_COOKIE);
-        for (i, b) in request[8..20].iter_mut().enumerate() {
-            *b = i as u8;
-        }
-
-        let mut rng = ChaCha8Rng::seed_from_u64(11);
-        let over_v4 = reply_to(
+        let request = stun_request();
+        let over_v4 = reply(
             &request,
-            client,
-            PORT,
+            "203.0.113.5:40000",
             AmneziaImitationProtocol::Stun,
-            &budget(),
-            &mut rng,
         );
-        let over_v6 = reply_to(
+        let over_v6 = reply(
             &request,
-            mapped,
-            PORT,
+            "[::ffff:203.0.113.5]:40000",
             AmneziaImitationProtocol::Stun,
-            &budget(),
-            &mut rng,
         );
         assert!(over_v4.is_some(), "a plain v4 source is answered");
         assert_eq!(
@@ -488,38 +614,22 @@ mod tests {
     ///
     /// The allowance is exactly one reply, so a premature charge of even a
     /// single byte on the refused path is enough to starve the legitimate reply
-    /// that follows. Sized generously, this test passes against a mutant that
-    /// charges on the classifier's verdict.
+    /// that follows. Sized generously, this passes against a mutant that charges
+    /// on the classifier's verdict.
     #[test]
     fn a_refused_reply_does_not_spend_one_byte_of_the_budget() {
         let mut rng = ChaCha8Rng::seed_from_u64(5);
         let query = dns_query();
         let reply_len = dns::servfail(&query).expect("answerable").len();
-        let b = ProbeBudget::new(reply_len as u32);
+        let r = ProbeResponder::new(reply_len as u32, &mut ChaCha8Rng::seed_from_u64(0));
+        let from = peer("203.0.113.5:40000");
 
         // Wrong protocol: detected, never built, must not be charged.
         for _ in 0..100 {
-            assert!(reply_to(
-                &query,
-                peer("203.0.113.5:40000"),
-                PORT,
-                AmneziaImitationProtocol::Stun,
-                &b,
-                &mut rng
-            )
-            .is_none());
+            assert!(reply_to(&query, from, AmneziaImitationProtocol::Stun, &r, &mut rng).is_none());
         }
-        // The allowance is intact to the byte, so the one reply it covers fits.
         assert!(
-            reply_to(
-                &query,
-                peer("203.0.113.5:40000"),
-                PORT,
-                AmneziaImitationProtocol::Dns,
-                &b,
-                &mut rng
-            )
-            .is_some(),
+            reply_to(&query, from, AmneziaImitationProtocol::Dns, &r, &mut rng).is_some(),
             "100 refused replies must not have taken a byte off the ceiling"
         );
     }
@@ -528,50 +638,30 @@ mod tests {
     /// transaction state a real UAS has, so silence is the honest behaviour.
     #[test]
     fn sip_is_detected_but_not_answered() {
-        let mut rng = ChaCha8Rng::seed_from_u64(6);
         let invite = b"INVITE sip:a@b SIP/2.0\r\n\r\n";
         assert_eq!(detect(invite), Some(Probe::Sip), "detected");
         assert!(
-            reply_to(
-                invite,
-                peer("203.0.113.5:40000"),
-                PORT,
-                AmneziaImitationProtocol::Sip,
-                &budget(),
-                &mut rng
-            )
-            .is_none(),
+            reply(invite, "203.0.113.5:40000", AmneziaImitationProtocol::Sip).is_none(),
             "but not answered"
         );
     }
 
-    /// Once the ceiling is spent, replies stop. This is the property that
-    /// bounds what answering unauthenticated traffic can cost, so it is
-    /// asserted as an exact count rather than as "eventually stops": a charge of
-    /// the wrong size, or no charge at all, changes the number.
-    ///
-    /// The allowance is sized from the reply this build actually produces, so
-    /// the test does not silently loosen if a generator changes shape.
+    /// Once the ceiling is spent, replies stop. Asserted as an exact count
+    /// rather than "eventually stops": a charge of the wrong size, or no charge
+    /// at all, changes the number.
     #[test]
     fn the_ceiling_admits_exactly_what_it_allows_and_no_more() {
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let query = dns_query();
         let reply_len = dns::servfail(&query).expect("answerable").len();
+        let from = peer("203.0.113.5:40000");
 
         // Room for four replies a second. Refill over the microseconds this
         // loop takes is a fraction of a byte, so a fifth cannot slip through.
-        let b = ProbeBudget::new(4 * reply_len as u32);
+        let r = ProbeResponder::new(4 * reply_len as u32, &mut ChaCha8Rng::seed_from_u64(0));
         let admitted = (0..100)
             .filter(|_| {
-                reply_to(
-                    &query,
-                    peer("203.0.113.5:40000"),
-                    PORT,
-                    AmneziaImitationProtocol::Dns,
-                    &b,
-                    &mut rng,
-                )
-                .is_some()
+                reply_to(&query, from, AmneziaImitationProtocol::Dns, &r, &mut rng).is_some()
             })
             .count();
 
@@ -593,71 +683,94 @@ mod tests {
     /// module doc calls that order mandatory rather than preferred.
     #[test]
     fn our_own_dns_cover_traffic_is_answered_because_nothing_here_can_tell() {
-        let mut rng = ChaCha8Rng::seed_from_u64(8);
         let mut gen_rng = ChaCha8Rng::seed_from_u64(9);
         for pkt in crate::noise::imitation::dns::generate("example.com", &mut gen_rng) {
             assert!(
-                reply_to(
-                    &pkt,
-                    peer("203.0.113.5:40000"),
-                    PORT,
-                    AmneziaImitationProtocol::Dns,
-                    &budget(),
-                    &mut rng
-                )
-                .is_some(),
+                reply(&pkt, "203.0.113.5:40000", AmneziaImitationProtocol::Dns).is_some(),
                 "nothing at this layer distinguishes our own burst from a probe"
             );
         }
     }
 
-    /// [`MAX_REPLY_LEN`] is a backstop that no current generator can reach, and
-    /// this asserts the margin rather than leaving that claim in a comment. If a
-    /// generator ever grows past it the reply would be silently dropped, so the
-    /// failure should arrive here, not in production.
+    /// Every generator's **worst case** stays under [`MAX_REPLY_LEN`], asserted
+    /// against real measurements rather than against a made-up margin.
+    ///
+    /// The earlier version fed zero-length QUIC connection IDs and asserted
+    /// `len * 2 < MAX_REPLY_LEN`. Both were wrong. The zero-length input
+    /// measured a 15-byte reply when 525 is reachable, and the `* 2` was an
+    /// invented factor — against the real worst case it fails (1050 > 1024)
+    /// while nothing is actually broken, which would have invited someone to
+    /// raise `MAX_REPLY_LEN` past `MIN_INITIAL_DATAGRAM` and give away the
+    /// property that makes this port an attenuator.
     #[test]
-    fn every_generator_stays_well_under_the_backstop() {
+    fn every_generator_stays_under_the_backstop_at_its_worst_case() {
         let mut rng = ChaCha8Rng::seed_from_u64(10);
-        let client = peer("203.0.113.5:40000");
 
-        // DNS: header plus the echoed question, bounded by a 255-byte QNAME.
-        let dns = dns::servfail(&dns_query()).expect("a generated query is answerable");
-
-        // STUN: the largest reply this module can build -- a maximum-length
-        // SOFTWARE value, which `binding_success` caps at 127 bytes.
-        let long_software = "x".repeat(127);
-        let mut request = vec![0u8; 20];
-        request[0..2].copy_from_slice(&[0x00, 0x01]); // Binding Request
-        request[4..8].copy_from_slice(&stun::MAGIC_COOKIE);
-        for (i, b) in request[8..20].iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        let stun_reply = stun::binding_success(&request, client, &long_software)
-            .expect("a minimal Binding Request is answerable");
-
-        for (what, len) in [("DNS", dns.len()), ("STUN", stun_reply.len())] {
-            assert!(
-                len * 2 < MAX_REPLY_LEN,
-                "{} reply is {} bytes, no longer comfortably under the {}-byte backstop",
-                what,
-                len,
-                MAX_REPLY_LEN
-            );
-        }
-
-        // QUIC: a Version Negotiation is a header plus one 4-byte version per
-        // advertised entry, so it is the smallest of the three. Built through
-        // the real path so the bound covers whatever the version list becomes.
-        let mut initial = vec![0u8; 1200];
-        initial[0] = 0xC0;
-        initial[1..5].copy_from_slice(&0xff00_001du32.to_be_bytes()); // a draft version
-        let vn = version_negotiation::version_negotiation(&initial, &mut rng)
-            .expect("a draft-version Initial is answerable");
+        // DNS: header plus the echoed question, and never larger than the query.
+        let query = dns_query();
+        let dns_max = dns::servfail(&query).expect("answerable").len();
         assert!(
-            vn.len() * 2 < MAX_REPLY_LEN,
-            "QUIC reply is {} bytes, no longer comfortably under the {}-byte backstop",
-            vn.len(),
+            dns_max <= query.len(),
+            "a SERVFAIL must never exceed its query ({} vs {})",
+            dns_max,
+            query.len()
+        );
+
+        // STUN: the longest SOFTWARE `binding_success` accepts, to an IPv6
+        // client (the larger XOR-MAPPED-ADDRESS).
+        let long_software = "x".repeat(127);
+        let stun_max =
+            stun::binding_success(&stun_request(), peer("[2001:db8::1]:40000"), &long_software)
+                .expect("a minimal Binding Request is answerable")
+                .len();
+        assert!(
+            stun_max < MAX_REPLY_LEN,
+            "the largest STUN reply is {} bytes, over the {}-byte backstop",
+            stun_max,
             MAX_REPLY_LEN
+        );
+
+        // QUIC: 255-byte connection IDs, which is what the responder actually
+        // permits — the 20-byte RFC 9000 cap is not applied to the versions it
+        // answers. The bound is derived and pinned in `version_negotiation`;
+        // here we only confirm the worst case is reached and clears the
+        // backstop.
+        let vn =
+            version_negotiation::version_negotiation(&quic_initial(0xff00_001d, 255), &mut rng)
+                .expect("a draft-version Initial is answerable");
+        assert_eq!(vn.len(), VN_MAX_LEN, "the worst case really is VN_MAX_LEN");
+        assert!(dns_max < MAX_REPLY_LEN, "DNS reply over the backstop");
+
+        // `VN_MAX_LEN < MAX_REPLY_LEN` and `MAX_REPLY_LEN < MIN_INITIAL_DATAGRAM`
+        // are relationships between constants, so they are `const _: () =
+        // assert!(..)` at the top of this module and fail the *build*. That is
+        // what stops anyone raising MAX_REPLY_LEN to make something pass; a
+        // runtime assertion here would only be a lint about a constant.
+    }
+
+    /// The STUN SOFTWARE comes from the shared pool, so the responder and the
+    /// outbound Binding Requests cannot announce different stacks — and it
+    /// varies across devices, so it is not a constant identifying this fork.
+    #[test]
+    fn the_stun_software_comes_from_the_shared_pool() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..64u64 {
+            let r = ProbeResponder::new(1 << 20, &mut ChaCha8Rng::seed_from_u64(seed));
+            seen.insert(r.software);
+        }
+        let mut pool = std::collections::HashSet::new();
+        for seed in 0..512u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            pool.insert(stun::pick_software(&mut rng));
+        }
+        assert!(
+            seen.is_subset(&pool),
+            "responder announced {:?}, which the request generator never sends",
+            seen.difference(&pool).collect::<Vec<_>>()
+        );
+        assert!(
+            seen.len() > 1,
+            "the value must vary across devices, or it is a constant fingerprint"
         );
     }
 }

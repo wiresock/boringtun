@@ -11,14 +11,6 @@
 //! meaning — the packets go to the WireGuard endpoint, not a STUN server; the
 //! HMAC/CRC are purely cover traffic.
 
-// The responder half -- `binding_request_len`, `check_fingerprint`,
-// `binding_success` and their helpers -- has a caller only in
-// `device::probe_reply`, which is behind the `device` feature. Without that
-// feature the whole crate has no ingress path, so those items really are dead
-// and the allow is the truth rather than a mask. With it, nothing here is
-// exempt.
-#![cfg_attr(not(feature = "device"), allow(dead_code))]
-
 use super::random_token;
 use rand_core::RngCore;
 use ring::hmac;
@@ -160,9 +152,20 @@ fn random_trans_id(rng: &mut impl RngCore) -> [u8; 12] {
     id
 }
 
+/// Draw a SOFTWARE value from [`SOFTWARE_POOL`].
+///
+/// The pool's single accessor, so the responder in `device::probe_reply` and the
+/// request generator below announce stacks from the same list. The responder had
+/// its own hardcoded literal, which meant a device configured `ip=stun` sent
+/// checks claiming one of five stacks and answered as a sixth — a mismatch a
+/// prober who saw both directions could read straight off the wire.
+pub(crate) fn pick_software(rng: &mut impl RngCore) -> &'static str {
+    SOFTWARE_POOL[(rng.next_u32() % SOFTWARE_POOL.len() as u32) as usize]
+}
+
 /// Generate the two STUN Binding Request datagrams of an ICE connectivity check.
 pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
-    let software = SOFTWARE_POOL[(rng.next_u32() % SOFTWARE_POOL.len() as u32) as usize];
+    let software = pick_software(rng);
     let username = format!("{}:{}", random_token(4, 8, rng), random_token(4, 8, rng));
     let ice_pwd: Vec<u8> = random_token(22, 22, rng).into_bytes();
     let priority = rng.next_u32();
@@ -191,9 +194,24 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
     vec![first, second]
 }
 
-// The response side has no caller yet -- the ingress hook that will reach it
-// is the next commit. Scoped to these items rather than the module, so the
-// request side stays covered by the lint.
+/// The largest Binding Request this crate will look at.
+///
+/// A real ICE connectivity check is well under 200 bytes -- the ones
+/// [`generate`] emits are around 120 -- so this is generous by a factor of five
+/// and rejects nothing a genuine client sends.
+///
+/// It exists because everything downstream of the framing check is linear in
+/// the message length, and none of it is covered by the reply budget.
+/// [`check_fingerprint`] walks the attribute list and CRC-32s the whole message
+/// bit-serially; a datagram carrying a deliberately *wrong* FINGERPRINT is
+/// rejected, so no reply is built and `ProbeBudget` is never charged. Without a
+/// bound, one 65 KB datagram buys an attacker ~65 KB of CRC per packet, for
+/// free, repeatable, and invisible to the ceiling that is supposed to bound what
+/// answering strangers costs.
+///
+/// Applied here, in the parser both halves share, so the classifier stops
+/// looking at exactly the point the responder stops answering.
+const MAX_BINDING_REQUEST_LEN: usize = 1024;
 
 /// Validate `data` as a well-framed STUN Binding Request and return the
 /// declared attribute length.
@@ -210,7 +228,7 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
 /// field are always zero". §6.3 has a receiver check "that the message length
 /// is sensible" before anything else.
 pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
-    if data.len() < HEADER_LEN {
+    if data.len() < HEADER_LEN || data.len() > MAX_BINDING_REQUEST_LEN {
         return None;
     }
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
@@ -228,6 +246,7 @@ pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
 }
 
 /// What `msg` carries in place of a FINGERPRINT attribute.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fingerprint {
     /// The attribute list tiles the message exactly and carries no
@@ -257,6 +276,7 @@ enum Fingerprint {
 /// [`binding_success`] has already checked it equals `HEADER_LEN + msg_len`.
 /// Calling this on an unvalidated datagram would let trailing bytes change
 /// which attribute counts as last.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     let mut off = HEADER_LEN;
     while off + 4 <= msg.len() {
@@ -296,6 +316,11 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     Fingerprint::Absent
 }
 
+// Item-scoped, not module-scoped: only the responder half is unreachable
+// without the `device` feature. A module-wide allow would also stop the
+// lint reporting an unused *generator*, which is the half that ships in
+// every build.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Upper bound on the SOFTWARE value this encoder will emit, in bytes.
 ///
 /// Two jobs. It keeps `software.len() as u16` and the message-length cast
@@ -312,6 +337,7 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
 /// stricter than necessary on a value we choose ourselves costs nothing.
 const MAX_SOFTWARE_LEN: usize = 127;
 
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
 ///
 /// The port is XORed with the top half of the magic cookie and the address with
@@ -346,11 +372,13 @@ fn write_xor_mapped_address(pkt: &mut [u8], off: usize, client: SocketAddr, tran
     }
 }
 
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Attribute size of XOR-MAPPED-ADDRESS for this address family.
 fn xor_mapped_len(client: SocketAddr) -> usize {
     4 + if client.is_ipv4() { 8 } else { 20 }
 }
 
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Build a Binding Success Response to `request`, reporting `client` as the
 /// reflexive address.
 ///
@@ -434,6 +462,67 @@ pub(crate) fn binding_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Binding Request larger than [`MAX_BINDING_REQUEST_LEN`] is refused by
+    /// the shared framing check, before any attribute walk or CRC.
+    ///
+    /// A packet-rate bound, not a security boundary — see
+    /// [`MAX_BINDING_REQUEST_LEN`] for the measurements. CRC cost is flat per
+    /// byte, so this does not change what an attacker spends per byte; it
+    /// changes how many packets a second they must send to spend it.
+    ///
+    /// Asserted through `binding_request_len` rather than `binding_success`
+    /// because it is the *shared* parser: the classifier has to stop looking at
+    /// exactly the point the responder stops answering, which is the property
+    /// three earlier review rounds found broken between these two.
+    #[test]
+    fn an_oversized_binding_request_is_refused_by_the_shared_parser() {
+        // Well-framed in every other respect: correct type, correct cookie,
+        // 4-byte-aligned length, and len == HEADER_LEN + msg_len.
+        let framed = |n: usize| {
+            let mut m = vec![0u8; n];
+            m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+            m[2..4].copy_from_slice(&((n - HEADER_LEN) as u16).to_be_bytes());
+            m[4..8].copy_from_slice(&MAGIC_COOKIE);
+            m
+        };
+
+        // The boundary itself is accepted, so the bound is not merely "small".
+        assert_eq!(
+            binding_request_len(&framed(MAX_BINDING_REQUEST_LEN)),
+            Some(MAX_BINDING_REQUEST_LEN - HEADER_LEN),
+            "a request exactly at the limit is still well-framed"
+        );
+        assert_eq!(
+            binding_request_len(&framed(MAX_BINDING_REQUEST_LEN + 4)),
+            None,
+            "one attribute past the limit must be refused"
+        );
+        assert_eq!(
+            binding_request_len(&framed(65_504)),
+            None,
+            "a 65 KB request must be refused before anything walks it"
+        );
+
+        // And the responder agrees, because it goes through the same parser.
+        let client: SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        assert!(
+            binding_success(&framed(65_504), client, "Chromium").is_none(),
+            "classifier and responder must stop at the same size"
+        );
+
+        // The bound must stay above anything this crate actually emits, or real
+        // ICE checks would start being refused.
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        for req in generate(&mut rng) {
+            assert!(
+                req.len() <= MAX_BINDING_REQUEST_LEN,
+                "our own Binding Request is {} bytes, over the {}-byte limit",
+                req.len(),
+                MAX_BINDING_REQUEST_LEN
+            );
+        }
+    }
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 

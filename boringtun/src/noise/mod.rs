@@ -102,14 +102,12 @@ struct PendingAmneziaJunk {
 }
 
 type MessageType = u32;
-// `pub(crate)`: `device::probe_reply`'s ordering test builds a conforming
-// initiation to prove the hazard it guards against is real.
-pub(crate) const HANDSHAKE_INIT: MessageType = 1;
+const HANDSHAKE_INIT: MessageType = 1;
 const HANDSHAKE_RESP: MessageType = 2;
 const COOKIE_REPLY: MessageType = 3;
 const DATA: MessageType = 4;
 
-pub(crate) const HANDSHAKE_INIT_SZ: usize = 148;
+const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;

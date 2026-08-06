@@ -1,6 +1,8 @@
 // Copyright (c) 2024 BoringTun contributors. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+#[cfg(test)]
+use super::HANDSHAKE_INIT;
 use super::{
     handshake::ObfuscationRanges, COOKIE_REPLY_SZ, DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ,
     HANDSHAKE_RESP_SZ,
@@ -70,6 +72,52 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
             4 => Ok(Self::Stun),
             _ => Err(()),
         }
+    }
+}
+
+impl AmneziaImitationProtocol {
+    /// Every variant, so a caller offering these as choices cannot fall behind
+    /// the enum. `boringtun-cli` builds its `--imitate-protocol` value list from
+    /// this rather than restating it.
+    pub const ALL: [Self; 5] = [Self::None, Self::Dns, Self::Quic, Self::Sip, Self::Stun];
+
+    /// The name used on the command line and in `Ip =` config values.
+    ///
+    /// A `match` over `self` rather than a lookup table: adding a variant fails
+    /// to compile here, which is the whole point. The previous arrangement had
+    /// the CLI map these strings with a `_ =>` catch-all, so a new variant that
+    /// nobody wired up silently meant "no imitation".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Dns => "dns",
+            Self::Quic => "quic",
+            Self::Sip => "sip",
+            Self::Stun => "stun",
+        }
+    }
+
+    /// Does this protocol's cover traffic carry a hostname?
+    ///
+    /// `None` and `Stun` do not, and [`AmneziaImitation::new`] silently drops a
+    /// domain supplied with them. A caller that took one from an operator should
+    /// use this to say so rather than let it vanish.
+    pub fn uses_domain(self) -> bool {
+        matches!(self, Self::Dns | Self::Sip | Self::Quic)
+    }
+}
+
+impl std::str::FromStr for AmneziaImitationProtocol {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // `.iter().copied()`, not `.into_iter()`: in edition 2018 the latter on
+        // an array yields references, so this would be a `Result<&Self, _>`.
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|p| p.as_str() == s)
+            .ok_or(())
     }
 }
 
@@ -158,9 +206,46 @@ impl AmneziaImitation {
         }
     }
 
-    fn domain(&self) -> Option<&str> {
+    /// The domain that survived validation, if any.
+    ///
+    /// `pub` so a caller can tell whether the hostname it supplied was actually
+    /// kept: [`Self::new`] drops an invalid host and falls back to a randomly
+    /// generated one at emit time, which is a silent substitution an operator
+    /// would otherwise only discover in a packet capture.
+    pub fn domain(&self) -> Option<&str> {
         self.domain.as_deref()
     }
+}
+
+/// A conforming AmneziaWG handshake initiation, before and after
+/// [`AmneziaConfig::prepend_outbound`].
+///
+/// Lives here, next to the padding rules, because `device::probe_reply`'s
+/// ordering test needs a datagram that is *simultaneously* valid AmneziaWG and a
+/// valid DNS query — which is exactly what this module produces under `ip=dns`.
+/// Building it there instead meant exporting `HANDSHAKE_INIT` and
+/// `HANDSHAKE_INIT_SZ` crate-wide for a test, permanently widening two
+/// protocol constants that nothing in production needs outside `noise`.
+#[cfg(test)]
+pub(crate) fn conforming_initiation(
+    cfg: &AmneziaConfig,
+    obf: ObfuscationRanges,
+    rng: &mut impl RngCore,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut original = vec![0u8; HANDSHAKE_INIT_SZ];
+    original[..4].copy_from_slice(&HANDSHAKE_INIT.to_le_bytes());
+    for (i, byte) in original[4..].iter_mut().enumerate() {
+        *byte = (i as u8) ^ 0x5a;
+    }
+
+    let mut buffer = vec![0u8; HANDSHAKE_INIT_SZ + 1280];
+    buffer[..HANDSHAKE_INIT_SZ].copy_from_slice(&original);
+    let padded = cfg
+        .prepend_outbound(obf, &mut buffer, HANDSHAKE_INIT_SZ, rng)
+        .expect("S1 must leave room for the initiation")
+        .to_vec();
+
+    (original, padded)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

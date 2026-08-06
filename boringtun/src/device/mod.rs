@@ -48,7 +48,7 @@ use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
-use probe_budget::ProbeBudget;
+use probe_reply::ProbeResponder;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
@@ -137,11 +137,22 @@ pub struct DeviceConfig {
     /// Bytes per second of replies to *unauthenticated* probe traffic, or
     /// `None` to answer nothing.
     ///
-    /// Only ever spent when `amnezia.imitation` names a protocol, so a vanilla
-    /// WireGuard interface stays byte-for-byte silent to unverified sources
-    /// whatever this holds. When imitation *is* configured, answering is the
-    /// point: a port that emits DNS-shaped datagrams and answers no DNS query
-    /// describes a host that does not exist.
+    /// **Defaults to `None`.** Answering an unverified source is the one thing
+    /// this daemon otherwise never does — `verify_packet` computes mac1 from the
+    /// server's static public key before a single byte is written — so it is
+    /// opt-in rather than something an embedder acquires by upgrading. A reply
+    /// also requires `amnezia.imitation` to name a protocol, but that is a
+    /// second condition, not a substitute for this one: `Ip = dns` is what
+    /// AmneziaWG installers write on *clients*, and a client that answers scans
+    /// is more identifiable than one that stays silent, not less.
+    ///
+    /// `boringtun-cli` turns it on when `--imitate-protocol` is given, which is
+    /// where the operator has actually asked for a service to be imitated.
+    ///
+    /// Read **once**, at [`Device::new`]. There is no UAPI key and nothing
+    /// re-reads the copy retained in the device's config, so changing it after
+    /// construction has no effect; a future key would need to rebuild the
+    /// responder rather than assign this.
     ///
     /// The ceiling is aggregate and byte-based rather than per-source: a
     /// per-source limiter is defeated by spoofing, since every forged address
@@ -151,15 +162,20 @@ pub struct DeviceConfig {
     pub probe_reply_bytes_per_sec: Option<u32>,
 }
 
-/// Enough for roughly 250 replies a second, which no legitimate probing
-/// approaches, and low enough that the port is worthless as an amplifier: a
-/// reflector contributing 16 KiB/s is not worth an attacker's spoofed packets.
+/// The rate `boringtun-cli` uses when `--imitate-protocol` names a service.
 ///
-/// A number rather than a knob-per-protocol on purpose. The replies are tens of
-/// bytes each -- a DNS SERVFAIL is never larger than its query, a QUIC Version
-/// Negotiation is under 60 bytes, and a STUN Binding Success tops out near 200 --
-/// so one rate covers all of them and there is nothing for an operator to get
-/// wrong.
+/// Far more than any legitimate probing draws, and low enough that the port is
+/// worthless as an amplifier: a reflector contributing 16 KiB/s is not worth an
+/// attacker's spoofed packets. No reply-per-second figure is quoted here — it
+/// depends on which protocol is configured and on the request, and a number in
+/// a comment is the kind of thing that goes stale without anything failing.
+///
+/// One number rather than a knob per protocol. The replies are small and, more
+/// to the point, *bounded*: a DNS SERVFAIL is never larger than its query, a
+/// STUN Binding Success is capped by `MAX_SOFTWARE_LEN`, and a QUIC Version
+/// Negotiation by `version_negotiation::MAX_LEN`. Each of those bounds is
+/// asserted by a test in the module that owns it, rather than restated here as
+/// a number that would go stale.
 pub const DEFAULT_PROBE_REPLY_BYTES_PER_SEC: u32 = 16 * 1024;
 
 impl Default for DeviceConfig {
@@ -175,7 +191,9 @@ impl Default for DeviceConfig {
             // before AmneziaWG support existed.
             obf: ObfuscationRanges::default(),
             amnezia: AmneziaConfig::default(),
-            probe_reply_bytes_per_sec: Some(DEFAULT_PROBE_REPLY_BYTES_PER_SEC),
+            // Silent to unauthenticated sources, which is what the sentence
+            // above promises and what the daemon did before this existed.
+            probe_reply_bytes_per_sec: None,
         }
     }
 }
@@ -207,14 +225,16 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    /// Ceiling on bytes emitted in reply to unauthenticated probes, or `None`
-    /// when probe replies are off.
+    /// State for answering unauthenticated probes, or `None` when that is off
+    /// — which is the default.
     ///
-    /// One per device, not one per worker thread: every worker charges this
-    /// same instance, so `n_threads` does not multiply the allowance the
-    /// operator configured. `ProbeBudget` is a single atomic, so sharing it
-    /// costs a CAS on a path that already refuses to allocate.
-    probe_budget: Option<ProbeBudget>,
+    /// One per device, not one per worker thread. Its byte ceiling is aggregate,
+    /// so a per-thread copy would multiply the allowance the operator configured
+    /// by `n_threads`; sharing it is also what made the clock handling in
+    /// `ProbeBudget::try_consume` load-bearing (see the comment there). Its
+    /// STUN SOFTWARE value is per-device for the opposite reason: a single ICE
+    /// agent announces one stack, so it must not vary per worker or per reply.
+    probe_responder: Option<ProbeResponder>,
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
@@ -233,6 +253,19 @@ struct ThreadData {
     /// ChaCha8 for exactly these bytes (`noise/handshake.rs`), so this matches
     /// the per-peer path rather than weakening it.
     junk_rng: ChaCha8Rng,
+    /// Per-thread CSPRNG for probe replies, deliberately **not** `junk_rng`.
+    ///
+    /// A QUIC Version Negotiation puts six bits of its draw straight on the wire
+    /// (RFC 9000 §17.2.1 has a server randomise the Unused bits), and an
+    /// unauthenticated prober chooses when and how often that happens. Sharing
+    /// one stream would let a stranger both step and partially observe the
+    /// generator that fills AmneziaWG cover junk on the cookie-reply path —
+    /// which is the one thing about that junk that has to be unguessable.
+    ///
+    /// ChaCha8 makes neither of those exploitable today. The point is that the
+    /// obfuscation's unpredictability should not rest on the responder's choice
+    /// of RNG, because nothing would flag it if that choice later changed.
+    probe_rng: ChaCha8Rng,
 }
 
 /// Does `addr` route to `owner` in this index?
@@ -336,6 +369,7 @@ impl DeviceHandle {
             src_buf: [0u8; MAX_UDP_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
             junk_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
+            probe_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
             iface: if _i == 0 || !device.read().config.use_multi_queue {
                 // For the first thread use the original iface
                 Arc::clone(&device.read().iface)
@@ -362,6 +396,7 @@ impl DeviceHandle {
             src_buf: [0u8; MAX_UDP_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
             junk_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
+            probe_rng: ChaCha8Rng::from_rng(OsRng).expect("OsRng must seed ChaCha8"),
             iface: Arc::clone(&device.read().iface),
         };
 
@@ -606,7 +641,13 @@ impl Device {
         let uapi_fd = config.uapi_fd;
 
         // Before `config` is moved into the device.
-        let probe_budget = config.probe_reply_bytes_per_sec.map(ProbeBudget::new);
+        // `filter(> 0)` so `Some(0)` and `None` cannot mean different things:
+        // a zero-byte allowance already refuses every reply, so leaving both
+        // spellings live would be two encodings of one state.
+        let probe_responder = config
+            .probe_reply_bytes_per_sec
+            .filter(|&rate| rate > 0)
+            .map(|rate| ProbeResponder::new(rate, &mut OsRng));
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -626,7 +667,7 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
-            probe_budget,
+            probe_responder,
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -939,37 +980,59 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    // Strip the AmneziaWG S-prefix *before* verifying. The order
-                    // is mandatory: mac1/mac2 are computed over the slice handed
-                    // to the rate limiter, so verifying the padded datagram fails
-                    // the MAC check. This mirrors the kernel module, which strips
-                    // at device level before peer lookup.
+                    // Bound the batch on datagrams *received*, not on datagrams
+                    // fully processed. Every `continue` below -- unrecognised
+                    // framing, a probe reply, a cookie reply, an unknown peer --
+                    // skips the bottom of the loop, so with the decrement down
+                    // there a flood of anything that is not a valid peer packet
+                    // kept this worker inside a single dispatch indefinitely. It
+                    // holds the device read lock while it spins, so `awg set`
+                    // blocks for the duration of the flood, and this worker's
+                    // timers never run. `MAX_ITR` is what `drain_datagrams`
+                    // already bounds itself by; this makes the main path agree.
+                    if iter == 0 {
+                        break;
+                    }
+                    iter -= 1;
+
+                    // Resolved once, here, rather than twice further down behind
+                    // `unwrap()`. A `SockAddr` whose family is neither AF_INET
+                    // nor AF_INET6 cannot be replied to *or* attributed to a
+                    // peer, and a panic in this worker takes the whole daemon
+                    // down (see the keyless comment above), so it is dropped.
+                    let Some(from) = addr.as_socket() else {
+                        continue;
+                    };
+
                     // AmneziaWG framing first, probe detection only if that
-                    // fails. The order lives inside `classify` rather than
-                    // here so it can be tested; see its doc for why getting it
+                    // fails. The order lives inside `classify` rather than here
+                    // so it can be tested; see its doc for why getting it
                     // backwards makes the server answer its own clients.
                     let packet = match probe_reply::classify(
                         &t.src_buf[..packet_len],
                         &d.config.amnezia,
                         obf,
-                        addr.as_socket(),
-                        d.listen_port,
-                        d.probe_budget.as_ref(),
-                        &mut t.junk_rng,
+                        from,
+                        d.probe_responder.as_ref(),
+                        &mut t.probe_rng,
                     ) {
                         probe_reply::Ingress::Wireguard(packet) => packet,
-                        probe_reply::Ingress::Foreign(reply) => {
-                            if let Some(reply) = reply {
-                                let _: Result<_, _> = udp.send_to(&reply, &addr);
-                            }
+                        probe_reply::Ingress::Reply(reply) => {
+                            let _: Result<_, _> = udp.send_to(&reply, &addr);
                             continue;
                         }
+                        probe_reply::Ingress::Drop => continue,
                     };
-                    // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
+                    // The rate limiter checks mac1 and mac2 over the slice
+                    // `classify` handed back -- the S-prefix already stripped.
+                    // That order is mandatory: the MACs are computed over the
+                    // unpadded packet, so verifying the padded datagram fails
+                    // the check. It mirrors the kernel module, which strips at
+                    // device level before peer lookup.
                     let parsed_packet = match rate_limiter.verify_packet(
                         obf,
                         &mut OsRng,
-                        Some(addr.as_socket().unwrap().ip()),
+                        Some(from.ip()),
                         packet,
                         &mut t.dst_buf,
                     ) {
@@ -1046,19 +1109,13 @@ impl Device {
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    let addr = addr.as_socket().unwrap();
-                    let ip_addr = addr.ip();
-                    p.set_endpoint(addr);
+                    let ip_addr = from.ip();
+                    p.set_endpoint(from);
                     if d.config.use_connected_socket {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                                 .unwrap();
                         }
-                    }
-
-                    iter -= 1;
-                    if iter == 0 {
-                        break;
                     }
                 }
                 Action::Continue

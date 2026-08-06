@@ -171,6 +171,13 @@ for tool in awk cut date dd grep head lsmod od ping; do
   command -v "$tool" >/dev/null || die "$tool not installed (used by preflight or the checks)"
 done
 
+# The probe checks send UDP through bash's /dev/udp, which is a compile-time
+# option (--enable-net-redirections). Without it every probe fails to send, and
+# a check that asserts *silence* would score that as a pass. Assert it here
+# rather than let the harness quietly test nothing.
+bash -c 'exec 3<>/dev/udp/127.0.0.1/9' 2>/dev/null \
+  || die "this bash has no /dev/udp support (needed by the probe-reply checks)"
+
 lsmod | grep -q '^amneziawg'      || die "amneziawg kernel module not loaded -- the point of this test is a REAL client"
 [ -e /dev/net/tun ]               || die "/dev/net/tun missing"
 
@@ -322,17 +329,40 @@ start_client() {  # $1 = ns, $2 = conf, $3 = tunnel addr
 # after \x -- and the whole thing is 29 bytes.
 readonly DNS_PROBE='\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
 
-# Send one datagram and print the reply as lowercase hex, or nothing if none
-# arrives. bash's /dev/udp rather than a new dependency on socat or dig, and a
-# single `dd` read rather than `head -c`: one read() on a datagram socket
-# returns exactly one datagram, whereas `head -c N` blocks for an EOF that a
-# UDP socket never delivers, so `timeout` would kill it before it printed.
-udp_probe() { # <ns> <dst-ip> <dst-port> <printf-format-for-payload>
+# Send one datagram and print the reply as lowercase hex; empty means the
+# datagram was sent and nothing came back, and `SENDFAIL` means it could not be
+# sent at all.
+#
+# Distinguishing those two is the whole point. The checks below assert
+# *silence*, so a probe that never left the namespace -- a bash without
+# /dev/udp support, a broken route, a missing netns -- would otherwise score as
+# a PASS, and the harness would report that the responder is correctly inert
+# while having tested nothing.
+#
+# bash's /dev/udp rather than a new dependency on socat or dig, and a single
+# `dd` read rather than `head -c`: one read() on a datagram socket returns
+# exactly one datagram, whereas `head -c N` blocks for an EOF that a UDP socket
+# never delivers, so `timeout` would kill it before it printed.
+#
+# `printf '%b'` rather than `printf "$P_FMT"`: the payload is data, and passing
+# it as the *format* means a future probe containing a `%` produces garbage or
+# an error -- which, again, the silence checks would score as a PASS.
+udp_probe() { # <ns> <dst-ip> <dst-port> <printf-escapes-for-payload>
   ip netns exec "$1" env P_IP="$2" P_PORT="$3" P_FMT="$4" timeout 3 bash -c '
-    exec 3<>/dev/udp/$P_IP/$P_PORT || exit 1
-    printf "$P_FMT" >&3
+    exec 3<>/dev/udp/$P_IP/$P_PORT || { echo SENDFAIL; exit 0; }
+    printf "%b" "$P_FMT" >&3 || { echo SENDFAIL; exit 0; }
     dd bs=512 count=1 <&3 2>/dev/null | od -An -tx1 | tr -d " \n"
   ' 2>/dev/null
+}
+
+# Assert that a probe was delivered and drew no reply, keeping "could not send"
+# distinct from "sent, no answer".
+expect_silence() { # <label> <reply-from-udp_probe>
+  case "$2" in
+    SENDFAIL) bad "$1: the probe could not be sent -- harness failure, not a result" ;;
+    "")       ok  "$1" ;;
+    *)        bad "$1: answered with $2" ;;
+  esac
 }
 
 # Checks from here on inspect exit statuses themselves.
@@ -503,11 +533,7 @@ info "7. Probe replies: the port answers the protocol it imitates, and only that
 # must be inert. This is the control that gives the next two checks meaning: if
 # the port answered here, 7c would prove nothing about the imitation setting.
 probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
-if [ -z "$probe_reply" ]; then
-  ok "no imitation configured: a DNS probe gets silence"
-else
-  bad "a server with no imitation answered a DNS probe: $probe_reply"
-fi
+expect_silence "no imitation configured: a DNS probe gets silence" "$probe_reply"
 
 # 7b. Imitating STUN. A DNS probe is detected -- the classifier does not care
 # what we configured -- but must not be answered, because answering every
@@ -516,13 +542,21 @@ stop_server
 SRV_EXTRA_ARGS=(--imitate-protocol stun)
 if start_server srv.conf; then
   probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
-  if [ -z "$probe_reply" ]; then
-    ok "imitating STUN: a DNS probe gets silence"
-  else
-    bad "a STUN-imitating server answered a DNS probe: $probe_reply"
-  fi
+  expect_silence "imitating STUN: a DNS probe gets silence" "$probe_reply"
 else
   bad "could not start the STUN-imitating server -- not a probe-reply result"
+fi
+
+# 7b2. The kill switch. Imitation on, replies explicitly off. This is the knob
+# an operator reaches for if the responder ever becomes a liability, so it is
+# worth knowing it works separately from the protocol setting.
+stop_server
+SRV_EXTRA_ARGS=(--imitate-protocol dns --probe-reply-rate 0)
+if start_server srv.conf; then
+  probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
+  expect_silence "imitating DNS with --probe-reply-rate 0: silence" "$probe_reply"
+else
+  bad "could not start the server with replies disabled -- not a probe-reply result"
 fi
 
 # 7c. Imitating DNS. Now the same probe must come back as a SERVFAIL that a
@@ -554,15 +588,24 @@ else
     fi
   fi
 
-  # 7d. The ordering guarantee, and the reason it is mandatory. Under `ip=dns`
-  # our own S-junk is a valid DNS query by construction, so a server that asked
-  # "is this a probe?" before "is this one of my peers?" would SERVFAIL its own
-  # clients' handshakes. Nothing in `probe_reply` can distinguish the two; only
-  # the call order can, and only this check observes it.
-  if ip netns exec "$NS_CLI" ping -c3 -W3 -q 10.66.201.1 >/dev/null 2>&1; then
+  # 7d. The ordering guarantee against a *real* client. Under `ip=dns` our own
+  # S-junk is a valid DNS query by construction, so a server that asked "is this
+  # a probe?" before "is this one of my peers?" would SERVFAIL its own clients'
+  # handshakes. The unit test
+  # `a_conforming_initiation_is_tunnel_traffic_even_though_it_is_a_valid_dns_query`
+  # pins that deterministically; this is the kernel-module confirmation.
+  #
+  # `-w 30`, not `-W3`. Checks 7b and 7c each restarted the daemon, so the
+  # server has no session for a peer the *client* still considers valid. Kernel
+  # WireGuard does not re-initiate on the first dropped packet: it arms
+  # `timer_new_handshake` only after KEEPALIVE_TIMEOUT + REKEY_TIMEOUT = 15 s.
+  # A 5-second ping would report "classification order is wrong" for a timer it
+  # never waited on -- pointing a reviewer at the one thing that is not broken.
+  # `-c3` still exits as soon as three replies arrive, so a healthy run is fast.
+  if ip netns exec "$NS_CLI" ping -c3 -w 30 -q 10.66.201.1 >/dev/null 2>&1; then
     ok "a real AmneziaWG client still handshakes while the port answers probes"
   else
-    bad "the probe responder broke the datapath -- classification order is wrong"
+    bad "no traffic from a real client while the port answers probes -- either the classification order is wrong or the re-handshake did not happen within 30s"
   fi
 fi
 SRV_EXTRA_ARGS=()
