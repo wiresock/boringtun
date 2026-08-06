@@ -6,12 +6,18 @@
 //!
 //! Each generator produces the standalone datagram(s) a real client emits for
 //! that protocol — a STUN ICE connectivity check, a SIP INVITE/CANCEL pair, a
-//! short burst of DNS queries — to camouflage the AmneziaWG handshake. They are
-//! client-side cover traffic only; no server responses are synthesized.
+//! short burst of DNS queries — to camouflage the AmneziaWG handshake.
 //!
-//! These need no extra dependencies (HMAC-SHA1 comes from `ring`), so unlike the
-//! QUIC imitation they are always compiled. The QUIC imitation lives in
-//! [`super::quic`].
+//! Two of them also synthesize the *server* side, to answer an inbound probe
+//! rather than to camouflage an outbound handshake: [`dns::servfail`] and
+//! [`stun::binding_success`]. The third reply, for QUIC, lives with the rest of
+//! the QUIC code in [`super::quic::version_negotiation`]. [`detect`] is the
+//! classifier that decides which, if any, applies.
+//!
+//! These need no extra dependencies (HMAC-SHA1 comes from `ring`). The QUIC
+//! imitation lives in [`super::quic`] and pulls in `aes`; it is compiled
+//! unconditionally too, which [`detect`] now relies on — it reaches into
+//! `quic::version_negotiation` for the long-header parse.
 
 pub(crate) mod detect;
 pub(crate) mod dns;
