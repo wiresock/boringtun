@@ -133,11 +133,17 @@ pub(crate) fn servfail(query: &[u8]) -> Option<Vec<u8>> {
     let mut pkt = Vec::with_capacity(end);
     pkt.extend_from_slice(&query[0..2]); // transaction id, echoed
 
-    // QR=1, opcode and RD copied from the query, RA=1, RCODE=2 (SERVFAIL).
-    // Copying the opcode and RD matters: a resolver answering a
-    // recursion-desired query with RD clear is a tell on its own.
-    let opcode_rd = query[2] & 0x7F;
-    pkt.push(0x80 | opcode_rd);
+    // Byte 2 is QR | OPCODE(4) | AA | TC | RD (RFC 1035 §4.1.1).
+    //
+    // Copy only OPCODE and RD. Copying RD matters -- a resolver answering a
+    // recursion-desired query with RD clear is a tell by itself -- but AA and
+    // TC must be built fresh, not echoed: AA would claim authority over a name
+    // we just failed to resolve, and TC would claim *this response* was
+    // truncated when it is complete. A crafted query can set either, and
+    // `question_end` does not reject them, so echoing is reachable.
+    const OPCODE: u8 = 0x78;
+    const RD: u8 = 0x01;
+    pkt.push(0x80 | (query[2] & (OPCODE | RD)));
     pkt.push(0x80 | 0x02);
 
     pkt.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1, the echoed question
@@ -234,6 +240,37 @@ mod tests {
                 "question echoed"
             );
         }
+    }
+
+    /// AA and TC are built fresh, never echoed. A crafted query can set either
+    /// and `question_end` does not reject them, so this is reachable rather
+    /// than theoretical: AA would claim authority over a name we just failed to
+    /// resolve, and TC would claim this response was truncated when it is
+    /// complete. Both are wrong on a SERVFAIL and both are visible to a prober.
+    #[test]
+    fn aa_and_tc_are_not_echoed_from_the_query() {
+        const AA: u8 = 0x04;
+        const TC: u8 = 0x02;
+        const RD: u8 = 0x01;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(12);
+        let mut query = generate("example.com", &mut rng)[0].clone();
+        query[2] |= AA | TC;
+        assert_eq!(query[2] & RD, RD, "the generator sets RD");
+        assert!(
+            question_end(&query).is_some(),
+            "a query with AA/TC set still validates, which is why this matters"
+        );
+
+        let resp = servfail(&query).unwrap();
+        assert_eq!(resp[2] & AA, 0, "AA must not be echoed onto a SERVFAIL");
+        assert_eq!(
+            resp[2] & TC,
+            0,
+            "TC must not be echoed; the response is whole"
+        );
+        assert_eq!(resp[2] & RD, RD, "RD is still copied");
+        assert_eq!(resp[2] & 0x80, 0x80, "QR still set");
     }
 
     /// Unlike the STUN reply, this one can never amplify: the response is the
