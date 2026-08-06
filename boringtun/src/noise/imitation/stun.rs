@@ -223,12 +223,15 @@ pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fingerprint {
-    /// No FINGERPRINT attribute. Nothing to echo, nothing to check.
+    /// The attribute list tiles the message exactly and carries no
+    /// FINGERPRINT. Nothing to echo, nothing to check.
     Absent,
     /// Present, last, four bytes, and the CRC matches.
     Valid,
-    /// Present but malformed or wrong. RFC 5389 §15.5: an agent receiving a
-    /// message whose FINGERPRINT is incorrect MUST discard it.
+    /// Either a FINGERPRINT that is wrong or misplaced, or an attribute list
+    /// that does not tile the message. RFC 5389 §15.5: an agent receiving a
+    /// message whose FINGERPRINT is incorrect MUST discard it -- and a message
+    /// whose attributes overrun their own length is malformed regardless.
     Invalid,
 }
 
@@ -269,13 +272,19 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
             };
         }
 
+        // Malformed framing is Invalid, not Absent. Ending the walk with
+        // "no FINGERPRINT here" would let a bogus attribute length placed
+        // *before* a corrupt FINGERPRINT stop the walk before reaching it, so
+        // the corrupt one is never examined and the request gets answered --
+        // bypassing the discard rule entirely. A real agent discards a message
+        // whose attributes do not tile it.
         let advance = match padded(attr_len).checked_add(4) {
             Some(a) => a,
-            None => return Fingerprint::Absent,
+            None => return Fingerprint::Invalid,
         };
         off = match off.checked_add(advance) {
             Some(o) if o <= msg.len() => o,
-            _ => return Fingerprint::Absent,
+            _ => return Fingerprint::Invalid,
         };
     }
     Fingerprint::Absent
@@ -789,6 +798,39 @@ mod tests {
         assert!(binding_success(&ok, client, "x").is_some());
     }
 
+    /// The "drop an invalid FINGERPRINT" rule must not be bypassable by putting a
+    /// malformed attribute in front of it. Treating a bad attribute length as
+    /// "no FINGERPRINT here" ends the walk early, so the corrupt FINGERPRINT
+    /// after it is never examined and the request gets answered.
+    #[test]
+    fn a_malformed_attribute_cannot_shield_a_corrupt_fingerprint() {
+        let client: SocketAddr = "192.0.2.9:1".parse().unwrap();
+
+        // 8 bytes of bogus attribute (claiming 0xFFFF) then 8 bytes of
+        // FINGERPRINT carrying a CRC that is certainly wrong.
+        let attrs = 8 + FP_ATTR_LEN;
+        let mut m = vec![0u8; HEADER_LEN + attrs];
+        m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        m[2..4].copy_from_slice(&(attrs as u16).to_be_bytes());
+        m[4..8].copy_from_slice(&MAGIC_COOKIE);
+        m[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0x0006u16.to_be_bytes());
+        m[HEADER_LEN + 2..HEADER_LEN + 4].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        let fp = HEADER_LEN + 8;
+        m[fp..fp + 2].copy_from_slice(&0x8028u16.to_be_bytes());
+        m[fp + 2..fp + 4].copy_from_slice(&4u16.to_be_bytes());
+        m[fp + 4..fp + 8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+
+        assert_eq!(
+            check_fingerprint(&m),
+            Fingerprint::Invalid,
+            "a malformed attribute list is malformed, not FINGERPRINT-free"
+        );
+        assert!(
+            binding_success(&m, client, "x").is_none(),
+            "a malformed attribute must not shield a corrupt FINGERPRINT"
+        );
+    }
+
     #[test]
     fn refuses_what_is_not_a_binding_request() {
         let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
@@ -808,23 +850,32 @@ mod tests {
         assert!(binding_success(&no_cookie, client, "x").is_none());
     }
 
-    /// `check_fingerprint` walks attacker-controlled bytes; a length that
-    /// overruns the buffer must end the walk rather than wrap or index out of
-    /// bounds.
+    /// `check_fingerprint` walks attacker-controlled bytes. A length that
+    /// overruns the buffer must end the walk without wrapping or indexing out
+    /// of bounds -- and the message must then be refused, because attributes
+    /// that do not tile the message are malformed.
+    ///
+    /// This test previously asserted the request was *answered*, which pinned
+    /// the very defect review found: it was written to prove "does not panic"
+    /// and quietly also asserted "replies", so the bypass looked like intended
+    /// behaviour.
     #[test]
-    fn attribute_walk_survives_malformed_lengths() {
+    fn a_malformed_attribute_length_is_refused_without_panicking() {
         let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
         let mut m = vec![0u8; HEADER_LEN + 8];
-        m[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
         // Header length is correct -- 8 bytes of attributes follow. It is the
-        // *attribute* length that is malformed, which is the thing under test;
-        // a wrong header length is rejected earlier and would never reach the
-        // attribute walk.
+        // *attribute* length that is malformed, which is the thing under test.
         m[2..4].copy_from_slice(&8u16.to_be_bytes());
         m[4..8].copy_from_slice(&MAGIC_COOKIE);
         // An attribute claiming 0xFFFF bytes inside a 28-byte datagram.
         m[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0x0006u16.to_be_bytes());
         m[HEADER_LEN + 2..HEADER_LEN + 4].copy_from_slice(&0xFFFFu16.to_be_bytes());
-        assert!(binding_success(&m, client, "x").is_some(), "must not panic");
+
+        assert_eq!(check_fingerprint(&m), Fingerprint::Invalid);
+        assert!(
+            binding_success(&m, client, "x").is_none(),
+            "attributes that do not tile the message are malformed"
+        );
     }
 }
