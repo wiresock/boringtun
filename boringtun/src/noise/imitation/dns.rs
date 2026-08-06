@@ -5,8 +5,12 @@
 //!
 //! Emits the three standard-query datagrams a modern OS resolver sends for a
 //! name — A (RFC 1035), AAAA (RFC 3596), and HTTPS/SVCB (RFC 9460) — each with a
-//! fresh transaction id and the standard "recursion desired" flag. No responses
-//! are synthesized.
+//! fresh transaction id and the standard "recursion desired" flag.
+//!
+//! Also builds the one response this crate synthesizes, [`servfail`], and owns
+//! the query validator [`question_end`] that both it and the probe classifier
+//! use. Keeping the parser here rather than in two places is deliberate: the
+//! STUN pair drifted three times before its rules were shared.
 
 use rand_core::RngCore;
 
@@ -89,10 +93,16 @@ fn qname_end(data: &[u8], start: usize) -> Option<usize> {
 /// One function so the classifier and the responder cannot disagree, which is
 /// the mistake the STUN pair made three times before the rules were shared.
 ///
-/// Requires QR=0 with a standard opcode, exactly one question, a QNAME whose
-/// label walk terminates exactly, and a QCLASS a real client emits -- IN(1),
-/// CH(3), HS(4) or ANY(255). Trailing bytes past the question are allowed;
-/// EDNS OPT records live there.
+/// Requires everything a standard query must have and nothing a query must
+/// not: QR=0 with a standard opcode, no response-only flags (RA, Z, RCODE),
+/// exactly one question, no answer or authority records, a QNAME whose label
+/// walk terminates exactly, and a QCLASS a real client emits -- IN(1), CH(3),
+/// HS(4) or ANY(255).
+///
+/// AD and CD are permitted: RFC 4035 lets a validating client set either in a
+/// query, so rejecting them would refuse legitimate traffic. ARCOUNT is
+/// unconstrained and trailing bytes are allowed, because that is where an EDNS
+/// OPT record lives -- including the one `fill_dns` hides ciphertext in.
 ///
 /// End-to-end validation rather than a header-flags check, and the difference
 /// matters: AmneziaWG junk is uniformly random and roughly 3% of it passes a
@@ -102,9 +112,22 @@ pub(super) fn question_end(query: &[u8]) -> Option<usize> {
     if query.len() < HEADER_LEN {
         return None;
     }
-    let flags = u16::from_be_bytes([query[2], query[3]]);
+    // Byte 2: QR | OPCODE(4) | AA | TC | RD. Byte 3: RA | Z | AD | CD | RCODE(4).
+    // Reject QR and a non-standard opcode, and the three response-only fields.
+    // AA and TC are left alone -- meaningless or legal in a query, and a
+    // prober setting them is not reason enough to refuse.
+    const QR_AND_OPCODE: u8 = 0xF8;
+    const RA_Z_RCODE: u8 = 0xCF;
+    if query[2] & QR_AND_OPCODE != 0 || query[3] & RA_Z_RCODE != 0 {
+        return None;
+    }
+
+    // Exactly one question, and nothing a query cannot carry. ARCOUNT is
+    // deliberately unchecked: EDNS OPT records live there.
     let qdcount = u16::from_be_bytes([query[4], query[5]]);
-    if flags & 0xF800 != 0 || qdcount != 1 {
+    let ancount = u16::from_be_bytes([query[6], query[7]]);
+    let nscount = u16::from_be_bytes([query[8], query[9]]);
+    if qdcount != 1 || ancount != 0 || nscount != 0 {
         return None;
     }
     let name_end = qname_end(query, HEADER_LEN)?;
@@ -252,6 +275,55 @@ mod tests {
                 "question echoed"
             );
         }
+    }
+
+    /// A standard query carries no answer or authority records and none of the
+    /// response-only flags. Accepting those would widen what gets classified as
+    /// DNS -- the opposite of why this validator is end-to-end rather than a
+    /// header-flags check.
+    #[test]
+    fn header_fields_a_query_cannot_carry_are_rejected() {
+        let mut rng = ChaCha8Rng::seed_from_u64(14);
+        let good = generate("example.com", &mut rng)[0].clone();
+        assert!(question_end(&good).is_some(), "control");
+
+        // (byte offset, bits to set) -- simpler than boxed closures, and it is
+        // the byte being mangled that the failure message needs to name.
+        for (what, at, bits) in [
+            ("ANCOUNT != 0", 7usize, 0x01u8),
+            ("NSCOUNT != 0", 9, 0x01),
+            ("RA set", 3, 0x80),
+            ("Z set", 3, 0x40),
+            ("RCODE != 0", 3, 0x03),
+        ] {
+            let mut q = good.clone();
+            q[at] |= bits;
+            assert!(
+                question_end(&q).is_none(),
+                "{} is not a standard query",
+                what
+            );
+            assert!(servfail(&q).is_none(), "{} must not be answered", what);
+        }
+
+        // AD and CD are legal in a query (RFC 4035) and must still be accepted:
+        // refusing them would drop traffic from validating clients.
+        for (bit, what) in [(0x20u8, "AD"), (0x10u8, "CD")] {
+            let mut q = good.clone();
+            q[3] |= bit;
+            assert!(
+                question_end(&q).is_some(),
+                "{} is legal in a query and must be accepted",
+                what
+            );
+        }
+
+        // ARCOUNT is unconstrained: that is where an EDNS OPT record lives,
+        // including the one `fill_dns` hides ciphertext in.
+        let mut with_opt = good.clone();
+        with_opt[11] = 1;
+        with_opt.extend_from_slice(&[0x00, 0x00, 0x29, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+        assert!(question_end(&with_opt).is_some(), "EDNS OPT must be accepted");
     }
 
     /// Every non-`0b00` top-bit form is refused: compression pointer, extended
