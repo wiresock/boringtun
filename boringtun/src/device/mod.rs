@@ -647,7 +647,7 @@ impl Device {
         let probe_responder = config
             .probe_reply_bytes_per_sec
             .filter(|&rate| rate > 0)
-            .map(|rate| ProbeResponder::new(rate, &mut OsRng));
+            .map(ProbeResponder::new);
 
         let mut device = Device {
             queue: Arc::new(poll),

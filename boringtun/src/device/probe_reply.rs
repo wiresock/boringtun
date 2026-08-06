@@ -69,7 +69,7 @@ const _: () = assert!(MAX_REPLY_LEN < version_negotiation::MIN_INITIAL_DATAGRAM)
 /// Device-scoped state for answering probes.
 ///
 /// Exists so the reply path takes one parameter instead of three, and so the
-/// SOFTWARE value below can be chosen once per device rather than per reply.
+/// SOFTWARE value below is read once per device rather than per reply.
 pub(crate) struct ProbeResponder {
     budget: ProbeBudget,
     /// The SOFTWARE advertised in a STUN Binding Success.
@@ -79,18 +79,25 @@ pub(crate) struct ProbeResponder {
     /// both a duplicate and a mismatch: a device configured `ip=stun` would send
     /// checks announcing one of five stacks and answer as a hardcoded sixth.
     ///
-    /// Chosen **once per device**, not per reply. Under `ip=stun` this port is
-    /// an ICE agent, not a STUN server — ICE peers send Binding Requests to each
-    /// other and answer with Binding Success — and a single agent has one
-    /// SOFTWARE. Re-rolling it per reply would be the anomaly.
+    /// Chosen **once per process**, not per reply and not per device. Under
+    /// `ip=stun` this port is an ICE agent, not a STUN server — ICE peers send
+    /// Binding Requests to each other and answer with Binding Success — and a
+    /// single agent has one SOFTWARE. Re-rolling it per reply would be the
+    /// anomaly.
+    ///
+    /// `stun::host_software()` rather than a draw of this responder's own, so
+    /// the outbound Binding Requests announce the same stack this answers with.
+    /// A per-device draw was still half the fingerprint: the requests came from
+    /// `stun::generate`, which re-rolled per burst, so one host presented
+    /// several ICE stacks on the one port the connected per-peer sockets share.
     software: &'static str,
 }
 
 impl ProbeResponder {
-    pub(crate) fn new(bytes_per_sec: u32, rng: &mut impl RngCore) -> Self {
+    pub(crate) fn new(bytes_per_sec: u32) -> Self {
         Self {
             budget: ProbeBudget::new(bytes_per_sec),
-            software: stun::pick_software(rng),
+            software: stun::host_software(),
         }
     }
 }
@@ -312,7 +319,7 @@ mod tests {
     /// Large enough that no test hits the ceiling by accident; the tests that
     /// mean to exercise it build their own.
     fn responder() -> ProbeResponder {
-        ProbeResponder::new(1 << 20, &mut ChaCha8Rng::seed_from_u64(0))
+        ProbeResponder::new(1 << 20)
     }
 
     fn cfg(protocol: AmneziaImitationProtocol) -> AmneziaConfig {
@@ -621,7 +628,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(5);
         let query = dns_query();
         let reply_len = dns::servfail(&query).expect("answerable").len();
-        let r = ProbeResponder::new(reply_len as u32, &mut ChaCha8Rng::seed_from_u64(0));
+        let r = ProbeResponder::new(reply_len as u32);
         let from = peer("203.0.113.5:40000");
 
         // Wrong protocol: detected, never built, must not be charged.
@@ -658,7 +665,7 @@ mod tests {
 
         // Room for four replies a second. Refill over the microseconds this
         // loop takes is a fraction of a byte, so a fifth cannot slip through.
-        let r = ProbeResponder::new(4 * reply_len as u32, &mut ChaCha8Rng::seed_from_u64(0));
+        let r = ProbeResponder::new(4 * reply_len as u32);
         let admitted = (0..100)
             .filter(|_| {
                 reply_to(&query, from, AmneziaImitationProtocol::Dns, &r, &mut rng).is_some()
@@ -748,16 +755,28 @@ mod tests {
         // runtime assertion here would only be a lint about a constant.
     }
 
-    /// The STUN SOFTWARE comes from the shared pool, so the responder and the
-    /// outbound Binding Requests cannot announce different stacks — and it
-    /// varies across devices, so it is not a constant identifying this fork.
+    /// The STUN SOFTWARE is pinned for the process and comes from the shared
+    /// pool, so no two responders — and no responder and request generator —
+    /// announce different stacks.
+    ///
+    /// The "varies across hosts" half cannot be asserted here: within one test
+    /// binary there is one process and therefore one value, which is the property
+    /// under test. That half is
+    /// [`stun::tests::the_software_pool_is_not_effectively_a_constant`], on the
+    /// draw that seeds the pin.
     #[test]
-    fn the_stun_software_comes_from_the_shared_pool() {
+    fn the_stun_software_is_pinned_and_from_the_shared_pool() {
         let mut seen = std::collections::HashSet::new();
-        for seed in 0..64u64 {
-            let r = ProbeResponder::new(1 << 20, &mut ChaCha8Rng::seed_from_u64(seed));
-            seen.insert(r.software);
+        for _ in 0..64 {
+            seen.insert(ProbeResponder::new(1 << 20).software);
         }
+        assert_eq!(
+            seen.len(),
+            1,
+            "every responder in a process must announce one stack, saw {:?}",
+            seen
+        );
+
         let mut pool = std::collections::HashSet::new();
         for seed in 0..512u64 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -767,10 +786,6 @@ mod tests {
             seen.is_subset(&pool),
             "responder announced {:?}, which the request generator never sends",
             seen.difference(&pool).collect::<Vec<_>>()
-        );
-        assert!(
-            seen.len() > 1,
-            "the value must vary across devices, or it is a constant fingerprint"
         );
     }
 }
