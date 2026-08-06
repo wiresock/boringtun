@@ -1567,4 +1567,162 @@ mod ingress_tests {
             "a vanilla device must not be able to read an obfuscated initiation"
         );
     }
+
+    /// A handshake response must demux back to the peer that initiated it.
+    ///
+    /// This is the contract between `Tunn` and `Device`, and nothing in the
+    /// type system holds the two ends together: `Device::update_peer` keys
+    /// `peers_by_idx` by the 24-bit index from `IndexLfsr`, while ingress
+    /// recovers it with `peers_by_idx.get(&(receiver_idx >> 8))`. The low byte
+    /// belongs to `Handshake::inc_index`, which cycles it per session, so
+    /// `Tunn` has to seed the handshake with `index << 8`. Seeding it with a
+    /// bare `index` shifts the peer index out from under the lookup: every
+    /// response is dropped as "no peer", and an initiator can never complete a
+    /// handshake at all.
+    ///
+    /// A `Tunn`-to-`Tunn` test cannot see this. `handle_handshake_response`
+    /// matches the response against its own `local_index` directly and never
+    /// consults the device index, so a full handshake between two bare `Tunn`s
+    /// succeeds under either seeding -- which is how a suite of 100+ passing
+    /// tests coexisted with an initiator that could not connect to anything.
+    #[test]
+    fn handshake_response_demuxes_back_to_the_initiating_peer() {
+        // A realistic `IndexLfsr` output: 24 bits wide with a non-zero low
+        // byte, so an unshifted seed cannot coincidentally survive the `>> 8`.
+        const INITIATOR_IDX: u32 = 0x00B0_1B85;
+        const RESPONDER_IDX: u32 = 0x00C4_2A17;
+
+        let obf = ObfuscationRanges::default();
+        let amnezia = AmneziaConfig::default();
+
+        let initiator_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let responder_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let initiator_public = x25519::PublicKey::from(&initiator_secret);
+        let responder_public = x25519::PublicKey::from(&responder_secret);
+
+        let mut initiator = Tunn::new_with_obfuscation(
+            initiator_secret,
+            responder_public,
+            None,
+            None,
+            INITIATOR_IDX,
+            None,
+            obf,
+            amnezia.clone(),
+        )
+        .unwrap();
+        let mut responder = Tunn::new_with_obfuscation(
+            responder_secret,
+            initiator_public,
+            None,
+            None,
+            RESPONDER_IDX,
+            None,
+            obf,
+            amnezia,
+        )
+        .unwrap();
+
+        let mut init_buf = vec![0u8; MAX_UDP_SIZE];
+        let initiation = match initiator.format_handshake_initiation(&mut init_buf, false) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+
+        let mut resp_buf = vec![0u8; MAX_UDP_SIZE];
+        let parsed_init = Tunn::parse_incoming_packet(obf, &initiation)
+            .expect("the responder must parse the initiation");
+        let response = match responder.handle_verified_packet(parsed_init, &mut resp_buf) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected a handshake response, got {:?}", other),
+        };
+
+        let receiver_idx = match Tunn::parse_incoming_packet(obf, &response)
+            .expect("the initiator must parse the response")
+        {
+            Packet::HandshakeResponse(p) => p.receiver_idx,
+            other => panic!("expected a handshake response, got {:?}", other),
+        };
+
+        // Exactly what `register_udp_handler` does, against an index keyed
+        // exactly the way `Device::update_peer` keys it.
+        let peer = Arc::new(());
+        let mut peers_by_idx: HashMap<u32, Arc<()>> = HashMap::new();
+        peers_by_idx.insert(INITIATOR_IDX, Arc::clone(&peer));
+
+        assert!(
+            peers_by_idx.get(&(receiver_idx >> 8)).is_some(),
+            "response echoed sender index {:#x}, which reduces to {:#x}, but the \
+             device registered this peer under {:#x} -- the initiator will drop \
+             every response it receives",
+            receiver_idx,
+            receiver_idx >> 8,
+            INITIATOR_IDX,
+        );
+    }
+
+    /// The same invariant stated directly, across the width of the index space.
+    ///
+    /// Covers the initiation as well as the response, so it also pins the
+    /// responder's `peers_by_idx` lookup for cookie replies and transport data,
+    /// which key off the initiator's sender index the same way.
+    ///
+    /// Several indices rather than one: the low byte is what a missing shift
+    /// destroys, so an index whose low byte happens to be convenient could hide
+    /// it. `0xFF` wraps the session counter to zero, and `0xFF_FFFF` is the
+    /// widest value `IndexLfsr` can produce.
+    #[test]
+    fn a_tunns_wire_index_reduces_to_its_device_index() {
+        for peer_idx in [1u32, 0xFF, 0x0100, 0x00B0_1B85, 0x00FF_FFFF] {
+            let obf = ObfuscationRanges::default();
+            let peer_public = x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
+
+            let mut tunn = Tunn::new_with_obfuscation(
+                x25519::StaticSecret::random_from_rng(OsRng),
+                peer_public,
+                None,
+                None,
+                peer_idx,
+                None,
+                obf,
+                AmneziaConfig::default(),
+            )
+            .unwrap();
+
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            let initiation = match tunn.format_handshake_initiation(&mut buf, false) {
+                TunnResult::WriteToNetwork(d) => d.to_vec(),
+                other => panic!("expected an initiation, got {:?}", other),
+            };
+
+            match Tunn::parse_incoming_packet(obf, &initiation)
+                .expect("a freshly formatted initiation must parse")
+            {
+                Packet::HandshakeInit(_) => {}
+                other => panic!("expected an initiation, got {:?}", other),
+            }
+
+            // Bytes 4..8 are `sender_index`, little-endian, per the WireGuard
+            // message layout -- the same field `parse_incoming_packet` reads.
+            // Taken off the wire because `HandshakeInit::sender_idx` is private
+            // to `noise`, and built byte-wise because this crate is edition
+            // 2018, where `TryInto` is not in the prelude.
+            let sender_idx = u32::from_le_bytes([
+                initiation[4],
+                initiation[5],
+                initiation[6],
+                initiation[7],
+            ]);
+
+            assert_eq!(
+                sender_idx >> 8,
+                peer_idx,
+                "peer index {:#x} went onto the wire as {:#x}, which reduces to \
+                 {:#x} under the device's demux",
+                peer_idx,
+                sender_idx,
+                sender_idx >> 8,
+            );
+        }
+    }
 }

@@ -332,7 +332,13 @@ impl Tunn {
                 static_private,
                 static_public,
                 peer_static_public,
-                index,
+                // `index << 8`, not `index`: the low byte is the cyclic session
+                // counter `Handshake::inc_index` advances, so the device's peer
+                // index has to sit in the top 24 bits. `Device` demuxes every
+                // inbound response, cookie and data packet with
+                // `peers_by_idx.get(&(receiver_idx >> 8))`, and that only finds
+                // the peer if the index on the wire was seeded shifted.
+                index << 8,
                 preshared_key,
                 obf,
             )?,
