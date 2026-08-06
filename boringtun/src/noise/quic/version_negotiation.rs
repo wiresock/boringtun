@@ -26,20 +26,27 @@
 
 use rand_core::RngCore;
 
-/// RFC 9000 §17.2: **in QUIC version 1** a connection ID is at most 20 bytes,
-/// and an endpoint that receives a longer version 1 long header MUST drop the
-/// packet.
+/// RFC 9000 §17.2: a connection ID is at most 20 bytes, and an endpoint that
+/// receives a longer long header for such a version MUST drop the packet.
 ///
-/// The bound is version-specific and deliberately applied only to the versions
-/// it governs. RFC 8999 §5.1 gives every other version the full 0..=255 the
-/// 8-bit length field can express, RFC 9000 §17.2 asks servers to "be able to
-/// read longer connection IDs from other QUIC versions" precisely so they can
-/// form a Version Negotiation packet, and §17.2.1 makes it normative:
-/// "Version-specific rules for the connection ID therefore MUST NOT influence a
-/// decision about whether to send a Version Negotiation packet." Enforcing 20
-/// bytes unconditionally would apply it to *exactly* the versions this module
-/// answers, since v1 and v2 are refused before a reply is built.
-pub(crate) const MAX_V1_CID_LEN: usize = 20;
+/// Named for the document that defines it rather than for a single version,
+/// because it governs **v1 and v2 alike**. RFC 9369 §3 changes only the version
+/// field, the long-header packet types and the crypto parameters, and is
+/// otherwise explicit that "QUIC version 2 endpoints MUST implement the QUIC
+/// version 1 specification", so v2 inherits this bound. That is why
+/// [`parse_long_header`] applies it to both — matching
+/// [`REAL_SERVER_VERSIONS`], not a v1-only test.
+///
+/// It is not applied to any other version, and that is the point. RFC 8999 §5.1
+/// gives every other version the full 0..=255 the 8-bit length field can
+/// express, RFC 9000 §17.2 asks servers to "be able to read longer connection
+/// IDs from other QUIC versions" precisely so they can form a Version
+/// Negotiation packet, and §17.2.1 makes it normative: "Version-specific rules
+/// for the connection ID therefore MUST NOT influence a decision about whether
+/// to send a Version Negotiation packet." Enforcing 20 bytes unconditionally
+/// would apply it to *exactly* the versions this module answers, since v1 and
+/// v2 are refused before a reply is built.
+pub(crate) const RFC9000_MAX_CID_LEN: usize = 20;
 
 /// RFC 9000 §14.1: a client's Initial datagram must be at least 1200 bytes, and
 /// a server must not act on a smaller one (§5.2.2: "Servers MUST drop smaller
@@ -122,18 +129,18 @@ pub(crate) fn parse_long_header(data: &[u8]) -> Option<LongHeader<'_>> {
     if !is_known_version(version) {
         return None;
     }
-    // See [`MAX_V1_CID_LEN`]: the 20-byte cap is a version 1 rule, and applying
+    // See [`RFC9000_MAX_CID_LEN`]: the 20-byte cap is a version 1 rule, and applying
     // it to a draft or GREASE version would gate the VN decision on a
     // version-specific rule that RFC 9000 §17.2.1 says MUST NOT gate it.
     let capped = is_supported_by_real_servers(version);
 
     let dcid_len = data[5] as usize;
-    if capped && dcid_len > MAX_V1_CID_LEN {
+    if capped && dcid_len > RFC9000_MAX_CID_LEN {
         return None;
     }
     let dcid_end = 6usize.checked_add(dcid_len)?;
     let scid_len = *data.get(dcid_end)? as usize;
-    if capped && scid_len > MAX_V1_CID_LEN {
+    if capped && scid_len > RFC9000_MAX_CID_LEN {
         return None;
     }
     let scid_start = dcid_end.checked_add(1)?;
@@ -240,7 +247,7 @@ mod tests {
             "RFC 9000 §14.1: the smallest allowed maximum datagram size"
         );
         assert_eq!(
-            MAX_V1_CID_LEN, 20,
+            RFC9000_MAX_CID_LEN, 20,
             "RFC 9000 §17.2: the version 1 connection-ID bound"
         );
     }
@@ -432,7 +439,7 @@ mod tests {
             assert_eq!(
                 parse_long_header(&p),
                 None,
-                "{v:#010x}: a 21-byte DCID is not a valid version 1 long header"
+                "{v:#010x}: a 21-byte DCID exceeds the RFC 9000 bound, which v2 inherits"
             );
             let p = initial(v, &[3], &long_cid, 1200);
             assert_eq!(parse_long_header(&p), None, "{v:#010x}: likewise the SCID");

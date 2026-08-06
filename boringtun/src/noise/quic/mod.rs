@@ -9,7 +9,8 @@
 //!
 //! Client-side DPI camouflage: boringtun never decrypts the emitted packets, so
 //! only the *client* Initial key schedule (RFC 9001) is implemented. (The one
-//! server-side packet here, [`version_negotiation`], carries no payload and so
+//! server-side packet here, [`version_negotiation::version_negotiation`],
+//! carries no payload and so
 //! needs no key schedule.) The aim is **fingerprint parity**: the bytes a DPI
 //! classifier
 //! keys on (cipher suites, supported groups, key shares, signature algorithms,
