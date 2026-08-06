@@ -14,6 +14,7 @@
 use super::random_token;
 use rand_core::RngCore;
 use ring::hmac;
+use std::net::SocketAddr;
 
 /// Plausible SOFTWARE values; deliberately generic ICE/VoIP stacks, never a
 /// product-specific string that would itself be a fingerprint.
@@ -28,7 +29,19 @@ const SOFTWARE_POOL: [&str; 5] = [
 const HEADER_LEN: usize = 20;
 const MI_ATTR_LEN: usize = 4 + 20; // type+len + HMAC-SHA1
 const FP_ATTR_LEN: usize = 4 + 4; // type+len + CRC-32
-const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+/// RFC 8489 §5, and the crate's single definition of it.
+///
+/// `pub(crate)` because three modules need it: this one to frame requests and
+/// responses, `imitation::detect` to gate the DNS arm, and `noise::amnezia`
+/// for the S-padding filler. Each used to restate the value. A second copy of
+/// a constant is the same drift risk as a second copy of a rule, just slower
+/// to notice.
+///
+/// Correctness is pinned separately, by a test asserting the literal bytes on
+/// a generated packet. Deriving everything from one place makes the copies
+/// consistent; it cannot make them right.
+pub(crate) const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
+const BINDING_REQUEST: u16 = 0x0001;
 
 struct BindingRequest<'a> {
     software: &'a str,
@@ -170,6 +183,251 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
     vec![first, second]
 }
 
+// The response side has no caller yet -- the ingress hook that will reach it
+// is the next commit. Scoped to these items rather than the module, so the
+// request side stays covered by the lint.
+
+/// Validate `data` as a well-framed STUN Binding Request and return the
+/// declared attribute length.
+///
+/// One function so the classifier and the responder cannot disagree. They did:
+/// `detect` enforced 32-bit alignment and `binding_success` did not, so a
+/// misaligned-length request was answered by the half that emits bytes and
+/// dropped by the half that decides whether to look. Three review rounds found
+/// three separate instances of that same asymmetry, which is a sign the checks
+/// wanted to be one thing rather than two lists kept in step by hand.
+///
+/// RFC 8489 §5: the length excludes the 20-byte header, and "since all STUN
+/// attributes are padded to a multiple of 4 bytes, the last 2 bits of this
+/// field are always zero". §6.3 has a receiver check "that the message length
+/// is sensible" before anything else.
+pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
+    if data.len() < HEADER_LEN {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    if msg_type != BINDING_REQUEST {
+        return None;
+    }
+    if data[4..8] != MAGIC_COOKIE {
+        return None;
+    }
+    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if !msg_len.is_multiple_of(4) || data.len() != HEADER_LEN + msg_len {
+        return None;
+    }
+    Some(msg_len)
+}
+
+/// What `msg` carries in place of a FINGERPRINT attribute.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fingerprint {
+    /// The attribute list tiles the message exactly and carries no
+    /// FINGERPRINT. Nothing to echo, nothing to check.
+    Absent,
+    /// Present, last, four bytes, and the CRC matches.
+    Valid,
+    /// Either a FINGERPRINT that is wrong or misplaced, or an attribute list
+    /// that does not tile the message. RFC 5389 §15.5: an agent receiving a
+    /// message whose FINGERPRINT is incorrect MUST discard it -- and a message
+    /// whose attributes overrun their own length is malformed regardless.
+    Invalid,
+}
+
+/// Classify `msg`'s FINGERPRINT attribute.
+///
+/// Presence alone is not enough. A real STUN stack validates the CRC and drops
+/// the message when it fails, so a responder that answers a deliberately
+/// corrupted FINGERPRINT is distinguishable from a real server in one packet --
+/// which is the whole thing this is trying not to be.
+///
+/// Parsing attacker-controlled bytes, so every step is bounds-checked and a
+/// length that overruns the buffer ends the walk: a bad length is not a reason
+/// to keep guessing at offsets.
+///
+/// `msg.len()` is the authoritative end of the message here because
+/// [`binding_success`] has already checked it equals `HEADER_LEN + msg_len`.
+/// Calling this on an unvalidated datagram would let trailing bytes change
+/// which attribute counts as last.
+#[allow(dead_code)]
+fn check_fingerprint(msg: &[u8]) -> Fingerprint {
+    let mut off = HEADER_LEN;
+    while off + 4 <= msg.len() {
+        let attr_type = u16::from_be_bytes([msg[off], msg[off + 1]]);
+        let attr_len = u16::from_be_bytes([msg[off + 2], msg[off + 3]]) as usize;
+
+        if attr_type == 0x8028 {
+            // RFC 5389 §15.5: four bytes, and the last attribute in the
+            // message. Anything else is malformed rather than merely unusual.
+            if attr_len != 4 || off + FP_ATTR_LEN != msg.len() {
+                return Fingerprint::Invalid;
+            }
+            let expected = crc32_ieee(&msg[..off]) ^ 0x5354_554e;
+            let got = u32::from_be_bytes([msg[off + 4], msg[off + 5], msg[off + 6], msg[off + 7]]);
+            return if got == expected {
+                Fingerprint::Valid
+            } else {
+                Fingerprint::Invalid
+            };
+        }
+
+        // Malformed framing is Invalid, not Absent. Ending the walk with
+        // "no FINGERPRINT here" would let a bogus attribute length placed
+        // *before* a corrupt FINGERPRINT stop the walk before reaching it, so
+        // the corrupt one is never examined and the request gets answered --
+        // bypassing the discard rule entirely. A real agent discards a message
+        // whose attributes do not tile it.
+        let advance = match padded(attr_len).checked_add(4) {
+            Some(a) => a,
+            None => return Fingerprint::Invalid,
+        };
+        off = match off.checked_add(advance) {
+            Some(o) if o <= msg.len() => o,
+            _ => return Fingerprint::Invalid,
+        };
+    }
+    Fingerprint::Absent
+}
+
+/// Upper bound on the SOFTWARE value this encoder will emit, in bytes.
+///
+/// Two jobs. It keeps `software.len() as u16` and the message-length cast
+/// lossless by construction rather than by assumption -- the failure this
+/// branch has now hit twice, where a limit was documented and never enforced.
+/// And it keeps what we emit inside the spec's limit, which is expressed in
+/// *characters* (fewer than 128) rather than bytes: every value we pass comes
+/// from `SOFTWARE_POOL` and is short ASCII, so 127 bytes is 127 characters and
+/// satisfies "fewer than 128" exactly. 128 would have permitted a value the
+/// spec forbids.
+///
+/// Deliberately not derived from a byte figure. The character-to-byte
+/// conversion depends on which UTF-8 revision the reader has in mind, and being
+/// stricter than necessary on a value we choose ourselves costs nothing.
+const MAX_SOFTWARE_LEN: usize = 127;
+
+#[allow(dead_code)]
+/// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
+///
+/// The port is XORed with the top half of the magic cookie and the address with
+/// the cookie itself; IPv6 continues the XOR into the transaction id, which is
+/// why the id has to be passed in rather than read back from the header.
+fn write_xor_mapped_address(pkt: &mut [u8], off: usize, client: SocketAddr, trans_id: &[u8; 12]) {
+    let cookie = u32::from_be_bytes(MAGIC_COOKIE);
+    let x_port = client.port() ^ (cookie >> 16) as u16;
+
+    match client {
+        SocketAddr::V4(v4) => {
+            write_tlv(pkt, off, 0x0020, 8);
+            pkt[off + 4] = 0;
+            pkt[off + 5] = 0x01; // IPv4
+            pkt[off + 6..off + 8].copy_from_slice(&x_port.to_be_bytes());
+            let x_addr = u32::from(*v4.ip()) ^ cookie;
+            pkt[off + 8..off + 12].copy_from_slice(&x_addr.to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            write_tlv(pkt, off, 0x0020, 20);
+            pkt[off + 4] = 0;
+            pkt[off + 5] = 0x02; // IPv6
+            pkt[off + 6..off + 8].copy_from_slice(&x_port.to_be_bytes());
+            let mut key = [0u8; 16];
+            key[..4].copy_from_slice(&MAGIC_COOKIE);
+            key[4..].copy_from_slice(trans_id);
+            let addr = v6.ip().octets();
+            for i in 0..16 {
+                pkt[off + 8 + i] = addr[i] ^ key[i];
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+/// Attribute size of XOR-MAPPED-ADDRESS for this address family.
+fn xor_mapped_len(client: SocketAddr) -> usize {
+    4 + if client.is_ipv4() { 8 } else { 20 }
+}
+
+#[allow(dead_code)]
+/// Build a Binding Success Response to `request`, reporting `client` as the
+/// reflexive address.
+///
+/// Returns `None` if `request` is not a Binding Request this should answer.
+///
+/// **Presents as an unauthenticated public STUN server**, which is the
+/// deployment that answers Binding Requests from strangers at all — the kind a
+/// prober would expect to find. So a MESSAGE-INTEGRITY attribute in the request
+/// is ignored rather than answered with 401: we hold no credential, and a
+/// server that demanded one would refuse every unauthenticated check, which no
+/// public STUN server does.
+///
+/// FINGERPRINT is echoed when the request carries a *valid* one, because RFC
+/// 5389 §15.5 requires it and its absence is a one-attribute tell. A request
+/// whose FINGERPRINT is present but wrong gets no answer at all: a real stack
+/// discards such a message, so replying would distinguish us in one packet.
+///
+/// **Size**: 20-byte header + 12 (IPv4) or 24 (IPv6) + SOFTWARE + 8 if
+/// FINGERPRINT. Against a minimal 20-byte Binding Request that is larger than
+/// the request; against a real ICE connectivity check — which carries SOFTWARE,
+/// USERNAME, PRIORITY, ICE-CONTROLLING, MESSAGE-INTEGRITY and FINGERPRINT — it
+/// is smaller. The caller decides whether a given ratio is acceptable; this
+/// function does not send.
+pub(crate) fn binding_success(
+    request: &[u8],
+    client: SocketAddr,
+    software: &str,
+) -> Option<Vec<u8>> {
+    // Shared with `detect`, so the two cannot drift apart again.
+    binding_request_len(request)?;
+    let mut trans_id = [0u8; 12];
+    trans_id.copy_from_slice(&request[8..20]);
+
+    // A wrong FINGERPRINT means a real server would have discarded this, so
+    // answering it is a distinguisher. Silence is the correct imitation.
+    let echo_fingerprint = match check_fingerprint(request) {
+        Fingerprint::Absent => false,
+        Fingerprint::Valid => true,
+        Fingerprint::Invalid => return None,
+    };
+
+    // Keeps every `as u16` below lossless. A truncated SOFTWARE length would
+    // frame the attribute wrongly and the whole message with it.
+    if software.len() > MAX_SOFTWARE_LEN {
+        return None;
+    }
+    let software_padded = padded(software.len());
+    let attrs_len = xor_mapped_len(client)
+        + (4 + software_padded)
+        + if echo_fingerprint { FP_ATTR_LEN } else { 0 };
+
+    // Zero-initialised: attribute padding bytes must be zero for the CRC.
+    // `attrs_len` is bounded by MAX_SOFTWARE_LEN plus two fixed attributes, so
+    // it fits u16 by construction -- asserted rather than assumed.
+    debug_assert!(attrs_len <= u16::MAX as usize);
+    let mut pkt = vec![0u8; HEADER_LEN + attrs_len];
+    pkt[0..2].copy_from_slice(&0x0101u16.to_be_bytes()); // Binding Success
+    pkt[2..4].copy_from_slice(&(attrs_len as u16).to_be_bytes());
+    pkt[4..8].copy_from_slice(&MAGIC_COOKIE);
+    pkt[8..20].copy_from_slice(&trans_id);
+
+    let mut off = HEADER_LEN;
+    write_xor_mapped_address(&mut pkt, off, client, &trans_id);
+    off += xor_mapped_len(client);
+
+    write_tlv(&mut pkt, off, 0x8022, software.len() as u16); // SOFTWARE
+    pkt[off + 4..off + 4 + software.len()].copy_from_slice(software.as_bytes());
+    off += 4 + software_padded;
+
+    if echo_fingerprint {
+        // RFC 5389 §15.5: computed with the length field already covering the
+        // FINGERPRINT attribute, which it does -- `attrs_len` included it.
+        let crc = crc32_ieee(&pkt[..off]) ^ 0x5354_554e;
+        write_tlv(&mut pkt, off, 0x8028, 4);
+        pkt[off + 4..off + 8].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    Some(pkt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +519,363 @@ mod tests {
         verify_packet(&packets[1], &ice_pwd, true);
         // The two checks use distinct transaction ids.
         assert_ne!(packets[0][8..20], packets[1][8..20]);
+    }
+
+    fn parse_attrs(msg: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut off = HEADER_LEN;
+        while off + 4 <= msg.len() {
+            let t = u16::from_be_bytes([msg[off], msg[off + 1]]);
+            let l = u16::from_be_bytes([msg[off + 2], msg[off + 3]]) as usize;
+            let end = off + 4 + l;
+            if end > msg.len() {
+                break;
+            }
+            out.push((t, msg[off + 4..end].to_vec()));
+            off += 4 + padded(l);
+        }
+        out
+    }
+
+    /// Answering our own client's ICE check is the realistic case: the request
+    /// carries FINGERPRINT, so the response must too.
+    #[test]
+    fn binding_success_answers_our_own_connectivity_check() {
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let request = &generate(&mut rng)[0];
+        let client: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+
+        let resp = binding_success(request, client, "Chromium").expect("must answer");
+
+        assert_eq!(&resp[0..2], &0x0101u16.to_be_bytes(), "Binding Success");
+        assert_eq!(&resp[4..8], &MAGIC_COOKIE, "magic cookie");
+        assert_eq!(&resp[8..20], &request[8..20], "transaction id echoed");
+        assert_eq!(
+            u16::from_be_bytes([resp[2], resp[3]]) as usize,
+            resp.len() - HEADER_LEN,
+            "length field covers exactly the attributes"
+        );
+
+        let attrs = parse_attrs(&resp);
+        let types: Vec<u16> = attrs.iter().map(|(t, _)| *t).collect();
+        assert!(types.contains(&0x0020), "XOR-MAPPED-ADDRESS present");
+        assert!(types.contains(&0x8022), "SOFTWARE present");
+        assert!(
+            types.contains(&0x8028),
+            "FINGERPRINT must be echoed when the request carries one (RFC 5389 s15.5)"
+        );
+    }
+
+    /// The reflexive address is the point of the response: a client reads its
+    /// own public address out of it, so a wrong XOR is not cosmetic.
+    #[test]
+    fn xor_mapped_address_decodes_back_to_the_client() {
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        let request = &generate(&mut rng)[0];
+
+        for addr in ["198.51.100.42:1234", "[2001:db8::dead:beef]:4321"] {
+            let client: SocketAddr = addr.parse().unwrap();
+            let resp = binding_success(request, client, "Mozilla").unwrap();
+            let attrs = parse_attrs(&resp);
+            let (_, v) = attrs.iter().find(|(t, _)| *t == 0x0020).expect("XMA");
+
+            let cookie = u32::from_be_bytes(MAGIC_COOKIE);
+            let port = u16::from_be_bytes([v[2], v[3]]) ^ (cookie >> 16) as u16;
+            assert_eq!(port, client.port(), "port for {addr}");
+
+            match client {
+                SocketAddr::V4(v4) => {
+                    assert_eq!(v[1], 0x01, "family");
+                    let x = u32::from_be_bytes([v[4], v[5], v[6], v[7]]);
+                    assert_eq!(std::net::Ipv4Addr::from(x ^ cookie), *v4.ip());
+                }
+                SocketAddr::V6(v6) => {
+                    assert_eq!(v[1], 0x02, "family");
+                    let mut key = [0u8; 16];
+                    key[..4].copy_from_slice(&MAGIC_COOKIE);
+                    key[4..].copy_from_slice(&resp[8..20]);
+                    let mut out = [0u8; 16];
+                    for i in 0..16 {
+                        out[i] = v[4 + i] ^ key[i];
+                    }
+                    assert_eq!(std::net::Ipv6Addr::from(out), *v6.ip());
+                }
+            }
+        }
+    }
+
+    /// A FINGERPRINT that is present but wrong is a worse tell than one that is
+    /// absent: any real STUN stack validates it and drops the message. Checked
+    /// with the same CRC the request-side test uses.
+    #[test]
+    fn echoed_fingerprint_validates() {
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let request = &generate(&mut rng)[0];
+
+        for addr in ["203.0.113.9:1", "[2001:db8::1]:65535"] {
+            let client: SocketAddr = addr.parse().unwrap();
+            let resp = binding_success(request, client, "PJSIP 2.13.0").unwrap();
+
+            let fp_off = resp.len() - FP_ATTR_LEN;
+            assert_eq!(
+                be16(&resp[fp_off..]),
+                0x8028,
+                "FINGERPRINT must be the last attribute"
+            );
+            let expected = crc32_ieee(&resp[..fp_off]) ^ 0x5354_554e;
+            let got = u32::from_be_bytes([
+                resp[fp_off + 4],
+                resp[fp_off + 5],
+                resp[fp_off + 6],
+                resp[fp_off + 7],
+            ]);
+            assert_eq!(got, expected, "FINGERPRINT CRC for {addr}");
+        }
+    }
+
+    /// A bare Binding Request without FINGERPRINT must not gain one: echoing an
+    /// attribute the peer did not send is as much a tell as omitting one it did.
+    #[test]
+    fn fingerprint_is_echoed_only_when_requested() {
+        let mut bare = vec![0u8; HEADER_LEN];
+        bare[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        bare[2..4].copy_from_slice(&0u16.to_be_bytes()); // no attributes
+        bare[4..8].copy_from_slice(&MAGIC_COOKIE);
+        bare[8..20].copy_from_slice(&[0xAB; 12]);
+
+        let client: SocketAddr = "192.0.2.1:9999".parse().unwrap();
+        let resp = binding_success(&bare, client, "libnice 0.1.21").unwrap();
+        let types: Vec<u16> = parse_attrs(&resp).iter().map(|(t, _)| *t).collect();
+        assert!(!types.contains(&0x8028), "no FINGERPRINT was requested");
+    }
+
+    /// A real STUN stack validates FINGERPRINT and discards the message when it
+    /// fails (RFC 5389 §15.5). Answering a deliberately corrupted one would
+    /// distinguish us from a real server in a single packet, which is precisely
+    /// what a prober is looking for.
+    #[test]
+    fn a_corrupt_fingerprint_gets_no_answer() {
+        let mut rng = ChaCha8Rng::seed_from_u64(21);
+        let request = generate(&mut rng)[0].clone();
+        let client: SocketAddr = "203.0.113.5:443".parse().unwrap();
+
+        // Intact: answered, and the request-side FP really is valid.
+        assert_eq!(check_fingerprint(&request), Fingerprint::Valid);
+        assert!(binding_success(&request, client, "Chromium").is_some());
+
+        // One bit flipped in the CRC: a real server drops it, so must we.
+        let mut corrupt = request.clone();
+        let n = corrupt.len();
+        corrupt[n - 1] ^= 0x01;
+        assert_eq!(check_fingerprint(&corrupt), Fingerprint::Invalid);
+        assert!(
+            binding_success(&corrupt, client, "Chromium").is_none(),
+            "a wrong FINGERPRINT must produce silence, not a reply"
+        );
+
+        // Present but not last: also malformed per §15.5.
+        let mut trailing = request.clone();
+        trailing.extend_from_slice(&[0u8; 4]);
+        assert_eq!(check_fingerprint(&trailing), Fingerprint::Invalid);
+        assert!(binding_success(&trailing, client, "Chromium").is_none());
+    }
+
+    /// `software.len()` and the message length are cast to `u16`. An oversized
+    /// value would truncate and frame the packet wrongly, so it is refused --
+    /// the same shape as the budget rate that was documented but unenforced.
+    #[test]
+    fn an_oversized_software_value_is_refused() {
+        let mut rng = ChaCha8Rng::seed_from_u64(22);
+        let request = &generate(&mut rng)[0];
+        let client: SocketAddr = "192.0.2.8:1".parse().unwrap();
+
+        let at_limit = "s".repeat(MAX_SOFTWARE_LEN);
+        assert!(binding_success(request, client, &at_limit).is_some());
+
+        let over = "s".repeat(MAX_SOFTWARE_LEN + 1);
+        assert!(
+            binding_success(request, client, &over).is_none(),
+            "an oversized SOFTWARE must be refused, not silently truncated"
+        );
+
+        // Literals, not `MAX_SOFTWARE_LEN`: the assertions above move with the
+        // constant, so they prove the bound is enforced but not that it is the
+        // right number. The spec limit is "fewer than 128 characters", and our
+        // values are ASCII, so 127 bytes must pass and 128 must not. Raising
+        // the constant to 128 leaves every symbolic assertion green.
+        assert!(
+            binding_success(request, client, &"s".repeat(127)).is_some(),
+            "127 ASCII characters is within \"fewer than 128\""
+        );
+        assert!(
+            binding_success(request, client, &"s".repeat(128)).is_none(),
+            "128 characters is not \"fewer than 128\""
+        );
+    }
+
+    /// RFC 8489 §6.3 has a receiver check "that the message length is sensible"
+    /// before anything else, so a datagram whose length field disagrees with its
+    /// size is discarded by a real agent. Answering one would be a distinguisher,
+    /// and it would also move where `check_fingerprint` thinks the message ends.
+    ///
+    /// `detect` already required this exact equality for STUN; the responder was
+    /// the looser of the two, which is the wrong way round.
+    ///
+    /// Built **without** a FINGERPRINT on purpose. My first version of this test
+    /// used a real ICE check and passed even with the length validation removed,
+    /// because the FINGERPRINT "must be last" rule caught both cases first. With
+    /// no FINGERPRINT present, only the length check can reject these.
+    #[test]
+    fn a_message_length_that_disagrees_with_the_datagram_gets_no_answer() {
+        let client: SocketAddr = "198.51.100.3:5060".parse().unwrap();
+
+        // A well-framed bare Binding Request: no attributes, length 0.
+        let mut bare = vec![0u8; HEADER_LEN];
+        bare[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        bare[2..4].copy_from_slice(&0u16.to_be_bytes());
+        bare[4..8].copy_from_slice(&MAGIC_COOKIE);
+        bare[8..20].copy_from_slice(&[0x5A; 12]);
+        assert_eq!(
+            check_fingerprint(&bare),
+            Fingerprint::Absent,
+            "no FP to hide behind"
+        );
+        assert!(
+            binding_success(&bare, client, "Chromium").is_some(),
+            "control"
+        );
+
+        // Trailing byte: longer than the header declares.
+        let mut trailing = bare.clone();
+        trailing.push(0);
+        assert!(
+            binding_success(&trailing, client, "Chromium").is_none(),
+            "a datagram longer than its declared length must be discarded"
+        );
+
+        // Length field overstates a payload that is not there.
+        let mut overstated = bare.clone();
+        overstated[2..4].copy_from_slice(&8u16.to_be_bytes());
+        assert!(
+            binding_success(&overstated, client, "Chromium").is_none(),
+            "a length field larger than the datagram must be discarded"
+        );
+    }
+
+    /// STUN lengths are 32-bit aligned (RFC 8489 §5: "the last 2 bits of this
+    /// field are always zero"). `detect` enforced that and `binding_success` did
+    /// not, so a misaligned request was answered by the half that emits bytes
+    /// and dropped by the half that decides whether to look. Both now go through
+    /// `binding_request_len`, so this asserts they agree rather than asserting
+    /// each separately.
+    #[test]
+    fn a_misaligned_length_is_rejected_by_both_halves() {
+        use crate::noise::imitation::detect::{detect, Probe};
+
+        let mut m = vec![0u8; HEADER_LEN + 6];
+        m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        m[2..4].copy_from_slice(&6u16.to_be_bytes()); // 6 is not a multiple of 4
+        m[4..8].copy_from_slice(&MAGIC_COOKIE);
+
+        assert!(
+            binding_request_len(&m).is_none(),
+            "a length that is not 32-bit aligned is malformed"
+        );
+        let client: SocketAddr = "192.0.2.4:1".parse().unwrap();
+        assert!(
+            binding_success(&m, client, "x").is_none(),
+            "responder refuses"
+        );
+        assert_ne!(detect(&m), Some(Probe::Stun), "classifier refuses");
+
+        // The same datagram with an aligned length is accepted by both.
+        let mut ok = vec![0u8; HEADER_LEN + 8];
+        ok[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        ok[2..4].copy_from_slice(&8u16.to_be_bytes());
+        ok[4..8].copy_from_slice(&MAGIC_COOKIE);
+        assert!(binding_request_len(&ok).is_some());
+        assert_eq!(detect(&ok), Some(Probe::Stun));
+        assert!(binding_success(&ok, client, "x").is_some());
+    }
+
+    /// The "drop an invalid FINGERPRINT" rule must not be bypassable by putting a
+    /// malformed attribute in front of it. Treating a bad attribute length as
+    /// "no FINGERPRINT here" ends the walk early, so the corrupt FINGERPRINT
+    /// after it is never examined and the request gets answered.
+    #[test]
+    fn a_malformed_attribute_cannot_shield_a_corrupt_fingerprint() {
+        let client: SocketAddr = "192.0.2.9:1".parse().unwrap();
+
+        // 8 bytes of bogus attribute (claiming 0xFFFF) then 8 bytes of
+        // FINGERPRINT carrying a CRC that is certainly wrong.
+        let attrs = 8 + FP_ATTR_LEN;
+        let mut m = vec![0u8; HEADER_LEN + attrs];
+        m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        m[2..4].copy_from_slice(&(attrs as u16).to_be_bytes());
+        m[4..8].copy_from_slice(&MAGIC_COOKIE);
+        m[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0x0006u16.to_be_bytes());
+        m[HEADER_LEN + 2..HEADER_LEN + 4].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        let fp = HEADER_LEN + 8;
+        m[fp..fp + 2].copy_from_slice(&0x8028u16.to_be_bytes());
+        m[fp + 2..fp + 4].copy_from_slice(&4u16.to_be_bytes());
+        m[fp + 4..fp + 8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+
+        assert_eq!(
+            check_fingerprint(&m),
+            Fingerprint::Invalid,
+            "a malformed attribute list is malformed, not FINGERPRINT-free"
+        );
+        assert!(
+            binding_success(&m, client, "x").is_none(),
+            "a malformed attribute must not shield a corrupt FINGERPRINT"
+        );
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_binding_request() {
+        let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        // Too short.
+        assert!(binding_success(&[0u8; 19], client, "x").is_none());
+        // Right length, wrong message type (a Binding *Success*, not a request).
+        let mut resp_shaped = vec![0u8; HEADER_LEN];
+        resp_shaped[0..2].copy_from_slice(&0x0101u16.to_be_bytes());
+        resp_shaped[4..8].copy_from_slice(&MAGIC_COOKIE);
+        assert!(
+            binding_success(&resp_shaped, client, "x").is_none(),
+            "answering our own response shape would be a reflection loop"
+        );
+        // Right type, no magic cookie.
+        let mut no_cookie = vec![0u8; HEADER_LEN];
+        no_cookie[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+        assert!(binding_success(&no_cookie, client, "x").is_none());
+    }
+
+    /// `check_fingerprint` walks attacker-controlled bytes. A length that
+    /// overruns the buffer must end the walk without wrapping or indexing out
+    /// of bounds -- and the message must then be refused, because attributes
+    /// that do not tile the message are malformed.
+    ///
+    /// This test previously asserted the request was *answered*, which pinned
+    /// the very defect review found: it was written to prove "does not panic"
+    /// and quietly also asserted "replies", so the bypass looked like intended
+    /// behaviour.
+    #[test]
+    fn a_malformed_attribute_length_is_refused_without_panicking() {
+        let client: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let mut m = vec![0u8; HEADER_LEN + 8];
+        m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+        // Header length is correct -- 8 bytes of attributes follow. It is the
+        // *attribute* length that is malformed, which is the thing under test.
+        m[2..4].copy_from_slice(&8u16.to_be_bytes());
+        m[4..8].copy_from_slice(&MAGIC_COOKIE);
+        // An attribute claiming 0xFFFF bytes inside a 28-byte datagram.
+        m[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0x0006u16.to_be_bytes());
+        m[HEADER_LEN + 2..HEADER_LEN + 4].copy_from_slice(&0xFFFFu16.to_be_bytes());
+
+        assert_eq!(check_fingerprint(&m), Fingerprint::Invalid);
+        assert!(
+            binding_success(&m, client, "x").is_none(),
+            "attributes that do not tile the message are malformed"
+        );
     }
 }

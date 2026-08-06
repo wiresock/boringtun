@@ -69,8 +69,11 @@ impl Probe {
     }
 }
 
-const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
-const STUN_BINDING_REQUEST: u16 = 0x0001;
+/// Derived from [`super::stun::MAGIC_COOKIE`], not restated. Used only to gate
+/// the DNS arm below -- a datagram carrying the STUN cookie is not a DNS
+/// query whatever else it is. The Binding-Request framing rules live in
+/// `stun::binding_request_len`, not here.
+const STUN_MAGIC_COOKIE: u32 = u32::from_be_bytes(super::stun::MAGIC_COOKIE);
 /// RFC 9000 §17.2: a connection ID is at most 20 bytes.
 const QUIC_MAX_CID_LEN: usize = 20;
 
@@ -213,21 +216,13 @@ pub(crate) fn detect(data: &[u8]) -> Option<Probe> {
         }
     }
 
-    // STUN Binding Request (RFC 5389 / 8489): 20-byte header, top two
-    // message-type bits clear, 32-bit-aligned length that accounts for the
-    // whole datagram, and the magic cookie.
+    // The framing rules live in `stun::binding_request_len`, shared with the
+    // responder. Keeping a second copy here is what let the two drift: the
+    // classifier enforced 32-bit alignment and the responder did not.
     let has_stun_cookie = data.len() >= 8
         && u32::from_be_bytes([data[4], data[5], data[6], data[7]]) == STUN_MAGIC_COOKIE;
-    if data.len() >= 20 && has_stun_cookie {
-        let msg_type = u16::from_be_bytes([data[0], data[1]]);
-        let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-        if msg_type & 0xC000 == 0
-            && msg_type == STUN_BINDING_REQUEST
-            && msg_len.is_multiple_of(4)
-            && data.len() == 20 + msg_len
-        {
-            return Some(Probe::Stun);
-        }
+    if super::stun::binding_request_len(data).is_some() {
+        return Some(Probe::Stun);
     }
 
     if !has_stun_cookie && is_plausible_dns_query(data) {
