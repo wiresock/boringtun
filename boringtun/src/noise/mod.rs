@@ -4,11 +4,15 @@
 pub mod amnezia;
 pub mod errors;
 pub mod handshake;
-mod imitation;
+// `pub(crate)` rather than private: `device::probe_reply` builds the replies
+// from the same modules that generate the outbound cover traffic, which is the
+// whole point -- a classifier and a responder that share a parser cannot drift
+// apart. Still crate-private, so none of it is public API.
+pub(crate) mod imitation;
 pub mod rate_limiter;
 
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
-mod quic;
+pub(crate) mod quic;
 mod session;
 mod timers;
 
@@ -98,12 +102,14 @@ struct PendingAmneziaJunk {
 }
 
 type MessageType = u32;
-const HANDSHAKE_INIT: MessageType = 1;
+// `pub(crate)`: `device::probe_reply`'s ordering test builds a conforming
+// initiation to prove the hazard it guards against is real.
+pub(crate) const HANDSHAKE_INIT: MessageType = 1;
 const HANDSHAKE_RESP: MessageType = 2;
 const COOKIE_REPLY: MessageType = 3;
 const DATA: MessageType = 4;
 
-const HANDSHAKE_INIT_SZ: usize = 148;
+pub(crate) const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;

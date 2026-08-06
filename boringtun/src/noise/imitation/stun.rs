@@ -11,6 +11,14 @@
 //! meaning — the packets go to the WireGuard endpoint, not a STUN server; the
 //! HMAC/CRC are purely cover traffic.
 
+// The responder half -- `binding_request_len`, `check_fingerprint`,
+// `binding_success` and their helpers -- has a caller only in
+// `device::probe_reply`, which is behind the `device` feature. Without that
+// feature the whole crate has no ingress path, so those items really are dead
+// and the allow is the truth rather than a mask. With it, nothing here is
+// exempt.
+#![cfg_attr(not(feature = "device"), allow(dead_code))]
+
 use super::random_token;
 use rand_core::RngCore;
 use ring::hmac;
@@ -220,7 +228,6 @@ pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
 }
 
 /// What `msg` carries in place of a FINGERPRINT attribute.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fingerprint {
     /// The attribute list tiles the message exactly and carries no
@@ -250,7 +257,6 @@ enum Fingerprint {
 /// [`binding_success`] has already checked it equals `HEADER_LEN + msg_len`.
 /// Calling this on an unvalidated datagram would let trailing bytes change
 /// which attribute counts as last.
-#[allow(dead_code)]
 fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     let mut off = HEADER_LEN;
     while off + 4 <= msg.len() {
@@ -306,7 +312,6 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
 /// stricter than necessary on a value we choose ourselves costs nothing.
 const MAX_SOFTWARE_LEN: usize = 127;
 
-#[allow(dead_code)]
 /// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
 ///
 /// The port is XORed with the top half of the magic cookie and the address with
@@ -341,13 +346,11 @@ fn write_xor_mapped_address(pkt: &mut [u8], off: usize, client: SocketAddr, tran
     }
 }
 
-#[allow(dead_code)]
 /// Attribute size of XOR-MAPPED-ADDRESS for this address family.
 fn xor_mapped_len(client: SocketAddr) -> usize {
     4 + if client.is_ipv4() { 8 } else { 20 }
 }
 
-#[allow(dead_code)]
 /// Build a Binding Success Response to `request`, reporting `client` as the
 /// reflexive address.
 ///

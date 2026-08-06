@@ -27,11 +27,6 @@
 //! silence a bare WireGuard port already gives. It never affects the tunnel:
 //! authenticated traffic does not draw on it.
 
-// Phase 2 lands the budget before anything spends it: a ceiling with no
-// caller, so its arithmetic can be reviewed on its own rather than beside a
-// reply path. The allow comes off with the ingress hook.
-#![allow(dead_code)]
-
 // Edition 2018: `TryFrom` is not in the prelude (it arrived in 2021).
 use std::convert::TryFrom;
 

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use boringtun::device::drop_privileges::drop_privileges;
-use boringtun::device::{DeviceConfig, DeviceHandle};
+use boringtun::device::{DeviceConfig, DeviceHandle, DEFAULT_PROBE_REPLY_BYTES_PER_SEC};
+use boringtun::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, Command};
 use daemonize::{Daemonize, Outcome};
@@ -85,6 +86,33 @@ fn main() {
                 .long("disable-multi-queue")
                 .action(ArgAction::SetTrue)
                 .help("Disable using multiple queues for the tunnel interface"),
+            // Protocol imitation has no UAPI key: `awg showconf` drops keys it
+            // does not know, so a value set over the UAPI would not survive a
+            // round trip. It is therefore startup-only, and these are the only
+            // way to reach it from the binary.
+            Arg::new("imitate-protocol")
+                .long("imitate-protocol")
+                .env("WG_IMITATE_PROTOCOL")
+                .value_parser(PossibleValuesParser::new([
+                    "none", "dns", "quic", "sip", "stun",
+                ]))
+                .help("Protocol to imitate: shapes outbound cover traffic, and selects which probes the listen port answers")
+                .default_value("none"),
+            Arg::new("imitate-domain")
+                .long("imitate-domain")
+                .env("WG_IMITATE_DOMAIN")
+                .help("Hostname to use in imitated DNS/SIP/QUIC cover traffic (a random one is generated when omitted)"),
+            // No `default_value`: the default is the library constant, and
+            // restating it here as a string would be a second copy to drift.
+            // Absence means "the library default", which `unwrap_or` supplies.
+            Arg::new("probe-reply-rate")
+                .long("probe-reply-rate")
+                .env("WG_PROBE_REPLY_RATE")
+                .help(format!(
+                    "Aggregate ceiling, in bytes per second, on replies to unauthenticated probes; \
+                     0 answers nothing [default: {}]",
+                    DEFAULT_PROBE_REPLY_BYTES_PER_SEC
+                )),
         ])
         .get_matches();
 
@@ -170,6 +198,25 @@ fn main() {
             .init();
     }
 
+    let imitate = match matches
+        .get_one::<String>("imitate-protocol")
+        .unwrap()
+        .as_str()
+    {
+        "dns" => AmneziaImitationProtocol::Dns,
+        "quic" => AmneziaImitationProtocol::Quic,
+        "sip" => AmneziaImitationProtocol::Sip,
+        "stun" => AmneziaImitationProtocol::Stun,
+        // `none`, and unreachable for anything else: clap's value_parser has
+        // already rejected every other string.
+        _ => AmneziaImitationProtocol::None,
+    };
+    let imitate_domain = matches.get_one::<String>("imitate-domain").cloned();
+    let probe_reply_rate: u32 = matches
+        .get_one::<String>("probe-reply-rate")
+        .map(|v| v.parse().expect("Invalid probe-reply-rate value"))
+        .unwrap_or(DEFAULT_PROBE_REPLY_BYTES_PER_SEC);
+
     let config = DeviceConfig {
         n_threads,
         #[cfg(target_os = "linux")]
@@ -177,9 +224,14 @@ fn main() {
         use_connected_socket: !matches.get_flag("disable-connected-udp"),
         #[cfg(target_os = "linux")]
         use_multi_queue: !matches.get_flag("disable-multi-queue"),
-        // AmneziaWG parameters arrive over the UAPI (`awg setconf`), not the
-        // command line, so the device starts as plain WireGuard. `..default()`
-        // rather than naming them, so future fields do not break this build.
+        // S/H/J parameters arrive over the UAPI (`awg setconf`), so the device
+        // starts as plain WireGuard on those. Protocol imitation has no UAPI
+        // key and can only be set here; `api.rs` preserves it across `set=1`.
+        amnezia: AmneziaConfig::default().with_protocol_imitation(imitate, imitate_domain),
+        // 0 disables rather than meaning "a budget of nothing", so an operator
+        // who wants silence gets it without a second flag.
+        probe_reply_bytes_per_sec: (probe_reply_rate > 0).then_some(probe_reply_rate),
+        // `..default()` for the rest, so a future field does not break this.
         ..Default::default()
     };
 

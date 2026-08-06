@@ -9,6 +9,7 @@ pub mod drop_privileges;
 mod integration_tests;
 pub mod peer;
 mod probe_budget;
+mod probe_reply;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
@@ -47,6 +48,7 @@ use allowed_ips::AllowedIps;
 use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
+use probe_budget::ProbeBudget;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
 use socket2::{Domain, Protocol, Type};
@@ -132,7 +134,33 @@ pub struct DeviceConfig {
     /// imitation settings. Applied to every peer verbatim, matching the kernel
     /// module: junk is emitted by whichever side initiates a handshake.
     pub amnezia: AmneziaConfig,
+    /// Bytes per second of replies to *unauthenticated* probe traffic, or
+    /// `None` to answer nothing.
+    ///
+    /// Only ever spent when `amnezia.imitation` names a protocol, so a vanilla
+    /// WireGuard interface stays byte-for-byte silent to unverified sources
+    /// whatever this holds. When imitation *is* configured, answering is the
+    /// point: a port that emits DNS-shaped datagrams and answers no DNS query
+    /// describes a host that does not exist.
+    ///
+    /// The ceiling is aggregate and byte-based rather than per-source: a
+    /// per-source limiter is defeated by spoofing, since every forged address
+    /// gets a fresh allowance, and amplification is a byte ratio rather than a
+    /// packet count. The reasoning is in full in `device::probe_budget`, named
+    /// rather than linked because it is a private module.
+    pub probe_reply_bytes_per_sec: Option<u32>,
 }
+
+/// Enough for roughly 250 replies a second, which no legitimate probing
+/// approaches, and low enough that the port is worthless as an amplifier: a
+/// reflector contributing 16 KiB/s is not worth an attacker's spoofed packets.
+///
+/// A number rather than a knob-per-protocol on purpose. The replies are tens of
+/// bytes each -- a DNS SERVFAIL is never larger than its query, a QUIC Version
+/// Negotiation is under 60 bytes, and a STUN Binding Success tops out near 200 --
+/// so one rate covers all of them and there is nothing for an operator to get
+/// wrong.
+pub const DEFAULT_PROBE_REPLY_BYTES_PER_SEC: u32 = 16 * 1024;
 
 impl Default for DeviceConfig {
     fn default() -> Self {
@@ -147,6 +175,7 @@ impl Default for DeviceConfig {
             // before AmneziaWG support existed.
             obf: ObfuscationRanges::default(),
             amnezia: AmneziaConfig::default(),
+            probe_reply_bytes_per_sec: Some(DEFAULT_PROBE_REPLY_BYTES_PER_SEC),
         }
     }
 }
@@ -177,6 +206,15 @@ pub struct Device {
     mtu: AtomicUsize,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+
+    /// Ceiling on bytes emitted in reply to unauthenticated probes, or `None`
+    /// when probe replies are off.
+    ///
+    /// One per device, not one per worker thread: every worker charges this
+    /// same instance, so `n_threads` does not multiply the allowance the
+    /// operator configured. `ProbeBudget` is a single atomic, so sharing it
+    /// costs a CAS on a path that already refuses to allocate.
+    probe_budget: Option<ProbeBudget>,
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
@@ -567,6 +605,9 @@ impl Device {
         #[cfg(target_os = "linux")]
         let uapi_fd = config.uapi_fd;
 
+        // Before `config` is moved into the device.
+        let probe_budget = config.probe_reply_bytes_per_sec.map(ProbeBudget::new);
+
         let mut device = Device {
             queue: Arc::new(poll),
             iface,
@@ -585,6 +626,7 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            probe_budget,
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -902,11 +944,27 @@ impl Device {
                     // to the rate limiter, so verifying the padded datagram fails
                     // the MAC check. This mirrors the kernel module, which strips
                     // at device level before peer lookup.
-                    let packet = d
-                        .config
-                        .amnezia
-                        .strip_inbound(obf, &t.src_buf[..packet_len]);
-                    let Some(packet) = packet else { continue };
+                    // AmneziaWG framing first, probe detection only if that
+                    // fails. The order lives inside `classify` rather than
+                    // here so it can be tested; see its doc for why getting it
+                    // backwards makes the server answer its own clients.
+                    let packet = match probe_reply::classify(
+                        &t.src_buf[..packet_len],
+                        &d.config.amnezia,
+                        obf,
+                        addr.as_socket(),
+                        d.listen_port,
+                        d.probe_budget.as_ref(),
+                        &mut t.junk_rng,
+                    ) {
+                        probe_reply::Ingress::Wireguard(packet) => packet,
+                        probe_reply::Ingress::Foreign(reply) => {
+                            if let Some(reply) = reply {
+                                let _: Result<_, _> = udp.send_to(&reply, &addr);
+                            }
+                            continue;
+                        }
+                    };
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter.verify_packet(
                         obf,

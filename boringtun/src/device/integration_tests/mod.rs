@@ -266,8 +266,10 @@ mod tests {
                     use_multi_queue: true,
                     #[cfg(target_os = "linux")]
                     uapi_fd: -1,
-                    obf: Default::default(),
-                    amnezia: Default::default(),
+                    // Vanilla WireGuard: the AmneziaWG and probe-reply fields
+                    // stay at their defaults. `..default()` rather than naming
+                    // them, so a future field does not break this build.
+                    ..Default::default()
                 },
             )
         }
@@ -560,8 +562,8 @@ mod tests {
                 use_multi_queue: true,
                 #[cfg(target_os = "linux")]
                 uapi_fd: -1,
-                obf: Default::default(),
-                amnezia: Default::default(),
+                // As above: defaults for everything AmneziaWG and probe-reply.
+                ..Default::default()
             },
         );
 
@@ -720,8 +722,8 @@ mod tests {
                 use_multi_queue: true,
                 #[cfg(target_os = "linux")]
                 uapi_fd: -1,
-                obf: Default::default(),
-                amnezia: Default::default(),
+                // As above: defaults for everything AmneziaWG and probe-reply.
+                ..Default::default()
             },
         );
 

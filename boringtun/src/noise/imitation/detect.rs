@@ -36,15 +36,12 @@
 //! function of the datagram, so it needs no device, no socket and no key, and it
 //! is testable on every platform rather than only where `device` compiles.
 
-// Phase 1 of the probe-responder work lands the detector and the invariant
-// table it proves, deliberately with no caller: no hook, no config key, no
-// reply path, and therefore no behaviour change to review alongside it. The
-// only consumers today are this module's tests and the invariant table in
-// `amnezia.rs`, so every item here is dead code in a non-test build.
-//
-// This allow comes off in the phase that adds the ingress hook. Scoped to the
-// module rather than the crate so it cannot mask dead code anywhere else.
-#![allow(dead_code)]
+// The caller is `device::probe_reply`, which exists only behind the `device`
+// feature. Without it the crate has no ingress path, so the classifier's only
+// consumers are this module's tests and the invariant table in `amnezia.rs`,
+// and the allow states that rather than hiding it. In a `--features device`
+// build -- what ships, and what CI runs -- nothing here is exempt.
+#![cfg_attr(not(feature = "device"), allow(dead_code))]
 
 use super::super::amnezia::AmneziaImitationProtocol;
 

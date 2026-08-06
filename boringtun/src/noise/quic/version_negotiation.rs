@@ -180,7 +180,8 @@ pub(crate) fn parse_long_header(data: &[u8]) -> Option<LongHeader<'_>> {
 /// field", and errata 7578 makes that the default rather than a special case.
 /// With `0x40` clear, a receiver demultiplexing a shared UDP port per RFC 7983 /
 /// RFC 9443 routes the reply into the RTP/RTCP bucket instead of QUIC.
-#[allow(dead_code)]
+// As `dns::servfail`: the only caller is behind the `device` feature.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 pub(crate) fn version_negotiation(initial: &[u8], rng: &mut impl RngCore) -> Option<Vec<u8>> {
     if initial.len() < MIN_INITIAL_DATAGRAM {
         return None;
