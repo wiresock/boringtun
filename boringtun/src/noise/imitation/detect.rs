@@ -19,7 +19,7 @@
 //! The second finding is why a server must classify AmneziaWG *first* and only
 //! then consider probe detection. `fill_dns` output is a complete, well-formed
 //! DNS query by construction — it frames the WireGuard ciphertext inside an
-//! EDNS OPT padding option — so it satisfies [`is_plausible_dns_query`] with
+//! EDNS OPT padding option — so it satisfies [`super::dns::question_end`] with
 //! probability 1. A server that asked "is this a probe?" before "is this one of
 //! my peers?" would answer its own clients' cover traffic instead of
 //! handshaking with them, and would do so *more* often the better the imitation
@@ -98,66 +98,6 @@ fn is_quic_version(version: u32) -> bool {
     }
 }
 
-/// End offset of an uncompressed QNAME starting at `start`, if it is well formed.
-///
-/// Rejects compression pointers: a probe carries its question inline, and
-/// following a pointer would mean parsing attacker-controlled offsets.
-fn dns_qname_end(data: &[u8], start: usize) -> Option<usize> {
-    const MAX_LABEL: usize = 63;
-    const MAX_QNAME: usize = 255;
-    let mut pos = start;
-    let mut qname_len: usize = 0;
-    loop {
-        let label_len = *data.get(pos)? as usize;
-        // Top two bits set marks a compression pointer or a reserved form.
-        if label_len & 0xC0 != 0 {
-            return None;
-        }
-        if label_len == 0 {
-            return Some(pos + 1);
-        }
-        if label_len > MAX_LABEL {
-            return None;
-        }
-        qname_len += 1 + label_len;
-        // +1 for the terminating root label.
-        if qname_len + 1 > MAX_QNAME {
-            return None;
-        }
-        pos += 1 + label_len;
-    }
-}
-
-/// Is this a complete, well-formed standard DNS query?
-///
-/// Requires QR=0 with a standard opcode, exactly one question, a QNAME whose
-/// label walk terminates exactly, and a QCLASS a real client emits — IN(1),
-/// CH(3), HS(4) or ANY(255). Trailing bytes are allowed; EDNS OPT records live
-/// there.
-///
-/// End-to-end validation rather than a header-flags check, and the difference
-/// matters: AmneziaWG junk is uniformly random, and roughly 3% of it passes a
-/// flags-only test. At that rate a server in auto mode would eventually
-/// mislabel every non-masking client as DNS.
-fn is_plausible_dns_query(data: &[u8]) -> bool {
-    if data.len() < 12 {
-        return false;
-    }
-    let flags = u16::from_be_bytes([data[2], data[3]]);
-    let qdcount = u16::from_be_bytes([data[4], data[5]]);
-    if flags & 0xF800 != 0 || qdcount != 1 {
-        return false;
-    }
-    let Some(qname_end) = dns_qname_end(data, 12) else {
-        return false;
-    };
-    if data.len() < qname_end + 4 {
-        return false;
-    }
-    let qclass = u16::from_be_bytes([data[qname_end + 2], data[qname_end + 3]]);
-    matches!(qclass, 1 | 3 | 4 | 255)
-}
-
 /// SIP request methods and the response prefix, longest first so a shorter
 /// keyword cannot shadow a longer one.
 ///
@@ -225,7 +165,9 @@ pub(crate) fn detect(data: &[u8]) -> Option<Probe> {
         return Some(Probe::Stun);
     }
 
-    if !has_stun_cookie && is_plausible_dns_query(data) {
+    // The framing rules live in `dns::question_end`, shared with the
+    // responder, for the same reason the STUN ones do: two copies drift.
+    if !has_stun_cookie && super::dns::question_end(data).is_some() {
         return Some(Probe::Dns);
     }
 
