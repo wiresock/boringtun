@@ -43,8 +43,9 @@ fn build_query(domain: &str, qtype: u16, rng: &mut impl RngCore) -> Vec<u8> {
 
 /// End offset of an uncompressed QNAME starting at `start`, if it is well formed.
 ///
-/// Rejects compression pointers: a probe carries its question inline, and
-/// following a pointer would mean chasing attacker-controlled offsets.
+/// A label byte is a length only when its top two bits are `0b00`; every
+/// other form -- compression pointer, extended label, reserved -- is
+/// rejected rather than followed.
 fn qname_end(data: &[u8], start: usize) -> Option<usize> {
     const MAX_LABEL: usize = 63;
     const MAX_QNAME: usize = 255;
@@ -52,7 +53,18 @@ fn qname_end(data: &[u8], start: usize) -> Option<usize> {
     let mut qname_len: usize = 0;
     loop {
         let label_len = *data.get(pos)? as usize;
-        // Top two bits set marks a compression pointer or a reserved form.
+        // Only 0b00 is a length byte (RFC 1035 §4.1.4). Every other value of
+        // the top two bits is rejected, not just the compression pointer:
+        //   0b11  compression pointer
+        //   0b01  extended label (RFC 2671), deprecated by RFC 6891
+        //   0b10  reserved
+        //
+        // Kept even though it is *functionally redundant* with the MAX_LABEL
+        // bound below -- every byte with a top bit set is >= 64, so the length
+        // check rejects all 192 of them too, and mutating this line changes
+        // nothing observable. It stays because it states which forms exist and
+        // why none is followed, and because it is what still rejects a
+        // compression pointer if MAX_LABEL is ever raised.
         if label_len & 0xC0 != 0 {
             return None;
         }
@@ -239,6 +251,37 @@ mod tests {
                 &query[HEADER_LEN..end],
                 "question echoed"
             );
+        }
+    }
+
+    /// Every non-`0b00` top-bit form is refused: compression pointer, extended
+    /// label, reserved.
+    ///
+    /// This pins the *behaviour*, not a particular line. Narrowing the top-bits
+    /// check to `== 0xC0` leaves this green, because the two checks are
+    /// equivalent: any byte with a top bit set is >= 64 and the MAX_LABEL bound
+    /// rejects it anyway. Enumerating all 256 values shows the two predicates
+    /// agree on every one of them. Worth knowing before someone "simplifies"
+    /// either check on the assumption the other covers a different case.
+    #[test]
+    fn every_non_length_label_form_is_rejected() {
+        let mut rng = ChaCha8Rng::seed_from_u64(13);
+        let good = generate("example.com", &mut rng)[0].clone();
+        assert!(question_end(&good).is_some(), "control");
+
+        for (bits, what) in [
+            (0xC0u8, "compression pointer"),
+            (0x40u8, "extended label (RFC 2671)"),
+            (0x80u8, "reserved"),
+        ] {
+            let mut q = good.clone();
+            q[HEADER_LEN] = bits | 0x03; // a plausible length in the low bits
+            assert!(
+                question_end(&q).is_none(),
+                "{} must be rejected, not treated as a length",
+                what
+            );
+            assert!(servfail(&q).is_none(), "{} must not be answered", what);
         }
     }
 
