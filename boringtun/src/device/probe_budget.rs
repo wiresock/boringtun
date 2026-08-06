@@ -3,11 +3,20 @@
 
 //! An aggregate ceiling on bytes emitted in reply to *unauthenticated* traffic.
 //!
-//! Today the server emits nothing to an unverified source: `verify_packet`
-//! computes mac1 from the server's static public key before anything is written,
-//! so an attacker without that key cannot make the process produce a single
-//! byte. A probe responder gives that up deliberately, and this bounds what it
-//! costs.
+//! An earlier version of this paragraph claimed the server emitted *nothing* to
+//! an unverified source, on the grounds that `verify_packet` checks mac1 before
+//! anything is written. That was wrong twice over, and the error is worth
+//! keeping visible because it is the blind spot that left the cookie path
+//! unguarded for as long as it was. mac1 is keyed on the server's *public* key,
+//! which is in every client configuration, so it authenticates nobody; and a
+//! cookie reply is a write to an unverified source by design — it is how
+//! WireGuard proves an address is real.
+//!
+//! What was true is that the cookie path is bounded in a way the probe
+//! responder is not: it fires only while the limiter is under load, and
+//! [`super::reply_policy`] now holds it to the size of the datagram that
+//! provoked it. A probe responder answers anything, at any rate, so it needs a
+//! ceiling of its own — and this is it.
 //!
 //! Three properties, each chosen against a specific failure:
 //!

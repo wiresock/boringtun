@@ -612,6 +612,29 @@ impl AmneziaConfig {
         }
     }
 
+    /// How many bytes a `cookie_len`-byte cookie reply will occupy on the wire,
+    /// S3 prefix included.
+    ///
+    /// Exists so the ingress path can decide whether the reply is an amplifier
+    /// *before* [`Self::prepend_outbound`] generates junk for it. With S3 near
+    /// its 65443-byte maximum, filling a prefix for a reply that policy then
+    /// refuses would itself be the flood — one forged 148-byte initiation per
+    /// 65 KB of keystream, which is a cheaper attack than the amplification it
+    /// was meant to prevent.
+    ///
+    /// Duplicates what `prepend_outbound` derives from the packet's own tag, so
+    /// [`tests::the_predicted_cookie_reply_length_is_the_one_actually_produced`]
+    /// pins the two together.
+    ///
+    /// Gated because the ingress path is the only caller: without `device` this
+    /// is dead code, and a crate built without the feature would carry a
+    /// `dead_code` warning for it. `test` is in the list so the test above still
+    /// runs on a default-feature `cargo test`.
+    #[cfg(any(test, feature = "device"))]
+    pub(crate) fn cookie_reply_len(&self, cookie_len: usize) -> usize {
+        cookie_len.saturating_add(self.cookie_packet_junk_size as usize)
+    }
+
     pub(crate) fn prepend_outbound<'a>(
         &self,
         obf: ObfuscationRanges,
@@ -1790,6 +1813,40 @@ mod tests {
             .prepend_outbound(obf, &mut buffer, HANDSHAKE_INIT_SZ, &mut rng)
             .expect("largest validated S1 must still fit");
         assert_eq!(packet.len(), MAX_SENDABLE_DATAGRAM);
+    }
+
+    /// [`AmneziaConfig::cookie_reply_len`] must agree with the length
+    /// `prepend_outbound` actually produces, for every S3 from zero to the
+    /// largest `validate` admits.
+    ///
+    /// The ingress path predicts the length so it can refuse an amplifying
+    /// cookie reply *without* paying to generate its junk. A prediction that
+    /// ran low would let the amplifier through; one that ran high would silence
+    /// cookie replies for a configuration that is not an amplifier at all. Both
+    /// are silent, so the two are pinned to each other here rather than left to
+    /// agree by inspection.
+    #[test]
+    fn the_predicted_cookie_reply_length_is_the_one_actually_produced() {
+        let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
+        for s3 in [0u16, 1, 110, 1280, max_s3] {
+            let cfg = AmneziaConfig::new(0, 0, s3, 0);
+            cfg.validate().expect("S3 within the validated range");
+
+            let produced = packet_after_prepend(
+                &cfg,
+                COOKIE_REPLY_SZ,
+                COOKIE_REPLY,
+                COOKIE_REPLY_SZ + s3 as usize,
+            )
+            .len();
+
+            assert_eq!(
+                cfg.cookie_reply_len(COOKIE_REPLY_SZ),
+                produced,
+                "S3 = {}: predicted length must match the datagram prepend_outbound emits",
+                s3
+            );
+        }
     }
 
     #[test]

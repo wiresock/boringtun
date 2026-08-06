@@ -112,6 +112,27 @@ const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
 
+/// The wire sizes above, re-exported for the ingress tests in `device`.
+///
+/// `device::reply_policy` decides whether a cookie reply is larger than the
+/// packet that provoked it. The decision itself takes both lengths as
+/// arguments, so production needs none of these constants — but its tests do,
+/// and asserting against remembered numbers instead would leave a change to
+/// either packet size to be discovered in the field.
+///
+/// Gated rather than three `pub(crate)` constants, for the reason
+/// [`amnezia::conforming_initiation`] gives for living in `noise` at all:
+/// widening a protocol constant crate-wide and permanently, to serve a test,
+/// is a larger change than the test is worth. The `device` half of the gate
+/// matters too — without it these are dead code in every build of the crate
+/// that leaves the feature off.
+#[cfg(all(test, feature = "device"))]
+pub(crate) mod packet_sizes {
+    pub(crate) const HANDSHAKE_INIT_SZ: usize = super::HANDSHAKE_INIT_SZ;
+    pub(crate) const HANDSHAKE_RESP_SZ: usize = super::HANDSHAKE_RESP_SZ;
+    pub(crate) const COOKIE_REPLY_SZ: usize = super::COOKIE_REPLY_SZ;
+}
+
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
     sender_idx: u32,

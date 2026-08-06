@@ -10,6 +10,7 @@ mod integration_tests;
 pub mod peer;
 mod probe_budget;
 mod probe_reply;
+mod reply_policy;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
@@ -927,6 +928,14 @@ impl Device {
         // the whole signal: the operator needs to know traffic arrived before
         // the key, not how much of it did.
         let warned_keyless = AtomicBool::new(false);
+        // Also at most once per socket, and for a sharper reason than volume.
+        // Whether a cookie reply amplifies is fixed by S1/S2/S3, so once it is
+        // true it is true for every datagram of that kind until the operator
+        // changes the configuration -- and the datagrams that reach it arrive
+        // at flood rate by construction, since a cookie is only produced once
+        // the limiter is under load. Logging per refusal would turn one
+        // misconfiguration into a log flood driven by the attacker.
+        let warned_cookie_amplifier = AtomicBool::new(false);
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -1038,17 +1047,44 @@ impl Device {
                     ) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
-                            // The limiter writes a bare cookie reply; it does not
-                            // know about S3. Re-prefix it in place before sending,
-                            // or the peer will reject it.
+                            // Nothing here has been authenticated. `verify_packet`
+                            // returns a cookie on a valid mac1, and mac1 is keyed
+                            // on this server's *public* key -- which is in every
+                            // client configuration -- so the source address is as
+                            // attacker-chosen as a probe's, and the reply is as
+                            // amplifiable. Decided before the junk is generated:
+                            // see `cookie_reply_len`.
                             let cookie_len = cookie.len();
-                            if let Ok(out) = d.config.amnezia.prepend_outbound(
-                                obf,
-                                &mut t.dst_buf,
-                                cookie_len,
-                                &mut t.junk_rng,
-                            ) {
-                                let _: Result<_, _> = udp.send_to(out, &addr);
+                            let reply_len = d.config.amnezia.cookie_reply_len(cookie_len);
+                            match reply_policy::cookie_verdict(from, packet_len, reply_len) {
+                                reply_policy::CookieVerdict::Send => {
+                                    // The limiter writes a bare cookie reply; it
+                                    // does not know about S3. Re-prefix it in
+                                    // place before sending, or the peer will
+                                    // reject it.
+                                    if let Ok(out) = d.config.amnezia.prepend_outbound(
+                                        obf,
+                                        &mut t.dst_buf,
+                                        cookie_len,
+                                        &mut t.junk_rng,
+                                    ) {
+                                        let _: Result<_, _> = udp.send_to(out, &addr);
+                                    }
+                                }
+                                reply_policy::CookieVerdict::RefusedSource => {}
+                                reply_policy::CookieVerdict::WouldAmplify => {
+                                    if !warned_cookie_amplifier.swap(true, Ordering::Relaxed) {
+                                        tracing::warn!(
+                                            message = "suppressing cookie replies: S3 makes them \
+                                                       larger than the packets that provoke them, \
+                                                       which is a reflection amplifier. Handshakes \
+                                                       will fail while this interface is under \
+                                                       load; lower S3.",
+                                            reply_len = reply_len,
+                                            request_len = packet_len,
+                                        );
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -1377,6 +1413,7 @@ mod ingress_tests {
         assert_eq!(index_prefixes(&index, &wide).len(), 1);
     }
     use crate::noise::handshake::parse_handshake_anon;
+    use crate::noise::packet_sizes::{COOKIE_REPLY_SZ, HANDSHAKE_INIT_SZ};
     use crate::x25519;
     use rand_core::OsRng;
 
@@ -1483,6 +1520,148 @@ mod ingress_tests {
             demuxed,
             *client_public.as_bytes(),
             "must identify the initiating peer"
+        );
+    }
+
+    /// Drive the ingress cookie path the way `register_udp_handler` drives it,
+    /// and report the two numbers the policy decides on: the bytes the sender
+    /// spent, and the bytes the cookie reply would occupy on the wire.
+    ///
+    /// The initiation carries a valid mac1 and no mac2, which is all it takes:
+    /// mac1 is keyed on the server's *public* key, so this `Tunn` is a stranger
+    /// holding nothing but a copy of the server's config file. It is not a
+    /// configured peer and the server never learns who it is.
+    ///
+    /// The limiter is pushed under load first, because that is the only state
+    /// in which `verify_packet` produces a cookie at all — which is also why a
+    /// byte ceiling on this path would bind exclusively during a flood. See
+    /// `reply_policy::cookie_verdict`.
+    fn cookie_exchange_sizes(amnezia: &AmneziaConfig) -> (usize, usize) {
+        let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let server_public = x25519::PublicKey::from(&server_secret);
+        // Vanilla tags, matching `ObfuscationRanges::default()`: the H-ranges
+        // are orthogonal to everything under test here, and the interop config
+        // exercises non-default ones in
+        // `obfuscated_initiation_demuxes_to_the_initiating_peer`.
+        let obf = ObfuscationRanges::default();
+
+        let mut client = Tunn::new_with_amnezia(
+            x25519::StaticSecret::random_from_rng(OsRng),
+            server_public,
+            None,
+            None,
+            1,
+            None,
+            1,
+            1,
+            2,
+            2,
+            3,
+            3,
+            4,
+            4,
+            amnezia.clone(),
+        )
+        .unwrap();
+
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let datagram = match client.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(d) => d.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+
+        let limiter = RateLimiter::new(&server_public, HANDSHAKE_RATE_LIMIT);
+        let stripped = amnezia
+            .strip_inbound(obf, &datagram)
+            .expect("our own initiation must match our own shape");
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let mut scratch = vec![0u8; MAX_UDP_SIZE];
+
+        // `is_under_load` returns the counter value from *before* its own
+        // increment, so the limit-th call still reads as unloaded and the one
+        // after it is the first to demand a cookie. Asserting `Ok` here is not
+        // decoration: if the threshold ever moves, this loop stops leaving the
+        // limiter in the state the test is about, and it says so.
+        for _ in 0..HANDSHAKE_RATE_LIMIT {
+            limiter
+                .verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch)
+                .expect("below the handshake rate limit, no cookie is demanded");
+        }
+        let cookie_len =
+            match limiter.verify_packet(obf, &mut OsRng, Some(src), stripped, &mut scratch) {
+                Err(TunnResult::WriteToNetwork(cookie)) => cookie.len(),
+                Ok(_) => panic!("over the rate limit the limiter must demand a cookie"),
+                Err(other) => panic!("expected a cookie reply, got {:?}", other),
+            };
+
+        (datagram.len(), amnezia.cookie_reply_len(cookie_len))
+    }
+
+    /// The reflector the cookie path was, in the configuration that makes it
+    /// worst, with the amplification factor measured rather than asserted from
+    /// memory.
+    ///
+    /// This is reachable by anyone who has ever seen a client config for this
+    /// server: no key, no peer entry, no handshake. `cookie_verdict` is what
+    /// stands between it and 65 KB aimed at a stranger.
+    #[test]
+    fn the_largest_permitted_s3_is_refused_as_an_amplifier() {
+        // 65443 is the largest S3 `validate` accepts -- the IPv4 UDP payload
+        // limit less the 64-byte cookie reply. Pinned by its neighbour rather
+        // than quoted, so this is the real edge of the configuration space and
+        // not a number someone remembered.
+        assert!(AmneziaConfig::new(0, 0, 65_443, 0).validate().is_ok());
+        assert!(AmneziaConfig::new(0, 0, 65_444, 0).validate().is_err());
+
+        let amnezia = AmneziaConfig::new(0, 0, 65_443, 0);
+        let (request_len, reply_len) = cookie_exchange_sizes(&amnezia);
+
+        assert_eq!(
+            request_len, HANDSHAKE_INIT_SZ,
+            "S1 = 0, so the forgery costs one bare initiation"
+        );
+        assert_eq!(reply_len, 65_443 + COOKIE_REPLY_SZ);
+        assert!(
+            reply_len / request_len > 400,
+            "the point of the test is the ratio: {} in, {} out",
+            request_len,
+            reply_len
+        );
+
+        assert_eq!(
+            reply_policy::cookie_verdict(
+                "203.0.113.5:40000".parse().unwrap(),
+                request_len,
+                reply_len
+            ),
+            reply_policy::CookieVerdict::WouldAmplify,
+            "a {}x reflector must not be sent",
+            reply_len / request_len
+        );
+    }
+
+    /// And the configuration a real deployment runs still gets its cookie.
+    ///
+    /// The S-sizes are the ones `scripts/awg-interop-poc.sh` runs against the
+    /// AmneziaWG kernel module, so this is not a hypothetical shape. Without
+    /// it, the test above would pass just as well against a change that
+    /// disabled cookie replies outright -- which would break WireGuard's flood
+    /// defence rather than bound it.
+    #[test]
+    fn the_interop_configuration_still_gets_its_cookie_reply() {
+        let amnezia = AmneziaConfig::new(120, 130, 110, 80);
+        let (request_len, reply_len) = cookie_exchange_sizes(&amnezia);
+
+        assert_eq!(request_len, 120 + HANDSHAKE_INIT_SZ);
+        assert_eq!(reply_len, 110 + COOKIE_REPLY_SZ);
+        assert_eq!(
+            reply_policy::cookie_verdict(
+                "203.0.113.5:40000".parse().unwrap(),
+                request_len,
+                reply_len
+            ),
+            reply_policy::CookieVerdict::Send,
+            "an attenuating cookie reply is WireGuard's DoS defence working"
         );
     }
 
@@ -1651,7 +1830,7 @@ mod ingress_tests {
         peers_by_idx.insert(INITIATOR_IDX, Arc::clone(&peer));
 
         assert!(
-            peers_by_idx.get(&(receiver_idx >> 8)).is_some(),
+            peers_by_idx.contains_key(&(receiver_idx >> 8)),
             "response echoed sender index {:#x}, which reduces to {:#x}, but the \
              device registered this peer under {:#x} -- the initiator will drop \
              every response it receives",
@@ -1675,7 +1854,8 @@ mod ingress_tests {
     fn a_tunns_wire_index_reduces_to_its_device_index() {
         for peer_idx in [1u32, 0xFF, 0x0100, 0x00B0_1B85, 0x00FF_FFFF] {
             let obf = ObfuscationRanges::default();
-            let peer_public = x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
+            let peer_public =
+                x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(OsRng));
 
             let mut tunn = Tunn::new_with_obfuscation(
                 x25519::StaticSecret::random_from_rng(OsRng),
@@ -1707,12 +1887,8 @@ mod ingress_tests {
             // Taken off the wire because `HandshakeInit::sender_idx` is private
             // to `noise`, and built byte-wise because this crate is edition
             // 2018, where `TryInto` is not in the prelude.
-            let sender_idx = u32::from_le_bytes([
-                initiation[4],
-                initiation[5],
-                initiation[6],
-                initiation[7],
-            ]);
+            let sender_idx =
+                u32::from_le_bytes([initiation[4], initiation[5], initiation[6], initiation[7]]);
 
             assert_eq!(
                 sender_idx >> 8,

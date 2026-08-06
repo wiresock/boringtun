@@ -32,11 +32,12 @@
 //!
 //! [`AmneziaConfig::strip_inbound`]: crate::noise::amnezia::AmneziaConfig
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use rand_core::RngCore;
 
 use super::probe_budget::ProbeBudget;
+use super::reply_policy::reply_target;
 use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
 use crate::noise::handshake::ObfuscationRanges;
 use crate::noise::imitation::detect::{detect, Probe};
@@ -98,96 +99,6 @@ impl ProbeResponder {
         Self {
             budget: ProbeBudget::new(bytes_per_sec),
             software: stun::host_software(),
-        }
-    }
-}
-
-/// Rewrite an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as the IPv4 address
-/// it denotes.
-///
-/// The v6 listening socket is dual-stack, so every IPv4 peer reaching it is
-/// reported in this form, and it matters twice:
-///
-/// - The v6 arm of [`may_reply_to`] would let `::ffff:255.255.255.255` and
-///   `::ffff:224.0.0.1` through, because neither `is_multicast` nor
-///   `is_broadcast` looks inside the mapping. The hygiene rules have to see the
-///   address family the datagram actually came from.
-/// - A STUN XOR-MAPPED-ADDRESS would otherwise report family `0x02` with a
-///   16-byte address to a client that reached us over IPv4. Real servers report
-///   the family they saw, so the mapped form is its own fingerprint.
-///
-/// `Ipv6Addr::to_ipv4_mapped`, not `to_ipv4`: the latter also unwraps the
-/// deprecated IPv4-*compatible* form (`::a.b.c.d`), which a dual-stack socket
-/// never produces and which should keep failing the v6 rules below.
-fn unmap(addr: SocketAddr) -> SocketAddr {
-    match addr.ip() {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
-            None => addr,
-        },
-        IpAddr::V4(_) => addr,
-    }
-}
-
-/// Should we reply to this source address at all?
-///
-/// Independent of what the datagram contains. A source address is
-/// attacker-chosen on a UDP socket, so these are the addresses a reply must
-/// never be aimed at:
-///
-/// - **unspecified / loopback** — either bogus or a reply to ourselves;
-/// - **multicast / broadcast** — one forged datagram becomes a reply hitting
-///   every host on the segment, a multiplier no byte-based ceiling models;
-/// - **link-local** — not routable, and reachable only by an on-segment host
-///   that could have addressed us directly;
-/// - **`0.0.0.0/8` and `240.0.0.0/4`** — "this network" and reserved space; a
-///   reply to either dies at the first hop, so it is budget spent on nothing;
-/// - **port 0** — not a real source.
-///
-/// What it does **not** catch is a directed broadcast (`192.168.1.255`), which
-/// needs the local prefix to recognise. Linux refuses `sendto` to a
-/// locally-recognised broadcast address without `SO_BROADCAST`, which this
-/// socket does not set, and RFC 2644 has routers drop remote ones — so the
-/// defence there is the kernel's, not this function's. Said plainly because the
-/// list above otherwise reads as exhaustive.
-///
-/// There is deliberately **no check on the source port matching our own listen
-/// port**. It was here to stop two imitating servers trading replies, but that
-/// loop cannot form: no reply this crate generates is classifiable as a probe,
-/// so a reply arriving at a second server is simply dropped. That is asserted by
-/// [`tests::no_generated_reply_can_itself_be_detected_as_a_probe`], which holds
-/// for servers on *different* ports too — a source-port test never did.
-///
-/// What the check did buy was a fingerprint. A prober knows our listen port; it
-/// is the port it is dialling. Sending one probe from source port 51820 and one
-/// from 40000 got silence and a SERVFAIL — a one-packet discriminator that no
-/// real DNS, STUN or QUIC server exhibits, in a module whose entire purpose is
-/// not to be discriminable.
-fn may_reply_to(from: SocketAddr) -> bool {
-    if from.port() == 0 {
-        return false;
-    }
-    match from.ip() {
-        IpAddr::V4(v4) => {
-            // `is_unspecified` is only 0.0.0.0 exactly, and `is_broadcast` only
-            // 255.255.255.255, so 0.0.0.0/8 ("this network") and 240.0.0.0/4
-            // (reserved) are spelled out. Neither can be a real source; a reply
-            // to one is budget spent on a datagram that dies at the first hop.
-            let this_network = v4.octets()[0] == 0;
-            let reserved = v4.octets()[0] >= 240;
-            !(v4.is_unspecified()
-                || v4.is_loopback()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.is_link_local()
-                || this_network
-                || reserved)
-        }
-        IpAddr::V6(v6) => {
-            // `is_unicast_link_local` is unstable, so the fe80::/10 test is
-            // written out rather than waiting for it.
-            let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-            !(v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() || is_link_local)
         }
     }
 }
@@ -265,12 +176,11 @@ fn reply_to(
         return None;
     }
 
-    // Before the hygiene rules, not after: a dual-stack socket reports IPv4
-    // sources in the mapped form, and the v6 rules cannot see through it.
-    let from = unmap(from);
-    if !may_reply_to(from) {
-        return None;
-    }
+    // The shared source-address rule, which the cookie-reply path in `super`
+    // also goes through. It hands back the *unmapped* address, which is what
+    // `binding_success` must put in XOR-MAPPED-ADDRESS; see `reply_target` for
+    // why the check and the unmapping are one call rather than two.
+    let from = reply_target(from)?;
 
     // One protocol, not four: only answer as the service we are imitating.
     let probe = detect(request)?;
@@ -489,37 +399,23 @@ mod tests {
         }
     }
 
-    /// A source address is attacker-chosen. Each of these turns one forged
-    /// datagram into a reply somewhere it must never go.
+    /// This module actually consults the shared source-address rule.
+    ///
+    /// The rule itself, and the full table of addresses a reply must never be
+    /// aimed at, is tested in [`super::super::reply_policy`] — including the
+    /// v4-mapped forms, which is the part a caller could plausibly get wrong.
+    /// What is asserted here is only the wiring: `reply_to` calls
+    /// `reply_target`, so a probe that would otherwise be answered is not.
+    /// Both rows are answerable — `answers_a_dns_probe_when_imitating_dns`
+    /// covers the same query from an ordinary source — so a `None` here is the
+    /// address rule and nothing else.
     #[test]
-    fn refuses_source_addresses_a_reply_must_never_target() {
-        let cases = [
-            ("0.0.0.0:40000", "unspecified"),
-            ("127.0.0.1:40000", "loopback"),
-            ("224.0.0.1:40000", "multicast"),
-            ("255.255.255.255:40000", "broadcast"),
-            ("169.254.1.1:40000", "link-local"),
-            ("0.1.2.3:40000", "0.0.0.0/8 this-network"),
-            ("240.0.0.1:40000", "240.0.0.0/4 reserved"),
-            ("203.0.113.5:0", "port 0"),
-            ("[::]:40000", "v6 unspecified"),
-            ("[::1]:40000", "v6 loopback"),
-            ("[ff02::1]:40000", "v6 multicast"),
-            ("[fe80::1]:40000", "v6 link-local"),
-            // The dual-stack form. `Ipv6Addr::is_multicast` and friends do not
-            // look inside the mapping, so these pass the v6 rules unless the
-            // address is unmapped first -- and every IPv4 probe reaching the v6
-            // socket arrives exactly like this.
-            ("[::ffff:255.255.255.255]:40000", "v4-mapped broadcast"),
-            ("[::ffff:224.0.0.1]:40000", "v4-mapped multicast"),
-            ("[::ffff:127.0.0.1]:40000", "v4-mapped loopback"),
-            ("[::ffff:169.254.1.1]:40000", "v4-mapped link-local"),
-        ];
-        for (addr, what) in cases {
+    fn the_shared_source_address_rule_is_applied() {
+        for addr in ["255.255.255.255:40000", "[::ffff:224.0.0.1]:40000"] {
             assert!(
                 reply(&dns_query(), addr, AmneziaImitationProtocol::Dns).is_none(),
                 "{} must not be replied to",
-                what
+                addr
             );
         }
     }
@@ -530,7 +426,7 @@ mod tests {
     /// The reverse — silence for that one port — was a one-packet discriminator:
     /// a prober knows the port it is dialling, so it can send the same probe
     /// twice and read the difference. No real server behaves that way. See
-    /// [`may_reply_to`], and
+    /// `reply_policy::may_reply_to`, and
     /// [`no_generated_reply_can_itself_be_detected_as_a_probe`] for the property
     /// that makes the check unnecessary.
     #[test]
