@@ -7,9 +7,11 @@
 //!
 //! # Scope
 //!
-//! Client-side DPI camouflage only — boringtun never decrypts the emitted
-//! packets, so only the *client* Initial key schedule (RFC 9001) is
-//! implemented. The aim is **fingerprint parity**: the bytes a DPI classifier
+//! Client-side DPI camouflage: boringtun never decrypts the emitted packets, so
+//! only the *client* Initial key schedule (RFC 9001) is implemented. (The one
+//! server-side packet here, [`version_negotiation`], carries no payload and so
+//! needs no key schedule.) The aim is **fingerprint parity**: the bytes a DPI
+//! classifier
 //! keys on (cipher suites, supported groups, key shares, signature algorithms,
 //! ALPN, the extension set, QUIC transport parameters) match the target browser
 //! exactly, while inherently per-connection fields (client random, key-share
@@ -34,7 +36,9 @@
 //! - [`tls`] / [`profiles`] — the ClientHello serializer and the Chrome /
 //!   Firefox / curl fingerprint tables.
 //! - [`version_negotiation`] — the long-header parse shared with the probe
-//!   classifier, and the one server-side packet this crate emits.
+//!   classifier, and the QUIC probe reply. One of three, beside
+//!   [`super::imitation::dns::servfail`] and
+//!   [`super::imitation::stun::binding_success`].
 //! - [`generator`] — `generate_client_initials`: the full datagram sequence for
 //!   a browser + SNI (two Initials for Chrome/Firefox, one for curl).
 //! - `fingerprint` (test only) — decode + parse helper used to validate parity.

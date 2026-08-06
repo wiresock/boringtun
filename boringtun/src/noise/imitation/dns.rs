@@ -323,7 +323,10 @@ mod tests {
         let mut with_opt = good.clone();
         with_opt[11] = 1;
         with_opt.extend_from_slice(&[0x00, 0x00, 0x29, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
-        assert!(question_end(&with_opt).is_some(), "EDNS OPT must be accepted");
+        assert!(
+            question_end(&with_opt).is_some(),
+            "EDNS OPT must be accepted"
+        );
     }
 
     /// Every non-`0b00` top-bit form is refused: compression pointer, extended

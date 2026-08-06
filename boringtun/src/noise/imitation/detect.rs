@@ -13,8 +13,14 @@
 //!   configured, and random junk (`ip=none`) is never detected at all.
 //! - Under `ip=dns` or `ip=sip`, at the S sizes an installer actually
 //!   generates, our cover traffic **is** a valid probe.
-//! - Under `ip=quic` or `ip=stun` it never is, for structural reasons the
-//!   table documents.
+//! - Under `ip=quic` or `ip=stun` the S-junk never is, for structural reasons
+//!   the table documents (`fill_quic_short` writes a 1-RTT short header, so the
+//!   long-header test cannot fire). The *pre-handshake* `ip=quic` datagrams are
+//!   a different path and a different answer: they are complete browser
+//!   Initials, so [`super::super::quic::version_negotiation::parse_long_header`]
+//!   accepts them and they classify as [`Probe::Quic`]. What keeps a server from
+//!   answering its own clients there is that they offer QUIC v1, which
+//!   `version_negotiation` refuses.
 //!
 //! The second finding is why a server must classify AmneziaWG *first* and only
 //! then consider probe detection. `fill_dns` output is a complete, well-formed
@@ -117,9 +123,17 @@ pub(crate) fn detect(data: &[u8]) -> Option<Probe> {
         return None;
     }
 
-    // The long-header rules live in `quic::version_negotiation`, shared with
-    // the responder -- the same arrangement as the STUN and DNS pairs, for the
-    // same reason: two copies of a framing rule drift.
+    // The long-header *framing* rules live in `quic::version_negotiation`,
+    // shared with the responder for the same reason the STUN and DNS ones are:
+    // two copies of a framing rule drift.
+    //
+    // Unlike those two pairs, the shared predicate is not the whole story. For
+    // DNS and STUN the classifier's gate is also the responder's precondition,
+    // so a detection implies a reply. `version_negotiation` adds two gates of
+    // its own -- a 1200-byte floor and a refusal to answer v1/v2 -- so a QUIC
+    // detection here does *not* imply a reply, and for the common v1 Initial it
+    // implies silence. A caller that charges a reply budget must charge it on
+    // the responder's answer, not on this verdict.
     if crate::noise::quic::version_negotiation::parse_long_header(data).is_some() {
         return Some(Probe::Quic);
     }
@@ -141,14 +155,18 @@ pub(crate) fn detect(data: &[u8]) -> Option<Probe> {
 
     // Allocation-free, ASCII case-insensitive prefix match. Only the first few
     // bytes are examined, so a long datagram costs no more than a short one.
+    //
+    // Compared as bytes, not as `str`: the head is a fixed-width slice of a
+    // datagram we do not control, so decoding it as UTF-8 first made the whole
+    // arm fail whenever byte 9 happened to begin a multi-byte sequence --
+    // `BYE sip:x<U+00E4>@b ...` was classified as nothing at all, because the
+    // truncation, not the datagram, was invalid.
     let head = &data[..data.len().min(10)];
-    if let Ok(text) = std::str::from_utf8(head) {
-        if SIP_PREFIXES.iter().any(|p| {
-            text.get(..p.len())
-                .is_some_and(|s| s.eq_ignore_ascii_case(p))
-        }) {
-            return Some(Probe::Sip);
-        }
+    if SIP_PREFIXES.iter().any(|p| {
+        head.get(..p.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(p.as_bytes()))
+    }) {
+        return Some(Probe::Sip);
     }
 
     None
@@ -230,6 +248,60 @@ mod tests {
 
         p[1..5].copy_from_slice(&0x0000_0002u32.to_be_bytes());
         assert_eq!(detect(&p), None, "an unassigned version is not");
+    }
+
+    /// The prefix match runs on a fixed-width slice of a datagram a prober
+    /// controls, so it must not care whether that slice is valid UTF-8.
+    ///
+    /// The longest prefix is 10 bytes, so `head` is 10 bytes; decoding it as
+    /// `str` first meant a single non-ASCII character at offset 9 made the
+    /// decode fail and skipped every prefix, including one that had already
+    /// matched. A prober could suppress SIP classification with one byte.
+    #[test]
+    fn a_non_ascii_byte_in_the_head_does_not_suppress_the_sip_match() {
+        // `BYE sip:xä@b ...` -- the 0xC3 lead byte lands at offset 9, so the
+        // 10-byte head ends mid-sequence.
+        let with_umlaut = b"BYE sip:x\xc3\xa4@b SIP/2.0\r\n\r\n";
+        assert_eq!(with_umlaut[9], 0xC3, "the multi-byte lead must sit at 9");
+        assert_eq!(detect(with_umlaut), Some(Probe::Sip));
+
+        // The same shape for the longest prefix, where the head ends exactly at
+        // the keyword boundary.
+        let subscribe = b"SUBSCRIBE \xc3\xa4 SIP/2.0\r\n\r\n";
+        assert_eq!(detect(subscribe), Some(Probe::Sip));
+    }
+
+    /// A QUIC detection does not imply a QUIC reply, unlike the DNS and STUN
+    /// pairs where the classifier's gate is also the responder's precondition.
+    ///
+    /// Pins the comment above the QUIC arm. A caller that assumes the STUN/DNS
+    /// equivalence would charge a reply budget for a packet never sent, and for
+    /// the common v1 Initial that is *every* QUIC detection.
+    #[test]
+    fn a_quic_detection_does_not_imply_a_quic_reply() {
+        use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        use crate::noise::quic::version_negotiation::version_negotiation;
+
+        // A full-size v1 Initial: detected, and deliberately unanswered.
+        let mut v1 = quic_initial();
+        v1.resize(1200, 0);
+        assert_eq!(detect(&v1), Some(Probe::Quic));
+        assert_eq!(
+            version_negotiation(&v1, &mut rng),
+            None,
+            "v1 is supported by real servers, so VN would be a false statement"
+        );
+
+        // A draft Initial below the 1200-byte floor: detected, still unanswered.
+        let mut short_draft = quic_initial();
+        short_draft[1..5].copy_from_slice(&0xff00_001du32.to_be_bytes());
+        assert_eq!(detect(&short_draft), Some(Probe::Quic));
+        assert_eq!(
+            version_negotiation(&short_draft, &mut rng),
+            None,
+            "RFC 9000 §5.2.2: servers drop undersized packets with unsupported versions"
+        );
     }
 
     /// STUN is checked before DNS so a Binding Request cannot fall through into
