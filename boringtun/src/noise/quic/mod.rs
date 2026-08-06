@@ -33,6 +33,8 @@
 //!   an offset, PADDING to an exact size).
 //! - [`tls`] / [`profiles`] — the ClientHello serializer and the Chrome /
 //!   Firefox / curl fingerprint tables.
+//! - [`version_negotiation`] — the long-header parse shared with the probe
+//!   classifier, and the one server-side packet this crate emits.
 //! - [`generator`] — `generate_client_initials`: the full datagram sequence for
 //!   a browser + SNI (two Initials for Chrome/Firefox, one for curl).
 //! - `fingerprint` (test only) — decode + parse helper used to validate parity.
@@ -59,6 +61,7 @@ pub(crate) mod initial;
 pub(crate) mod profiles;
 pub(crate) mod tls;
 pub(crate) mod varint;
+pub(crate) mod version_negotiation;
 
 #[cfg(test)]
 pub(crate) mod fingerprint;

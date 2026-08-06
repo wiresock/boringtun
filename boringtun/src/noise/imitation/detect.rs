@@ -74,29 +74,6 @@ impl Probe {
 /// query whatever else it is. The Binding-Request framing rules live in
 /// `stun::binding_request_len`, not here.
 const STUN_MAGIC_COOKIE: u32 = u32::from_be_bytes(super::stun::MAGIC_COOKIE);
-/// RFC 9000 §17.2: a connection ID is at most 20 bytes.
-const QUIC_MAX_CID_LEN: usize = 20;
-
-/// Is `version` one a client would put in a real QUIC long header?
-///
-/// This check is what separates a genuine long header from any other protocol
-/// whose leading byte happens to have the form and fixed bits set — most
-/// notably a DNS query whose transaction-ID high byte lands in `0xC0..=0xFF`.
-///
-/// Accepted: v1 (RFC 9000), v2 (RFC 9369), IETF drafts `0xff0000xx` with
-/// `xx != 0`, and the GREASE pattern `0x?a?a?a?a` (RFC 9000 §15).
-///
-/// A heuristic, not a guarantee — a crafted datagram can still place a matching
-/// value here. That is acceptable because detection never decides whether to
-/// *accept* traffic, only whether to consider answering it.
-fn is_quic_version(version: u32) -> bool {
-    match version {
-        0x0000_0001 | 0x6b33_43cf => true,
-        v if v & 0xffff_ff00 == 0xff00_0000 && v & 0xff != 0 => true,
-        v if v & 0x0f0f_0f0f == 0x0a0a_0a0a => true,
-        _ => false,
-    }
-}
 
 /// SIP request methods and the response prefix, longest first so a shorter
 /// keyword cannot shadow a longer one.
@@ -140,20 +117,11 @@ pub(crate) fn detect(data: &[u8]) -> Option<Probe> {
         return None;
     }
 
-    // QUIC long header: form and fixed bits set, a recognised version, and
-    // connection-ID lengths that fit both the RFC bound and the datagram.
-    if data.len() >= 7 && data[0] & 0xC0 == 0xC0 {
-        let version = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-        let dcid_len = data[5] as usize;
-        if is_quic_version(version) && dcid_len <= QUIC_MAX_CID_LEN {
-            let scid_len_offset = 6 + dcid_len;
-            if let Some(&scid_len) = data.get(scid_len_offset) {
-                let scid_len = scid_len as usize;
-                if scid_len <= QUIC_MAX_CID_LEN && data.len() >= scid_len_offset + 1 + scid_len {
-                    return Some(Probe::Quic);
-                }
-            }
-        }
+    // The long-header rules live in `quic::version_negotiation`, shared with
+    // the responder -- the same arrangement as the STUN and DNS pairs, for the
+    // same reason: two copies of a framing rule drift.
+    if crate::noise::quic::version_negotiation::parse_long_header(data).is_some() {
+        return Some(Probe::Quic);
     }
 
     // The framing rules live in `stun::binding_request_len`, shared with the
@@ -244,15 +212,24 @@ mod tests {
         }
     }
 
-    /// A draft version of 0 is not a real draft, and must not be accepted just
-    /// because the top 24 bits match.
+    /// The version rules now live in `quic::version_negotiation`; this asserts
+    /// the classifier still behaves the same through them, rather than
+    /// re-testing the predicate where it no longer lives.
     #[test]
-    fn quic_draft_zero_is_rejected() {
-        assert!(is_quic_version(0xff00_0001));
-        assert!(!is_quic_version(0xff00_0000));
-        assert!(is_quic_version(0x0a0a_0a0a));
-        assert!(is_quic_version(0x1a2a_3a4a), "GREASE nibble pattern");
-        assert!(!is_quic_version(0x0000_0002));
+    fn quic_version_rules_still_apply_through_the_shared_parser() {
+        let mut p = quic_initial();
+        // draft-00 is not a real draft and must not be accepted.
+        p[1..5].copy_from_slice(&0xff00_0000u32.to_be_bytes());
+        assert_eq!(detect(&p), None, "draft 0 is not a QUIC version");
+
+        p[1..5].copy_from_slice(&0xff00_0001u32.to_be_bytes());
+        assert_eq!(detect(&p), Some(Probe::Quic), "draft 1 is");
+
+        p[1..5].copy_from_slice(&0x1a2a_3a4au32.to_be_bytes());
+        assert_eq!(detect(&p), Some(Probe::Quic), "GREASE pattern is");
+
+        p[1..5].copy_from_slice(&0x0000_0002u32.to_be_bytes());
+        assert_eq!(detect(&p), None, "an unassigned version is not");
     }
 
     /// STUN is checked before DNS so a Binding Request cannot fall through into
