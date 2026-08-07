@@ -16,8 +16,16 @@
 # Requires: root, iproute2, python3 with `cryptography`, ping, and a built
 #           amneziawg-go:
 #
-#   go install github.com/amnezia-vpn/amneziawg-go@latest
+#   go install github.com/amnezia-vpn/amneziawg-go/v3@latest   # needs Go >= 1.25
 #   # or: git clone ... && go build -o amneziawg-go .
+#
+# The `/v3` suffix is required, not cosmetic: upstream's go.mod declares
+# `module github.com/amnezia-vpn/amneziawg-go/v3`, so the unsuffixed path cannot
+# reach the current line -- it resolves to v1.0.4, a tag deleted from GitHub but
+# cached forever in the module proxy. And `--version` will not tell you: the
+# version constant reads 0.0.20250522 on both the v0 and v3 lines, so the banner
+# this script prints looks identical either way. Check `go version -m` on the
+# binary if a result here surprises you.
 #
 # SAFETY: everything lives in throwaway network namespaces prefixed `agi-`. The
 # host's own interfaces, routes and WireGuard devices are never touched, and
@@ -33,9 +41,13 @@ PORT=51820
 SRV_TUN=10.77.0.1; CLI_TUN=10.77.0.2
 SRV_LINK=10.55.0.1; CLI_LINK=10.55.0.2
 
-# Single values, not ranges: amneziawg-go parses h1..h4 as plain uints. Our fork
-# accepts a bare value as a degenerate range, which is exactly the compatibility
-# claim being tested here.
+# Bare values, not ranges -- and that is a degenerate range, not a plain uint.
+# amneziawg-go parses h1..h4 through `UintRange.FromString` (device/uapi.go),
+# which splits on `-` and collapses a single part to [N,N]; only s1..s4 take a
+# plain `ParseUint`. So the bare form our fork accepts is the same one-element
+# range every real AmneziaWG config carries, which is the compatibility claim
+# under test. Keep the four distinct: amneziawg-go refuses the whole `set=`
+# transaction with "headers must not overlap" if any two intersect.
 readonly JC=4 JMIN=50 JMAX=1000
 readonly S1=120 S2=130 S3=110 S4=80
 readonly H1=169887817 H2=390382747 H3=1033691040 H4=1526332224
