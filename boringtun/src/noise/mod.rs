@@ -4,11 +4,15 @@
 pub mod amnezia;
 pub mod errors;
 pub mod handshake;
-mod imitation;
+// `pub(crate)` rather than private: `device::probe_reply` builds the replies
+// from the same modules that generate the outbound cover traffic, which is the
+// whole point -- a classifier and a responder that share a parser cannot drift
+// apart. Still crate-private, so none of it is public API.
+pub(crate) mod imitation;
 pub mod rate_limiter;
 
 // QUIC Initial imitation generator (always compiled; pulls in `aes`).
-mod quic;
+pub(crate) mod quic;
 mod session;
 mod timers;
 
@@ -107,6 +111,27 @@ const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
+
+/// The wire sizes above, re-exported for the ingress tests in `device`.
+///
+/// `device::reply_policy` decides whether a cookie reply is larger than the
+/// packet that provoked it. The decision itself takes both lengths as
+/// arguments, so production needs none of these constants — but its tests do,
+/// and asserting against remembered numbers instead would leave a change to
+/// either packet size to be discovered in the field.
+///
+/// Gated rather than three `pub(crate)` constants, for the reason
+/// [`amnezia::conforming_initiation`] gives for living in `noise` at all:
+/// widening a protocol constant crate-wide and permanently, to serve a test,
+/// is a larger change than the test is worth. The `device` half of the gate
+/// matters too — without it these are dead code in every build of the crate
+/// that leaves the feature off.
+#[cfg(all(test, feature = "device"))]
+pub(crate) mod packet_sizes {
+    pub(crate) const HANDSHAKE_INIT_SZ: usize = super::HANDSHAKE_INIT_SZ;
+    pub(crate) const HANDSHAKE_RESP_SZ: usize = super::HANDSHAKE_RESP_SZ;
+    pub(crate) const COOKIE_REPLY_SZ: usize = super::COOKIE_REPLY_SZ;
+}
 
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
@@ -328,7 +353,13 @@ impl Tunn {
                 static_private,
                 static_public,
                 peer_static_public,
-                index,
+                // `index << 8`, not `index`: the low byte is the cyclic session
+                // counter `Handshake::inc_index` advances, so the device's peer
+                // index has to sit in the top 24 bits. `Device` demuxes every
+                // inbound response, cookie and data packet with
+                // `peers_by_idx.get(&(receiver_idx >> 8))`, and that only finds
+                // the peer if the index on the wire was seeded shifted.
+                index << 8,
                 preshared_key,
                 obf,
             )?,

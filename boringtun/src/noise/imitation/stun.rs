@@ -12,9 +12,10 @@
 //! HMAC/CRC are purely cover traffic.
 
 use super::random_token;
-use rand_core::RngCore;
+use rand_core::{OsRng, RngCore};
 use ring::hmac;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 /// Plausible SOFTWARE values; deliberately generic ICE/VoIP stacks, never a
 /// product-specific string that would itself be a fingerprint.
@@ -152,9 +153,79 @@ fn random_trans_id(rng: &mut impl RngCore) -> [u8; 12] {
     id
 }
 
+/// Draw a SOFTWARE value from [`SOFTWARE_POOL`].
+///
+/// The pool's single accessor, so the responder in `device::probe_reply` and the
+/// request generator below announce stacks from the same list. The responder had
+/// its own hardcoded literal, which meant a device configured `ip=stun` sent
+/// checks claiming one of five stacks and answered as a sixth — a mismatch a
+/// prober who saw both directions could read straight off the wire.
+///
+/// Not called directly by either path any more: both go through
+/// [`host_software`], which draws from here exactly once. This stays separate
+/// because it is what makes the value differ *between* hosts, and that is
+/// testable in a way a process-wide constant is not.
+pub(crate) fn pick_software(rng: &mut impl RngCore) -> &'static str {
+    SOFTWARE_POOL[(rng.next_u32() % SOFTWARE_POOL.len() as u32) as usize]
+}
+
+/// The SOFTWARE this host announces, in both directions, for as long as the
+/// process lives.
+///
+/// A real ICE agent has one SOFTWARE for its lifetime. [`generate`] used to call
+/// [`pick_software`] per invocation, so a device configured `ip=stun` announced a
+/// different stack in every pre-handshake burst — one host presenting five ICE
+/// implementations over time, which no real client does. The connected per-peer
+/// sockets bind the listen port, so a single observer sees the requests and the
+/// Binding Success replies on one port and can compare them.
+///
+/// # Why the process, and not the `Device` or the `AmneziaConfig`
+///
+/// SOFTWARE identifies the *agent*, which is the host, not the tunnel. Three
+/// scopes were available and two are wrong:
+///
+/// - **`AmneziaConfig`** derives `PartialEq`, and `Device::set_obfuscation`
+///   compares configs to decide whether anything changed. A field drawn at
+///   random would make that comparison permanently false, so every `awg
+///   syncconf` — which re-sends the whole `[Interface]` block on any peer add or
+///   revoke — would walk and lock every peer. It is also built per tunnel in six
+///   places in `ffi`, which would give a value per tunnel rather than per host.
+/// - **`Device`** is the right lifetime for the daemon but does not exist in the
+///   `ffi` path, where callers build `Tunn`s directly; threading it would mean a
+///   breaking parameter on all three public `Tunn` constructors and would still
+///   leave `ffi` without a value to pass.
+///
+/// The process is the one scope both paths already share, and multiple `Device`s
+/// in one process are still one host, so sharing is right rather than merely
+/// convenient.
+///
+/// # Why not derived from the static public key
+///
+/// It would survive restarts, which sounds like an improvement and is not. The
+/// static public key is public — it sits in every peer's config — so anyone
+/// holding it could compute the expected SOFTWARE and use the match as a
+/// confirmation test. The pool has five entries, so that is only ~2.3 bits, but
+/// it is 2.3 bits of "is this host the one with that key" available for free and
+/// stable across network moves, where a per-process draw offers none and is
+/// re-rolled on every restart.
+///
+/// It is also not available when it is needed: `Device::new` builds the responder
+/// before any key is set — `key_pair` is `Default` until UAPI supplies one — so a
+/// key-derived value would have to change when the key arrives and again on
+/// rekey, which is precisely the per-burst variation being fixed here.
+pub(crate) fn host_software() -> &'static str {
+    static HOST_SOFTWARE: OnceLock<&'static str> = OnceLock::new();
+    // `OsRng` and not a seeded generator: this is drawn once per process, so the
+    // syscall cost is irrelevant, and it must not be reproducible from anything
+    // an observer could also hold.
+    HOST_SOFTWARE.get_or_init(|| pick_software(&mut OsRng))
+}
+
 /// Generate the two STUN Binding Request datagrams of an ICE connectivity check.
 pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
-    let software = SOFTWARE_POOL[(rng.next_u32() % SOFTWARE_POOL.len() as u32) as usize];
+    // Pinned per process, not drawn from `rng`: see [`host_software`]. The two
+    // checks below already shared one value; the burst before this one did not.
+    let software = host_software();
     let username = format!("{}:{}", random_token(4, 8, rng), random_token(4, 8, rng));
     let ice_pwd: Vec<u8> = random_token(22, 22, rng).into_bytes();
     let priority = rng.next_u32();
@@ -183,9 +254,24 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
     vec![first, second]
 }
 
-// The response side has no caller yet -- the ingress hook that will reach it
-// is the next commit. Scoped to these items rather than the module, so the
-// request side stays covered by the lint.
+/// The largest Binding Request this crate will look at.
+///
+/// A real ICE connectivity check is well under 200 bytes -- the ones
+/// [`generate`] emits are around 120 -- so this is generous by a factor of five
+/// and rejects nothing a genuine client sends.
+///
+/// It exists because everything downstream of the framing check is linear in
+/// the message length, and none of it is covered by the reply budget.
+/// [`check_fingerprint`] walks the attribute list and CRC-32s the whole message
+/// bit-serially; a datagram carrying a deliberately *wrong* FINGERPRINT is
+/// rejected, so no reply is built and `ProbeBudget` is never charged. Without a
+/// bound, one 65 KB datagram buys an attacker ~65 KB of CRC per packet, for
+/// free, repeatable, and invisible to the ceiling that is supposed to bound what
+/// answering strangers costs.
+///
+/// Applied here, in the parser both halves share, so the classifier stops
+/// looking at exactly the point the responder stops answering.
+const MAX_BINDING_REQUEST_LEN: usize = 1024;
 
 /// Validate `data` as a well-framed STUN Binding Request and return the
 /// declared attribute length.
@@ -202,7 +288,7 @@ pub(crate) fn generate(rng: &mut impl RngCore) -> Vec<Vec<u8>> {
 /// field are always zero". §6.3 has a receiver check "that the message length
 /// is sensible" before anything else.
 pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
-    if data.len() < HEADER_LEN {
+    if data.len() < HEADER_LEN || data.len() > MAX_BINDING_REQUEST_LEN {
         return None;
     }
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
@@ -220,7 +306,7 @@ pub(super) fn binding_request_len(data: &[u8]) -> Option<usize> {
 }
 
 /// What `msg` carries in place of a FINGERPRINT attribute.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fingerprint {
     /// The attribute list tiles the message exactly and carries no
@@ -250,7 +336,7 @@ enum Fingerprint {
 /// [`binding_success`] has already checked it equals `HEADER_LEN + msg_len`.
 /// Calling this on an unvalidated datagram would let trailing bytes change
 /// which attribute counts as last.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     let mut off = HEADER_LEN;
     while off + 4 <= msg.len() {
@@ -290,6 +376,11 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
     Fingerprint::Absent
 }
 
+// Item-scoped, not module-scoped: only the responder half is unreachable
+// without the `device` feature. A module-wide allow would also stop the
+// lint reporting an unused *generator*, which is the half that ships in
+// every build.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Upper bound on the SOFTWARE value this encoder will emit, in bytes.
 ///
 /// Two jobs. It keeps `software.len() as u16` and the message-length cast
@@ -306,7 +397,7 @@ fn check_fingerprint(msg: &[u8]) -> Fingerprint {
 /// stricter than necessary on a value we choose ourselves costs nothing.
 const MAX_SOFTWARE_LEN: usize = 127;
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Write XOR-MAPPED-ADDRESS (RFC 5389 §15.2) for `client` at `off`.
 ///
 /// The port is XORed with the top half of the magic cookie and the address with
@@ -341,13 +432,13 @@ fn write_xor_mapped_address(pkt: &mut [u8], off: usize, client: SocketAddr, tran
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Attribute size of XOR-MAPPED-ADDRESS for this address family.
 fn xor_mapped_len(client: SocketAddr) -> usize {
     4 + if client.is_ipv4() { 8 } else { 20 }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 /// Build a Binding Success Response to `request`, reporting `client` as the
 /// reflexive address.
 ///
@@ -431,6 +522,67 @@ pub(crate) fn binding_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Binding Request larger than [`MAX_BINDING_REQUEST_LEN`] is refused by
+    /// the shared framing check, before any attribute walk or CRC.
+    ///
+    /// A packet-rate bound, not a security boundary — see
+    /// [`MAX_BINDING_REQUEST_LEN`] for the measurements. CRC cost is flat per
+    /// byte, so this does not change what an attacker spends per byte; it
+    /// changes how many packets a second they must send to spend it.
+    ///
+    /// Asserted through `binding_request_len` rather than `binding_success`
+    /// because it is the *shared* parser: the classifier has to stop looking at
+    /// exactly the point the responder stops answering, which is the property
+    /// three earlier review rounds found broken between these two.
+    #[test]
+    fn an_oversized_binding_request_is_refused_by_the_shared_parser() {
+        // Well-framed in every other respect: correct type, correct cookie,
+        // 4-byte-aligned length, and len == HEADER_LEN + msg_len.
+        let framed = |n: usize| {
+            let mut m = vec![0u8; n];
+            m[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
+            m[2..4].copy_from_slice(&((n - HEADER_LEN) as u16).to_be_bytes());
+            m[4..8].copy_from_slice(&MAGIC_COOKIE);
+            m
+        };
+
+        // The boundary itself is accepted, so the bound is not merely "small".
+        assert_eq!(
+            binding_request_len(&framed(MAX_BINDING_REQUEST_LEN)),
+            Some(MAX_BINDING_REQUEST_LEN - HEADER_LEN),
+            "a request exactly at the limit is still well-framed"
+        );
+        assert_eq!(
+            binding_request_len(&framed(MAX_BINDING_REQUEST_LEN + 4)),
+            None,
+            "one attribute past the limit must be refused"
+        );
+        assert_eq!(
+            binding_request_len(&framed(65_504)),
+            None,
+            "a 65 KB request must be refused before anything walks it"
+        );
+
+        // And the responder agrees, because it goes through the same parser.
+        let client: SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        assert!(
+            binding_success(&framed(65_504), client, "Chromium").is_none(),
+            "classifier and responder must stop at the same size"
+        );
+
+        // The bound must stay above anything this crate actually emits, or real
+        // ICE checks would start being refused.
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        for req in generate(&mut rng) {
+            assert!(
+                req.len() <= MAX_BINDING_REQUEST_LEN,
+                "our own Binding Request is {} bytes, over the {}-byte limit",
+                req.len(),
+                MAX_BINDING_REQUEST_LEN
+            );
+        }
+    }
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -501,8 +653,10 @@ mod tests {
     #[test]
     fn generates_two_valid_binding_requests() {
         // Reproduce generate()'s credential derivation so the test knows ice_pwd.
+        // SOFTWARE is deliberately absent: it comes from `host_software()` now,
+        // so `generate` draws nothing from `rng` for it and a placeholder draw
+        // here would desynchronise this reproduction from the real stream.
         let mut rng = ChaCha8Rng::seed_from_u64(7);
-        let _software = SOFTWARE_POOL[(rng.next_u32() % SOFTWARE_POOL.len() as u32) as usize];
         let _username = format!(
             "{}:{}",
             random_token(4, 8, &mut rng),
@@ -519,6 +673,106 @@ mod tests {
         verify_packet(&packets[1], &ice_pwd, true);
         // The two checks use distinct transaction ids.
         assert_ne!(packets[0][8..20], packets[1][8..20]);
+    }
+
+    /// The SOFTWARE attribute (0x8022) of a STUN message, as a string.
+    fn software_of(msg: &[u8]) -> String {
+        let (_, v) = parse_attrs(msg)
+            .into_iter()
+            .find(|&(t, _)| t == 0x8022)
+            .expect("SOFTWARE present");
+        String::from_utf8(v).expect("SOFTWARE is ASCII")
+    }
+
+    /// How many bursts the two tests below compare.
+    ///
+    /// Not 2. The pool has five entries, so a re-drawing `generate` still
+    /// announces the same value across two bursts one time in five — a test that
+    /// compared a pair would pass on a fifth of the pools it was given and read
+    /// as a regression that comes and goes. Across `BURSTS` draws the chance of
+    /// seeing one value throughout is `5^-(BURSTS-1)`, which for 32 is beyond
+    /// any run this will ever have, so the failure is a certainty rather than a
+    /// likelihood.
+    const BURSTS: u64 = 32;
+
+    /// The regression this pins: `generate` drew a fresh SOFTWARE per call, so a
+    /// device configured `ip=stun` announced a different ICE stack in every
+    /// pre-handshake burst. One host does not change ICE implementation between
+    /// connectivity checks.
+    ///
+    /// Distinct seeds, because a burst's other credentials *must* keep varying —
+    /// this has to fail when SOFTWARE is re-drawn, not merely when the whole
+    /// packet is reproducible.
+    #[test]
+    fn every_burst_announces_the_same_software() {
+        let mut seen = std::collections::HashSet::new();
+        let mut trans_ids = std::collections::HashSet::new();
+        for seed in 0..BURSTS {
+            let burst = generate(&mut ChaCha8Rng::seed_from_u64(seed));
+            // Both checks of a burst, so the within-burst agreement that always
+            // held stays pinned alongside the across-burst one that did not.
+            seen.insert(software_of(&burst[0]));
+            seen.insert(software_of(&burst[1]));
+            trans_ids.insert(burst[0][8..20].to_vec());
+            trans_ids.insert(burst[1][8..20].to_vec());
+        }
+
+        assert_eq!(
+            seen.len(),
+            1,
+            "one host announced several ICE stacks across bursts: {:?}",
+            seen
+        );
+        // The rest of the burst must still vary, or the assertion above would
+        // also pass for a `generate` that had stopped varying anything at all.
+        assert_eq!(
+            trans_ids.len(),
+            2 * BURSTS as usize,
+            "transaction ids must still vary"
+        );
+    }
+
+    /// Both directions announce one stack. The connected per-peer sockets bind
+    /// the listen port, so a single observer sees our Binding Requests and our
+    /// Binding Success replies on the same port and can compare them.
+    ///
+    /// This pins the request half against the pin the responder also reads;
+    /// `device::probe_reply` pins that the responder reads it, which is the half
+    /// that cannot be reached from this module.
+    #[test]
+    fn requests_and_responses_announce_the_same_software() {
+        let client: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        for seed in 0..BURSTS {
+            let request = &generate(&mut ChaCha8Rng::seed_from_u64(seed))[0];
+            let response = binding_success(request, client, host_software()).expect("well-formed");
+            assert_eq!(
+                software_of(request),
+                software_of(&response),
+                "request and response disagreed on burst {}",
+                seed
+            );
+        }
+    }
+
+    /// The pin is one draw from [`SOFTWARE_POOL`], so what makes the value differ
+    /// between hosts is that draw. A pool that returned one value in practice
+    /// would make the pinned value a constant identifying this fork — which is
+    /// exactly what pinning must not become.
+    ///
+    /// Tested on `pick_software` rather than `host_software`, because a single
+    /// test binary is a single process and so observes a single pinned value.
+    #[test]
+    fn the_software_pool_is_not_effectively_a_constant() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..512u64 {
+            seen.insert(pick_software(&mut ChaCha8Rng::seed_from_u64(seed)));
+        }
+        assert_eq!(
+            seen.len(),
+            SOFTWARE_POOL.len(),
+            "the draw must reach every pool entry, saw {:?}",
+            seen
+        );
     }
 
     fn parse_attrs(msg: &[u8]) -> Vec<(u16, Vec<u8>)> {

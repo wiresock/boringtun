@@ -1,6 +1,10 @@
 // Copyright (c) 2024 BoringTun contributors. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+// For `conforming_initiation` only, and gated exactly as it is: its caller is
+// `device::probe_reply`, which does not exist without the `device` feature.
+#[cfg(all(test, feature = "device"))]
+use super::HANDSHAKE_INIT;
 use super::{
     handshake::ObfuscationRanges, COOKIE_REPLY_SZ, DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ,
     HANDSHAKE_RESP_SZ,
@@ -70,6 +74,52 @@ impl TryFrom<u8> for AmneziaImitationProtocol {
             4 => Ok(Self::Stun),
             _ => Err(()),
         }
+    }
+}
+
+impl AmneziaImitationProtocol {
+    /// Every variant, so a caller offering these as choices cannot fall behind
+    /// the enum. `boringtun-cli` builds its `--imitate-protocol` value list from
+    /// this rather than restating it.
+    pub const ALL: [Self; 5] = [Self::None, Self::Dns, Self::Quic, Self::Sip, Self::Stun];
+
+    /// The name used on the command line and in `Ip =` config values.
+    ///
+    /// A `match` over `self` rather than a lookup table: adding a variant fails
+    /// to compile here, which is the whole point. The previous arrangement had
+    /// the CLI map these strings with a `_ =>` catch-all, so a new variant that
+    /// nobody wired up silently meant "no imitation".
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Dns => "dns",
+            Self::Quic => "quic",
+            Self::Sip => "sip",
+            Self::Stun => "stun",
+        }
+    }
+
+    /// Does this protocol's cover traffic carry a hostname?
+    ///
+    /// `None` and `Stun` do not, and [`AmneziaImitation::new`] silently drops a
+    /// domain supplied with them. A caller that took one from an operator should
+    /// use this to say so rather than let it vanish.
+    pub fn uses_domain(self) -> bool {
+        matches!(self, Self::Dns | Self::Sip | Self::Quic)
+    }
+}
+
+impl std::str::FromStr for AmneziaImitationProtocol {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // `.iter().copied()`, not `.into_iter()`: in edition 2018 the latter on
+        // an array yields references, so this would be a `Result<&Self, _>`.
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|p| p.as_str() == s)
+            .ok_or(())
     }
 }
 
@@ -158,9 +208,51 @@ impl AmneziaImitation {
         }
     }
 
-    fn domain(&self) -> Option<&str> {
+    /// The domain that survived validation, if any.
+    ///
+    /// `pub` so a caller can tell whether the hostname it supplied was actually
+    /// kept: [`Self::new`] drops an invalid host and falls back to a randomly
+    /// generated one at emit time, which is a silent substitution an operator
+    /// would otherwise only discover in a packet capture.
+    pub fn domain(&self) -> Option<&str> {
         self.domain.as_deref()
     }
+}
+
+/// A conforming AmneziaWG handshake initiation, before and after
+/// [`AmneziaConfig::prepend_outbound`].
+///
+/// Lives here, next to the padding rules, because `device::probe_reply`'s
+/// ordering test needs a datagram that is *simultaneously* valid AmneziaWG and a
+/// valid DNS query — which is exactly what this module produces under `ip=dns`.
+/// Building it there instead meant exporting `HANDSHAKE_INIT` and
+/// `HANDSHAKE_INIT_SZ` crate-wide for a test, permanently widening two
+/// protocol constants that nothing in production needs outside `noise`.
+///
+/// Gated on `device` as well as `test`, for the reason [`super::packet_sizes`]
+/// gives: the only caller is behind that feature, so a test build without it
+/// carries a `dead_code` warning for this function -- and `cargo hack test
+/// --each-feature`, which CI runs, compiles exactly that configuration.
+#[cfg(all(test, feature = "device"))]
+pub(crate) fn conforming_initiation(
+    cfg: &AmneziaConfig,
+    obf: ObfuscationRanges,
+    rng: &mut impl RngCore,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut original = vec![0u8; HANDSHAKE_INIT_SZ];
+    original[..4].copy_from_slice(&HANDSHAKE_INIT.to_le_bytes());
+    for (i, byte) in original[4..].iter_mut().enumerate() {
+        *byte = (i as u8) ^ 0x5a;
+    }
+
+    let mut buffer = vec![0u8; HANDSHAKE_INIT_SZ + 1280];
+    buffer[..HANDSHAKE_INIT_SZ].copy_from_slice(&original);
+    let padded = cfg
+        .prepend_outbound(obf, &mut buffer, HANDSHAKE_INIT_SZ, rng)
+        .expect("S1 must leave room for the initiation")
+        .to_vec();
+
+    (original, padded)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -525,6 +617,72 @@ impl AmneziaConfig {
             }
             _ => None,
         }
+    }
+
+    /// How many bytes a `cookie_len`-byte cookie reply will occupy on the wire,
+    /// S3 prefix included.
+    ///
+    /// Exists so the ingress path can decide whether the reply is an amplifier
+    /// *before* [`Self::prepend_outbound`] generates junk for it. With S3 near
+    /// its 65443-byte maximum, filling a prefix for a reply that policy then
+    /// refuses would itself be the flood — one forged 148-byte initiation per
+    /// 65 KB of keystream, which is a cheaper attack than the amplification it
+    /// was meant to prevent.
+    ///
+    /// Reads the prefix size through [`Self::outbound_junk_size`], the same
+    /// accessor `prepend_outbound` uses, so the prediction cannot drift from
+    /// the production by way of two spellings of one lookup. What it still has
+    /// to assume is the packet *kind*, which `prepend_outbound` derives from
+    /// the tag on the wire, so
+    /// [`tests::the_predicted_cookie_reply_length_is_the_one_actually_produced`]
+    /// pins the two together.
+    ///
+    /// Gated because the ingress path is the only caller: without `device` this
+    /// is dead code, and a crate built without the feature would carry a
+    /// `dead_code` warning for it. `test` is in the list so the test above still
+    /// runs on a default-feature `cargo test`.
+    #[cfg(any(test, feature = "device"))]
+    pub(crate) fn cookie_reply_len(&self, cookie_len: usize) -> usize {
+        cookie_len.saturating_add(self.outbound_junk_size(PacketKind::CookieReply))
+    }
+
+    /// The S sizes at which a cookie reply would be larger than the packet that
+    /// provokes it, if there are any.
+    ///
+    /// Returns `(kind, request_len, reply_len)` for the first packet kind that
+    /// amplifies, where `kind` is `"S1"` (an initiation) or `"S2"` (a response).
+    ///
+    /// `device::reply_policy::cookie_verdict` suppresses such a reply, because a
+    /// cookie reply aimed at a forged source is a reflector and the ratio is
+    /// fixed entirely by this configuration — an attacker cannot influence it.
+    /// The cost is real: the peer never learns the cookie, so it can never
+    /// produce a valid mac2, and every one of its handshakes fails for as long
+    /// as the device stays over `HANDSHAKE_RATE_LIMIT`.
+    ///
+    /// This exists so the operator hears about that when they set the sizes,
+    /// rather than during the flood. The condition is decidable from S1/S2/S3
+    /// alone — `64 + S3 > 148 + S1` for an initiation, `64 + S3 > 92 + S2` for a
+    /// response — so there is no reason to discover it at send time.
+    ///
+    /// It deliberately does **not** reject. The AmneziaWG kernel module accepts
+    /// these combinations, and a config this fork refuses but the reference
+    /// implementation runs would be an interoperability break for a
+    /// configuration that is merely unwise.
+    ///
+    /// Gated with `cookie_reply_len` above: `device::api` is the only caller.
+    #[cfg(any(test, feature = "device"))]
+    pub(crate) fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
+        let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
+        for (label, junk, base) in [
+            ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
+            ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
+        ] {
+            let request = base + junk as usize;
+            if reply > request {
+                return Some((label, request, reply));
+            }
+        }
+        None
     }
 
     pub(crate) fn prepend_outbound<'a>(
@@ -1707,6 +1865,40 @@ mod tests {
         assert_eq!(packet.len(), MAX_SENDABLE_DATAGRAM);
     }
 
+    /// [`AmneziaConfig::cookie_reply_len`] must agree with the length
+    /// `prepend_outbound` actually produces, for every S3 from zero to the
+    /// largest `validate` admits.
+    ///
+    /// The ingress path predicts the length so it can refuse an amplifying
+    /// cookie reply *without* paying to generate its junk. A prediction that
+    /// ran low would let the amplifier through; one that ran high would silence
+    /// cookie replies for a configuration that is not an amplifier at all. Both
+    /// are silent, so the two are pinned to each other here rather than left to
+    /// agree by inspection.
+    #[test]
+    fn the_predicted_cookie_reply_length_is_the_one_actually_produced() {
+        let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
+        for s3 in [0u16, 1, 110, 1280, max_s3] {
+            let cfg = AmneziaConfig::new(0, 0, s3, 0);
+            cfg.validate().expect("S3 within the validated range");
+
+            let produced = packet_after_prepend(
+                &cfg,
+                COOKIE_REPLY_SZ,
+                COOKIE_REPLY,
+                COOKIE_REPLY_SZ + s3 as usize,
+            )
+            .len();
+
+            assert_eq!(
+                cfg.cookie_reply_len(COOKIE_REPLY_SZ),
+                produced,
+                "S3 = {}: predicted length must match the datagram prepend_outbound emits",
+                s3
+            );
+        }
+    }
+
     #[test]
     fn quic_imitation_uses_short_header_for_every_packet_kind() {
         let cfg = AmneziaConfig::new(8, 9, 10, 11)
@@ -1914,5 +2106,53 @@ mod tests {
             let mut dns = vec![0u8; size];
             fill_dns_minimal_root_query(&mut dns, &mut rng);
         }
+    }
+
+    /// `cookie_reply_amplifies` agrees with the rule `reply_policy` enforces,
+    /// on both packet kinds and at the boundary.
+    ///
+    /// The two live in different modules and neither can see the other, so the
+    /// only thing keeping them in step is this test. The response bound
+    /// (`S3 > S2 + 28`) is the tighter of the two and had no coverage at all.
+    #[test]
+    fn cookie_reply_amplifies_agrees_with_the_rule_that_suppresses() {
+        // Parity exactly: 64 + S3 == 148 + S1 and == 92 + S2. Not an amplifier.
+        let ok = AmneziaConfig::new(100, 156, 184, 0);
+        assert_eq!(
+            ok.cookie_reply_amplifies(),
+            None,
+            "parity is not amplifying"
+        );
+
+        // One byte over on the initiation side.
+        let over_s1 = AmneziaConfig::new(100, 156, 185, 0);
+        assert_eq!(
+            over_s1.cookie_reply_amplifies(),
+            Some(("S1", 248, 249)),
+            "one byte past the initiation bound must be reported"
+        );
+
+        // The response bound is tighter, so a config can clear S1 and fail S2.
+        let over_s2 = AmneziaConfig::new(200, 100, 250, 0);
+        assert_eq!(
+            over_s2.cookie_reply_amplifies(),
+            Some(("S2", 192, 314)),
+            "the response bound is the tighter one and must be checked too"
+        );
+
+        // The shape a real installer rolls: S1 small, S3 large.
+        let installer = AmneziaConfig::new(15, 15, 150, 0);
+        assert!(
+            installer.cookie_reply_amplifies().is_some(),
+            "S1=15 S3=150 is a shape independent rolls produce, and it amplifies"
+        );
+
+        // And the interop harness's own sizes must not trip it.
+        let harness = AmneziaConfig::new(120, 130, 110, 80);
+        assert_eq!(
+            harness.cookie_reply_amplifies(),
+            None,
+            "the sizes scripts/awg-interop-poc.sh runs must keep their cookies"
+        );
     }
 }

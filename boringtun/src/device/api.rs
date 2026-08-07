@@ -5,6 +5,7 @@ use super::dev_lock::LockReadGuard;
 use super::drop_privileges::get_saved_ids;
 use super::{AllowedIP, Device, Error, SocketAddr};
 use crate::device::Action;
+use crate::noise::amnezia::AmneziaConfig;
 use crate::noise::handshake::ObfuscationRanges;
 use crate::serialization::KeyBytes;
 use crate::x25519;
@@ -112,9 +113,26 @@ impl AwgParams {
         if !self.seen {
             return Ok(());
         }
+        let (obf, amnezia) = self.merged(device.config.obf, &device.config.amnezia)?;
+        if device.set_obfuscation(obf, amnezia) {
+            tracing::info!(message = "AmneziaWG parameters updated");
+        }
+        Ok(())
+    }
 
-        let cur_obf = device.config.obf;
-        let cur_junk = device.config.amnezia.pre_handshake_junk;
+    /// Merge this transaction over the device's current settings.
+    ///
+    /// Split out of [`Self::apply`] so the merge can be tested without a
+    /// `Device`, which needs a TUN interface and root. The property worth
+    /// testing is that protocol imitation *survives* — it has no UAPI key, so it
+    /// can only arrive via `DeviceConfig` at startup, and rebuilding rather than
+    /// merging here would make any `awg setconf` silently switch camouflage off.
+    fn merged(
+        &self,
+        cur_obf: ObfuscationRanges,
+        cur_amnezia: &AmneziaConfig,
+    ) -> Result<(ObfuscationRanges, AmneziaConfig), i32> {
+        let cur_junk = cur_amnezia.pre_handshake_junk;
         let (h1, h2, h3, h4) = (
             self.h1
                 .unwrap_or((cur_obf.h1_init.start, cur_obf.h1_init.end)),
@@ -134,7 +152,7 @@ impl AwgParams {
         // protocol-imitation settings, which have no UAPI key of their own and
         // therefore can only arrive via `DeviceConfig` at startup -- so any
         // `set=1` mentioning an AmneziaWG key would silently turn imitation off.
-        let mut amnezia = device.config.amnezia.clone();
+        let mut amnezia = cur_amnezia.clone();
         amnezia.init_packet_junk_size = self.s1.unwrap_or(amnezia.init_packet_junk_size);
         amnezia.response_packet_junk_size = self.s2.unwrap_or(amnezia.response_packet_junk_size);
         amnezia.cookie_packet_junk_size = self.s3.unwrap_or(amnezia.cookie_packet_junk_size);
@@ -154,10 +172,27 @@ impl AwgParams {
             return Err(EINVAL);
         }
 
-        if device.set_obfuscation(obf, amnezia) {
-            tracing::info!(message = "AmneziaWG parameters updated");
+        // Not a rejection: the kernel module accepts these sizes and refusing
+        // them here would be an interop break for a configuration that is
+        // merely unwise. But `reply_policy::cookie_verdict` will suppress every
+        // cookie reply this config produces, and the peer that needs one cannot
+        // complete a handshake while the device is under load. The operator can
+        // only fix that if they are told, and here -- at `awg set` -- is when
+        // they can, rather than during the flood.
+        if let Some((which, request, reply)) = amnezia.cookie_reply_amplifies() {
+            tracing::warn!(
+                // One line, single-spaced. A `\`-continued literal here read
+                // fine in the source and then `cargo fmt` joined the lines,
+                // leaving ~28 literal spaces inside the message -- which is what
+                // an operator would have had to grep past in the log.
+                message = "S3 makes cookie replies larger than the packets that provoke them, so they will be suppressed and handshakes will fail while the device is under load; lower S3, or raise the S value named below",
+                larger_than = which,
+                request_bytes = request,
+                reply_bytes = reply
+            );
         }
-        Ok(())
+
+        Ok((obf, amnezia))
     }
 }
 
@@ -670,6 +705,53 @@ fn api_set_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Protocol imitation survives a `set=1` that carries AmneziaWG keys.
+    ///
+    /// It has no UAPI key of its own — `awg showconf` drops keys it does not
+    /// know, so a value set that way would not round-trip — which makes startup
+    /// configuration the only way in. If `merged` rebuilt the config instead of
+    /// merging over it, every `awg setconf` would silently switch camouflage off
+    /// and nothing would say so.
+    ///
+    /// The comment at the merge site asserted this; nothing tested it. A
+    /// cross-module claim in prose is exactly the thing that drifts.
+    #[test]
+    fn a_set_transaction_preserves_protocol_imitation() {
+        use crate::noise::amnezia::{
+            AmneziaImitation, AmneziaImitationBrowser, AmneziaImitationProtocol,
+        };
+
+        let current = AmneziaConfig::new(1, 1, 1, 1).with_protocol_imitation_browser(
+            AmneziaImitationProtocol::Quic,
+            Some("example.com".to_owned()),
+            AmneziaImitationBrowser::Firefox,
+        );
+        let expected_imitation = AmneziaImitation::new(
+            AmneziaImitationProtocol::Quic,
+            Some("example.com".to_owned()),
+            AmneziaImitationBrowser::Firefox,
+        );
+
+        // A transaction that touches only the S sizes, as `awg setconf` does.
+        let mut params = AwgParams::default();
+        params.set_size("s1", 120);
+        params.set_size("s2", 130);
+
+        let (_, merged) = params
+            .merged(ObfuscationRanges::default(), &current)
+            .expect("valid parameters");
+
+        assert_eq!(
+            merged.imitation, expected_imitation,
+            "the S sizes were updated but imitation must be carried over intact"
+        );
+        assert_eq!(merged.init_packet_junk_size, 120, "s1 applied");
+        assert_eq!(merged.response_packet_junk_size, 130, "s2 applied");
+        // And the keys the transaction did not mention keep their old values.
+        assert_eq!(merged.cookie_packet_junk_size, 1, "s3 untouched");
+        assert_eq!(merged.transport_packet_junk_size, 1, "s4 untouched");
+    }
 
     #[test]
     fn parse_tag_range_accepts_bare_values_and_ranges() {

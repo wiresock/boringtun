@@ -161,7 +161,9 @@ pub(super) fn question_end(query: &[u8]) -> Option<usize> {
 /// **Size**: 12-byte header plus the echoed question, which is never larger
 /// than the query -- any EDNS OPT record in the request is dropped rather than
 /// echoed. So this reply cannot amplify, unlike the STUN one.
-#[allow(dead_code)]
+// Only `device::probe_reply` calls this, and only behind the `device`
+// feature; without an ingress path there is nothing to answer.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 pub(crate) fn servfail(query: &[u8]) -> Option<Vec<u8>> {
     let end = question_end(query)?;
 

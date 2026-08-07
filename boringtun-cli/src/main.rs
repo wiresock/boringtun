@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use boringtun::device::drop_privileges::drop_privileges;
-use boringtun::device::{DeviceConfig, DeviceHandle};
+use boringtun::device::{DeviceConfig, DeviceHandle, DEFAULT_PROBE_REPLY_BYTES_PER_SEC};
+use boringtun::noise::amnezia::{AmneziaConfig, AmneziaImitation, AmneziaImitationProtocol};
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, Command};
 use daemonize::{Daemonize, Outcome};
@@ -85,6 +86,46 @@ fn main() {
                 .long("disable-multi-queue")
                 .action(ArgAction::SetTrue)
                 .help("Disable using multiple queues for the tunnel interface"),
+            // Protocol imitation has no UAPI key: `awg showconf` drops keys it
+            // does not know, so a value set over the UAPI would not survive a
+            // round trip. It is therefore startup-only, and these are the only
+            // way to reach it from the binary.
+            // The value list comes from `AmneziaImitationProtocol::ALL`, not a
+            // literal: a variant added to the enum without a name here would
+            // otherwise be unreachable, and a name here without an enum arm used
+            // to fall through a `_ =>` catch-all to "no imitation" — an operator
+            // asking for camouflage and silently getting none.
+            Arg::new("imitate-protocol")
+                .long("imitate-protocol")
+                .env("WG_IMITATE_PROTOCOL")
+                .value_parser(PossibleValuesParser::new(
+                    AmneziaImitationProtocol::ALL.map(|p| p.as_str()),
+                ))
+                .help("Protocol to imitate: shapes outbound cover traffic, and selects which probes the listen port answers")
+                .default_value(AmneziaImitationProtocol::None.as_str()),
+            Arg::new("imitate-domain")
+                .long("imitate-domain")
+                .env("WG_IMITATE_DOMAIN")
+                .help("Hostname to use in imitated DNS/SIP/QUIC cover traffic (a random one is generated when omitted)"),
+            // `value_parser` rather than a hand-rolled `.parse().expect(...)`:
+            // clap then rejects a bad value inside `get_matches()`, which runs
+            // *before* the daemonize fork. Parsed afterwards, a panic would land
+            // in a child whose stderr is already /dev/null and whose log file
+            // says "started successfully", leaving the operator with no clue
+            // which flag was wrong.
+            //
+            // No `default_value`: the default is the library constant, and
+            // restating it here as a string would be a second copy to drift.
+            // Absence means "the library default", resolved below.
+            Arg::new("probe-reply-rate")
+                .long("probe-reply-rate")
+                .env("WG_PROBE_REPLY_RATE")
+                .value_parser(clap::value_parser!(u32))
+                .help(format!(
+                    "Aggregate ceiling, in bytes per second, on replies to unauthenticated probes; \
+                     0 answers nothing [default: {} when --imitate-protocol is set, otherwise off]",
+                    DEFAULT_PROBE_REPLY_BYTES_PER_SEC
+                )),
         ])
         .get_matches();
 
@@ -117,6 +158,67 @@ fn main() {
         .unwrap()
         .parse()
         .expect("Invalid verbosity value");
+
+    // Resolved here, beside every other argument conversion and *before* the
+    // daemonize fork below. Anything that can reject a value has to run while
+    // stderr is still the operator's terminal.
+    let imitate: AmneziaImitationProtocol = matches
+        .get_one::<String>("imitate-protocol")
+        .unwrap()
+        .parse()
+        // Unreachable: clap's value_parser accepts only the names `FromStr`
+        // knows, because both come from `AmneziaImitationProtocol::ALL`.
+        .expect("clap accepted an imitation protocol that FromStr rejects");
+    let imitate_domain = matches.get_one::<String>("imitate-domain").cloned();
+    let probe_reply_rate: u32 = match matches.get_one::<u32>("probe-reply-rate") {
+        Some(&rate) => rate,
+        // Answering probes is what makes an imitated service credible, so it is
+        // on by default once a protocol is named — but a device that imitates
+        // nothing stays byte-for-byte silent to unauthenticated sources, which
+        // is what it did before this flag existed.
+        None if imitate == AmneziaImitationProtocol::None => 0,
+        None => DEFAULT_PROBE_REPLY_BYTES_PER_SEC,
+    };
+
+    // A rate without a protocol builds a responder that answers nothing:
+    // `probe_reply::reply_to` returns before it classifies anything when the
+    // imitation protocol is `none`. Refused rather than accepted for the same
+    // reason `--imitate-domain` is below -- an operator who asked for a service
+    // to be answerable and silently got silence has no way to find out but a
+    // packet capture. `--probe-reply-rate 0` stays legal everywhere: that is
+    // the spelling for "answer nothing", and it means the same thing here.
+    if probe_reply_rate > 0 && imitate == AmneziaImitationProtocol::None {
+        eprintln!(
+            "--probe-reply-rate {} has no effect without --imitate-protocol; \
+             the listen port only answers probes for the service it imitates",
+            probe_reply_rate
+        );
+        exit(1);
+    }
+
+    // A domain that reaches `AmneziaImitation::new` and fails its validation is
+    // dropped, and a *random* one is generated at emit time instead. Silently
+    // camouflaging as a name the operator never chose is worse than refusing to
+    // start, and a packet capture is the only other way to notice.
+    if let Some(domain) = imitate_domain.as_deref() {
+        if !imitate.uses_domain() {
+            eprintln!(
+                "--imitate-domain is not used by --imitate-protocol {}; \
+                 only dns, sip and quic carry a hostname",
+                imitate.as_str()
+            );
+            exit(1);
+        }
+        let checked = AmneziaImitation::new(imitate, imitate_domain.clone(), Default::default());
+        if checked.domain().is_none() {
+            eprintln!(
+                "--imitate-domain {:?} is not a valid host for --imitate-protocol {}",
+                domain,
+                imitate.as_str()
+            );
+            exit(1);
+        }
+    }
 
     // Create a socketpair to communicate between forked processes
     let (sock1, sock2) = UnixDatagram::pair().unwrap();
@@ -177,9 +279,14 @@ fn main() {
         use_connected_socket: !matches.get_flag("disable-connected-udp"),
         #[cfg(target_os = "linux")]
         use_multi_queue: !matches.get_flag("disable-multi-queue"),
-        // AmneziaWG parameters arrive over the UAPI (`awg setconf`), not the
-        // command line, so the device starts as plain WireGuard. `..default()`
-        // rather than naming them, so future fields do not break this build.
+        // S/H/J parameters arrive over the UAPI (`awg setconf`), so the device
+        // starts as plain WireGuard on those. Protocol imitation has no UAPI
+        // key and can only be set here; `api.rs` preserves it across `set=1`.
+        amnezia: AmneziaConfig::default().with_protocol_imitation(imitate, imitate_domain),
+        // 0 disables rather than meaning "a budget of nothing", so an operator
+        // who wants silence gets it without a second flag.
+        probe_reply_bytes_per_sec: (probe_reply_rate > 0).then_some(probe_reply_rate),
+        // `..default()` for the rest, so a future field does not break this.
         ..Default::default()
     };
 

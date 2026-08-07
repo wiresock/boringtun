@@ -64,6 +64,29 @@ pub(crate) const MIN_INITIAL_DATAGRAM: usize = 1200;
 /// that advertises a version it also refuses is a self-contradictory packet.
 pub(crate) const REAL_SERVER_VERSIONS: [u32; 2] = [0x0000_0001, 0x6b33_43cf];
 
+/// The largest Version Negotiation [`version_negotiation`] can emit.
+///
+/// One first byte, four version bytes, and two length-prefixed connection IDs
+/// echoed back from the client, then the supported-version list.
+///
+/// **The connection IDs are 255 bytes, not 20.** [`RFC9000_MAX_CID_LEN`] is a
+/// version 1 rule, and [`parse_long_header`] deliberately does not apply it to
+/// the draft and GREASE versions — the only ones answered here — because
+/// RFC 8999 §5.1 gives an unknown version the full 0..=255 and RFC 9000 §17.2.1
+/// says a version-specific rule MUST NOT gate the VN decision. Computing this
+/// with the 20-byte cap gives 55, which is where the "under 60" this module's
+/// callers used to claim came from; it was never reachable.
+///
+/// Pinned by [`tests::the_largest_reply_is_max_len_and_still_smaller_than_the_smallest_request`]
+/// rather than asserted in prose, and stated in terms of
+/// [`MIN_INITIAL_DATAGRAM`] because that comparison is the one that matters: a
+/// reply can never be larger than the smallest datagram able to elicit it, so
+/// this responder attenuates rather than amplifies.
+// Part of the responder half, so unreachable without the `device` feature —
+// same item-scoped treatment as `version_negotiation` itself.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) const MAX_LEN: usize = 1 + 4 + 1 + 255 + 1 + 255 + 4 * REAL_SERVER_VERSIONS.len();
+
 /// The fields of a QUIC long header that both the classifier and the responder
 /// need.
 ///
@@ -180,7 +203,8 @@ pub(crate) fn parse_long_header(data: &[u8]) -> Option<LongHeader<'_>> {
 /// field", and errata 7578 makes that the default rather than a special case.
 /// With `0x40` clear, a receiver demultiplexing a shared UDP port per RFC 7983 /
 /// RFC 9443 routes the reply into the RTP/RTCP bucket instead of QUIC.
-#[allow(dead_code)]
+// As `dns::servfail`: the only caller is behind the `device` feature.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
 pub(crate) fn version_negotiation(initial: &[u8], rng: &mut impl RngCore) -> Option<Vec<u8>> {
     if initial.len() < MIN_INITIAL_DATAGRAM {
         return None;
@@ -233,6 +257,43 @@ mod tests {
     const GREASE: u32 = 0x0a0a_0a0a;
     const V1: u32 = 0x0000_0001;
     const V2: u32 = 0x6b33_43cf;
+
+    /// The worst case is 255-byte connection IDs, not 20-byte ones, and it is
+    /// still smaller than the smallest datagram that can elicit it.
+    ///
+    /// The second half is the load-bearing one: `MIN_INITIAL_DATAGRAM` is the
+    /// floor on a request we will answer, so `MAX_LEN < MIN_INITIAL_DATAGRAM`
+    /// says this responder can never amplify, whatever the version list grows
+    /// to. A bound stated against `MAX_REPLY_LEN` alone would be satisfied by
+    /// simply raising that constant, which would quietly give the property away.
+    #[test]
+    fn the_largest_reply_is_max_len_and_still_smaller_than_the_smallest_request() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5EED);
+        let big = [0xAB; 255];
+
+        for version in [DRAFT, GREASE] {
+            let req = initial(version, &big, &big, MIN_INITIAL_DATAGRAM);
+            let vn = version_negotiation(&req, &mut rng)
+                .unwrap_or_else(|| panic!("version {:#x} must be answered", version));
+
+            assert_eq!(
+                vn.len(),
+                MAX_LEN,
+                "version {:#x}: 255-byte connection IDs must round-trip in full",
+                version
+            );
+            // Not a coincidence of the arithmetic -- the CIDs really are echoed
+            // back at full length, swapped.
+            assert_eq!(vn[5], 255, "the reply's DCID length is the client's SCID");
+            assert_eq!(vn[261], 255, "and its SCID length is the client's DCID");
+        }
+
+        // `MAX_LEN < MIN_INITIAL_DATAGRAM` -- the property that makes this
+        // responder an attenuator rather than an amplifier -- is a relationship
+        // between constants, so it is enforced at compile time in
+        // `device::probe_reply` rather than asserted here where it is only a
+        // lint about a constant.
+    }
 
     /// The RFC values themselves, as literals. Structure keeps the three uses of
     /// [`REAL_SERVER_VERSIONS`] consistent; only a literal here can keep them

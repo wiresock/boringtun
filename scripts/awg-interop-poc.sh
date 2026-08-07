@@ -10,7 +10,8 @@
 # reachable from any unit test.
 #
 # Requires: root, the amneziawg kernel module, amneziawg-tools (awg), iproute2
-#           (ip), tcpdump, timeout, ping, and awk/cut/date/grep/head/lsmod.
+#           (ip), tcpdump, timeout, ping, and these coreutils:
+#           awk, cut, date, dd, grep, head, lsmod, od, tr.
 #           Preflight enforces every one of them and names the missing tool,
 #           because a missing dependency otherwise surfaces as a bogus test
 #           failure rather than as a setup problem.
@@ -167,9 +168,16 @@ command -v timeout >/dev/null     || die "timeout not installed (needed by the w
 # without ping, checks 3 and 5 report a dead datapath; and without grep or
 # lsmod the module check below reports the module as not loaded. ping is the
 # realistic one: minimal images frequently ship without iputils.
-for tool in awk cut date grep head lsmod ping; do
+for tool in awk cut date dd grep head lsmod od ping tr; do
   command -v "$tool" >/dev/null || die "$tool not installed (used by preflight or the checks)"
 done
+
+# The probe checks send UDP through bash's /dev/udp, which is a compile-time
+# option (--enable-net-redirections). Without it every probe fails to send, and
+# a check that asserts *silence* would score that as a pass. Assert it here
+# rather than let the harness quietly test nothing.
+bash -c 'exec 3<>/dev/udp/127.0.0.1/9' 2>/dev/null \
+  || die "this bash has no /dev/udp support (needed by the probe-reply checks)"
 
 lsmod | grep -q '^amneziawg'      || die "amneziawg kernel module not loaded -- the point of this test is a REAL client"
 [ -e /dev/net/tun ]               || die "/dev/net/tun missing"
@@ -240,9 +248,17 @@ for n in 1 2; do
     "$(cat srv.pub)" "$ep" "$PORT" >> "c$n.conf"
 done
 
-start_server() {  # $1 = config file
+# Extra boringtun-cli flags for the next start_server. Protocol imitation has
+# no UAPI key -- `awg showconf` drops keys it does not know -- so it can only be
+# set on the command line, which means the probe checks have to restart the
+# daemon rather than reconfigure it.
+SRV_EXTRA_ARGS=()
+start_server() {  # $1 = config file; SRV_EXTRA_ARGS = extra daemon flags
+  # `${a[@]+"${a[@]}"}` rather than `"${a[@]}"`: under `set -u` an empty array
+  # expansion is an unbound-variable error on bash before 4.4.
   ip netns exec "$NS_SRV" env WG_LOG_FILE="$WORKDIR/srv.log" \
-    "$BORINGTUN" --disable-drop-privileges "$IF_SRV" >/dev/null 2>&1
+    "$BORINGTUN" --disable-drop-privileges \
+    ${SRV_EXTRA_ARGS[@]+"${SRV_EXTRA_ARGS[@]}"} "$IF_SRV" >/dev/null 2>&1
   # Poll for the socket `awg` actually opens, not the one boringtun binds
   # first: it binds /var/run/wireguard/<if>.sock and only then symlinks it
   # into /var/run/amneziawg/ (device/api.rs), so waiting on the former leaves
@@ -306,6 +322,68 @@ start_client() {  # $1 = ns, $2 = conf, $3 = tunnel addr
   ip netns exec "$1" ip link add "$IF_CLI" type amneziawg || return 1
   ip netns exec "$1" awg setconf "$IF_CLI" "$2" || return 1
   ip netns exec "$1" sh -c "ip addr add $3/32 dev $IF_CLI && ip link set $IF_CLI up mtu 1420 && ip route add 10.66.201.1/32 dev $IF_CLI" || return 1
+}
+
+# A DNS query for example.com/A/IN with transaction id 0xabcd and RD set: the
+# 12-byte header, then the QNAME as length-prefixed labels, then QTYPE/QCLASS.
+# `\x07example` is unambiguous -- bash's printf takes at most two hex digits
+# after \x -- and the whole thing is 29 bytes.
+readonly DNS_PROBE='\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
+
+# Send one datagram and print the reply as lowercase hex. Three other outcomes
+# are distinguishable from a reply and from each other: empty means the datagram
+# was sent and nothing came back, `SENDFAIL` means the probe ran but could not
+# send, and `HARNESSFAIL(rc=N)` means the probe never ran at all.
+#
+# Distinguishing those two is the whole point. The checks below assert
+# *silence*, so a probe that never left the namespace -- a bash without
+# /dev/udp support, a broken route, a missing netns -- would otherwise score as
+# a PASS, and the harness would report that the responder is correctly inert
+# while having tested nothing.
+#
+# bash's /dev/udp rather than a new dependency on socat or dig, and a single
+# `dd` read rather than `head -c`: one read() on a datagram socket returns
+# exactly one datagram, whereas `head -c N` blocks for an EOF that a UDP socket
+# never delivers, so `timeout` would kill it before it printed.
+#
+# `printf '%b'` rather than `printf "$P_FMT"`: the payload is data, and passing
+# it as the *format* means a future probe containing a `%` produces garbage or
+# an error -- which, again, the silence checks would score as a PASS.
+udp_probe() { # <ns> <dst-ip> <dst-port> <printf-escapes-for-payload>
+  local out rc
+  out=$(ip netns exec "$1" env P_IP="$2" P_PORT="$3" P_FMT="$4" timeout 3 bash -c '
+    exec 3<>/dev/udp/$P_IP/$P_PORT || { echo SENDFAIL; exit 0; }
+    printf "%b" "$P_FMT" >&3 || { echo SENDFAIL; exit 0; }
+    dd bs=512 count=1 <&3 2>/dev/null | od -An -tx1 | tr -d " \n"
+  ' 2>/dev/null)
+  rc=$?
+
+  # The inner script handles its own failures and always exits 0, so a non-zero
+  # status here is the *harness* failing before the probe ever ran: a missing
+  # namespace, no `timeout` or `bash` on PATH, `ip netns exec` refused. Those
+  # produce no output either, so without this they would arrive at the callers
+  # as an empty string and be scored as silence -- which is exactly the
+  # confusion `SENDFAIL` was added to remove, just one level further out.
+  #
+  # 124 is the exception: that is `timeout` killing a `dd` that is still waiting
+  # for a reply, which is the ordinary no-answer case and the thing the silence
+  # checks are actually asserting.
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+    echo "HARNESSFAIL(rc=$rc)"
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
+# Assert that a probe was delivered and drew no reply, keeping "could not send"
+# distinct from "sent, no answer".
+expect_silence() { # <label> <reply-from-udp_probe>
+  case "$2" in
+    SENDFAIL)      bad "$1: the probe could not be sent -- harness failure, not a result" ;;
+    HARNESSFAIL*)  bad "$1: the probe never ran ($2) -- harness failure, not a result" ;;
+    "")            ok  "$1" ;;
+    *)             bad "$1: answered with $2" ;;
+  esac
 }
 
 # Checks from here on inspect exit statuses themselves.
@@ -466,7 +544,98 @@ elif [ "$tag_found" -ne 1 ]; then
   bad "no captured frame carried an H4 tag at offset $S4 (frames examined: $frames)"
 fi
 
-info "7. NEGATIVE CONTROL: a vanilla server must NOT serve an AmneziaWG client"
+info "7. Probe replies: the port answers the protocol it imitates, and only that"
+# The camouflage claim is bidirectional: a port that emits DNS-shaped datagrams
+# and answers no DNS query describes a host that does not exist. Nothing below
+# is reachable from a unit test -- it needs the real ingress path, a real socket
+# and a real source address.
+
+# 7a. The server from checks 1-6 has no imitation configured, so the responder
+# must be inert. This is the control that gives the next two checks meaning: if
+# the port answered here, 7c would prove nothing about the imitation setting.
+probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
+expect_silence "no imitation configured: a DNS probe gets silence" "$probe_reply"
+
+# 7b. Imitating STUN. A DNS probe is detected -- the classifier does not care
+# what we configured -- but must not be answered, because answering every
+# protocol on one port describes a host that does not exist either.
+stop_server
+SRV_EXTRA_ARGS=(--imitate-protocol stun)
+if start_server srv.conf; then
+  probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
+  expect_silence "imitating STUN: a DNS probe gets silence" "$probe_reply"
+else
+  bad "could not start the STUN-imitating server -- not a probe-reply result"
+fi
+
+# 7b2. The kill switch. Imitation on, replies explicitly off. This is the knob
+# an operator reaches for if the responder ever becomes a liability, so it is
+# worth knowing it works separately from the protocol setting.
+stop_server
+SRV_EXTRA_ARGS=(--imitate-protocol dns --probe-reply-rate 0)
+if start_server srv.conf; then
+  probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
+  expect_silence "imitating DNS with --probe-reply-rate 0: silence" "$probe_reply"
+else
+  bad "could not start the server with replies disabled -- not a probe-reply result"
+fi
+
+# 7c. Imitating DNS. Now the same probe must come back as a SERVFAIL that a
+# resolver client would accept: the transaction id echoed (otherwise every
+# client discards it), QR set, RD copied from the query (a resolver answering a
+# recursion-desired query with RD clear is its own tell) and RCODE 2.
+stop_server
+SRV_EXTRA_ARGS=(--imitate-protocol dns)
+if ! start_server srv.conf; then
+  bad "could not start the DNS-imitating server -- not a probe-reply result"
+else
+  probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
+  # 24 hex chars = the 12-byte header; anything shorter cannot be parsed at all.
+  case "$probe_reply" in
+    SENDFAIL|HARNESSFAIL*)
+      bad "imitating DNS: the probe never reached the server ($probe_reply) -- harness failure, not a result" ;;
+  esac
+  if [ "${#probe_reply}" -lt 24 ]; then
+    bad "imitating DNS: no usable reply to a DNS probe (got '${probe_reply:-<silence>}')"
+  else
+    id=${probe_reply:0:4}
+    b2=${probe_reply:4:2}
+    b3=${probe_reply:6:2}
+    if ! is_hex8 "0000$b2$b3"; then
+      bad "imitating DNS: reply header is not hex: '$probe_reply'"
+    else
+      flags_ok=1
+      [ "$id" = "abcd" ] || { bad "transaction id not echoed: sent abcd, got $id"; flags_ok=0; }
+      [ $(( 0x$b2 & 0x80 )) -ne 0 ] || { bad "QR bit clear: the reply is not marked as a response"; flags_ok=0; }
+      [ $(( 0x$b2 & 0x01 )) -eq 1 ] || { bad "RD not copied from the query"; flags_ok=0; }
+      [ $(( 0x$b3 & 0x0f )) -eq 2 ] || { bad "RCODE is $(( 0x$b3 & 0x0f )), expected 2 (SERVFAIL)"; flags_ok=0; }
+      [ "$flags_ok" -eq 1 ] && ok "imitating DNS: probe answered with a well-formed SERVFAIL ($probe_reply)"
+    fi
+  fi
+
+  # 7d. The ordering guarantee against a *real* client. Under `ip=dns` our own
+  # S-junk is a valid DNS query by construction, so a server that asked "is this
+  # a probe?" before "is this one of my peers?" would SERVFAIL its own clients'
+  # handshakes. The unit test
+  # `a_conforming_initiation_is_tunnel_traffic_even_though_it_is_a_valid_dns_query`
+  # pins that deterministically; this is the kernel-module confirmation.
+  #
+  # `-w 30`, not `-W3`. Checks 7b and 7c each restarted the daemon, so the
+  # server has no session for a peer the *client* still considers valid. Kernel
+  # WireGuard does not re-initiate on the first dropped packet: it arms
+  # `timer_new_handshake` only after KEEPALIVE_TIMEOUT + REKEY_TIMEOUT = 15 s.
+  # A 5-second ping would report "classification order is wrong" for a timer it
+  # never waited on -- pointing a reviewer at the one thing that is not broken.
+  # `-c3` still exits as soon as three replies arrive, so a healthy run is fast.
+  if ip netns exec "$NS_CLI" ping -c3 -w 30 -q 10.66.201.1 >/dev/null 2>&1; then
+    ok "a real AmneziaWG client still handshakes while the port answers probes"
+  else
+    bad "no traffic from a real client while the port answers probes -- either the classification order is wrong or the re-handshake did not happen within 30s"
+  fi
+fi
+SRV_EXTRA_ARGS=()
+
+info "8. NEGATIVE CONTROL: a vanilla server must NOT serve an AmneziaWG client"
 # The most important check. If this passes, tests 3-6 were not proving
 # interoperability -- they would pass even with obfuscation switched off.
 stop_server
