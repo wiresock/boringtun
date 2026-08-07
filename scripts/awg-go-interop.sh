@@ -42,6 +42,22 @@ readonly JC=4 JMIN=50 JMAX=1000
 readonly S1=120 S2=130 S3=110 S4=80
 readonly H1=169887817 H2=390382747 H3=1033691040 H4=1526332224
 
+# Every artifact goes here, not to a predictable /tmp path. This runs as root:
+# a local user who pre-creates $SRV_LOG as a symlink would have root
+# truncate whatever it points at. `mktemp -d` plus `umask 077` is what
+# awg-interop-poc.sh does, for exactly this reason.
+umask 077
+WORKDIR=$(mktemp -d /tmp/awg-go-interop.XXXXXX) || {
+  echo "could not create a temporary directory" >&2
+  exit 2
+}
+readonly WORKDIR
+SRV_LOG="$WORKDIR/srv.log"
+CLI_LOG="$WORKDIR/cli.log"
+BTCLI_LOG="$WORKDIR/btcli.log"
+SRV_SET="$WORKDIR/srv-set.txt"
+CLI_SET="$WORKDIR/cli-set.txt"
+
 PASS=0; FAIL=0
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
@@ -66,7 +82,15 @@ teardown() {
         "/var/run/wireguard/${IF_CLI}.sock" "/var/run/amneziawg/${IF_CLI}.sock"
   return 0
 }
-trap teardown EXIT
+# `$WORKDIR` came from `mktemp -d`, so this only ever removes a directory this
+# run created. Failures are printed rather than swallowed: leaving a root-owned
+# directory behind in /tmp is worth a line of output.
+cleanup_workdir() {
+  [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ] || return 0
+  rm -rf "$WORKDIR" || echo "could not remove $WORKDIR" >&2
+  return 0
+}
+trap 'teardown; cleanup_workdir' EXIT
 
 die() { printf '\033[31mpreflight: %s\033[0m\n' "$1" >&2; exit 2; }
 
@@ -140,8 +164,12 @@ wait_sock() { # <iface>
 # check 3 exists to prevent, so the link is also *proven* to work below rather
 # than assumed.
 build_underlay() {
-  SETUP_STARTED=1
+  # Marked *after* the first create succeeds, not before. Two runs can both
+  # clear preflight; the loser of this `ip netns add` race must not then have
+  # its EXIT trap delete the winner's namespaces. The first successful add is
+  # the serialisation point, so ownership begins there.
   ip netns add "$NS_SRV" || return 1
+  SETUP_STARTED=1
   ip netns add "$NS_CLI" || return 1
   ip link add agi-vs type veth peer name agi-vc || return 1
   ip link set agi-vs netns "$NS_SRV" || return 1
@@ -177,14 +205,14 @@ start_pair() {
   CLI_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
   SRV_PUB=$(pubkey "$SRV_KEY"); CLI_PUB=$(pubkey "$CLI_KEY")
 
-  ip netns exec "$NS_SRV" env WG_LOG_FILE=/tmp/agi-srv.log WG_LOG_LEVEL=debug \
+  ip netns exec "$NS_SRV" env WG_LOG_FILE=$SRV_LOG WG_LOG_LEVEL=debug \
     "$BT" --disable-drop-privileges "$@" "$IF_SRV" >/dev/null 2>&1
   # `-f`, not its default daemonise. Forking under WSL loses the process
   # before the UAPI socket appears -- the same failure boringtun's own
   # daemonised logs have here. Foreground plus `&` keeps it in the
   # namespace and observable.
   ip netns exec "$NS_CLI" env LOG_LEVEL=verbose \
-    "$GO" -f "$IF_CLI" >/tmp/agi-cli.log 2>&1 &
+    "$GO" -f "$IF_CLI" >$CLI_LOG 2>&1 &
 
   wait_sock "$IF_SRV" || { echo "server socket never appeared"; return 1; }
   wait_sock "$IF_CLI" || { echo "amneziawg-go socket never appeared"; return 1; }
@@ -195,7 +223,7 @@ start_pair() {
   [ "$srv_obf" = 1 ] && SRV_OBF=$AWG
   [ "$cli_obf" = 1 ] && CLI_OBF=$AWG
 
-  uapi "$NS_SRV" "$IF_SRV" >/tmp/agi-srv-set.txt <<EOF
+  uapi "$NS_SRV" "$IF_SRV" >$SRV_SET <<EOF
 set=1
 private_key=$SRV_KEY
 listen_port=$PORT
@@ -203,7 +231,7 @@ ${SRV_OBF}public_key=$CLI_PUB
 allowed_ip=$CLI_TUN/32
 
 EOF
-  uapi "$NS_CLI" "$IF_CLI" >/tmp/agi-cli-set.txt <<EOF
+  uapi "$NS_CLI" "$IF_CLI" >$CLI_SET <<EOF
 set=1
 private_key=$CLI_KEY
 listen_port=51821
@@ -213,8 +241,8 @@ persistent_keepalive_interval=5
 allowed_ip=$SRV_TUN/32
 
 EOF
-  grep -q 'errno=0' /tmp/agi-srv-set.txt || { echo "server set=1 failed: $(cat /tmp/agi-srv-set.txt)"; return 1; }
-  grep -q 'errno=0' /tmp/agi-cli-set.txt || { echo "amneziawg-go set=1 failed: $(cat /tmp/agi-cli-set.txt)"; return 1; }
+  grep -q '^errno=0$' "$SRV_SET" || { echo "server set=1 failed: $(cat "$SRV_SET")"; return 1; }
+  grep -q '^errno=0$' "$CLI_SET" || { echo "amneziawg-go set=1 failed: $(cat "$CLI_SET")"; return 1; }
 
   ip netns exec "$NS_SRV" sh -c "ip addr add $SRV_TUN/24 dev $IF_SRV && ip link set $IF_SRV up mtu 1420" || return 1
   ip netns exec "$NS_CLI" sh -c "ip addr add $CLI_TUN/32 dev $IF_CLI && ip link set $IF_CLI up mtu 1420 && ip route add $SRV_TUN/32 dev $IF_CLI" || return 1
@@ -234,8 +262,8 @@ start_bt_pair() {
 ')
   SRV_PUB=$(pubkey "$SRV_KEY"); CLI_PUB=$(pubkey "$CLI_KEY")
 
-  ip netns exec "$NS_SRV" env WG_LOG_FILE=/tmp/agi-srv.log WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_SRV" >/dev/null 2>&1
-  ip netns exec "$NS_CLI" env WG_LOG_FILE=/tmp/agi-btcli.log WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_CLI" >/dev/null 2>&1
+  ip netns exec "$NS_SRV" env WG_LOG_FILE=$SRV_LOG WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_SRV" >/dev/null 2>&1
+  ip netns exec "$NS_CLI" env WG_LOG_FILE=$BTCLI_LOG WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_CLI" >/dev/null 2>&1
 
   wait_sock "$IF_SRV" || { echo "server socket never appeared"; return 1; }
   wait_sock "$IF_CLI" || { echo "boringtun client socket never appeared"; return 1; }
@@ -254,7 +282,11 @@ h3='"$H3"$'
 h4='"$H4"$'
 '
 
-  uapi "$NS_SRV" "$IF_SRV" >/dev/null <<EOF
+  # Both responses are inspected, as `start_pair` does. `validate` refuses some
+  # S combinations outright, so a bad set of sizes here would otherwise surface
+  # as check 5 reporting a classification-order failure for a config the device
+  # never accepted.
+  uapi "$NS_SRV" "$IF_SRV" >"$SRV_SET" <<EOF
 set=1
 private_key=$SRV_KEY
 listen_port=$PORT
@@ -262,7 +294,7 @@ ${AWG}public_key=$CLI_PUB
 allowed_ip=$CLI_TUN/32
 
 EOF
-  uapi "$NS_CLI" "$IF_CLI" >/dev/null <<EOF
+  uapi "$NS_CLI" "$IF_CLI" >"$CLI_SET" <<EOF
 set=1
 private_key=$CLI_KEY
 listen_port=51821
@@ -272,9 +304,16 @@ persistent_keepalive_interval=5
 allowed_ip=$SRV_TUN/32
 
 EOF
-  ip netns exec "$NS_SRV" sh -c "ip addr add $SRV_TUN/24 dev $IF_SRV; ip link set $IF_SRV up mtu 1420" 2>/dev/null
-  ip netns exec "$NS_CLI" sh -c "ip addr add $CLI_TUN/32 dev $IF_CLI; ip link set $IF_CLI up mtu 1420; ip route add $SRV_TUN/32 dev $IF_CLI" 2>/dev/null
-  ip netns exec "$NS_CLI" ping -c2 -w 8 -q "$SRV_TUN" >/dev/null 2>&1
+  grep -q '^errno=0$' "$SRV_SET" || { echo "server set=1 failed: $(cat "$SRV_SET")"; return 1; }
+  grep -q '^errno=0$' "$CLI_SET" || { echo "boringtun client set=1 failed: $(cat "$CLI_SET")"; return 1; }
+
+  # `&&` not `;`, and the status propagated: a half-configured interface would
+  # otherwise reach check 5 and be reported as a classification-order failure.
+  ip netns exec "$NS_SRV" sh -c "ip addr add $SRV_TUN/24 dev $IF_SRV && ip link set $IF_SRV up mtu 1420" || return 1
+  ip netns exec "$NS_CLI" sh -c "ip addr add $CLI_TUN/32 dev $IF_CLI && ip link set $IF_CLI up mtu 1420 && ip route add $SRV_TUN/32 dev $IF_CLI" || return 1
+  # Best-effort on purpose: this only nudges the client into handshaking, and
+  # the handshake itself is what check 5 asserts.
+  ip netns exec "$NS_CLI" ping -c2 -w 8 -q "$SRV_TUN" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -301,8 +340,8 @@ else
     ok "amneziawg-go completed a handshake against boringtun"
   else
     bad "no handshake -- wire format disagreement"
-    echo "    srv: $(tail -3 /tmp/agi-srv.log 2>/dev/null | tr '\n' ' ')"
-    echo "    cli: $(tail -3 /tmp/agi-cli.log 2>/dev/null | tr '\n' ' ')"
+    echo "    srv: $(tail -3 $SRV_LOG 2>/dev/null | tr '\n' ' ')"
+    echo "    cli: $(tail -3 $CLI_LOG 2>/dev/null | tr '\n' ' ')"
   fi
 
   info "2. and passes bidirectional traffic through the tunnel"
@@ -347,7 +386,7 @@ else
     ok "amneziawg-go still handshakes and passes traffic while the port answers DNS probes"
   else
     bad "enabling the probe responder broke interop with a third-party client"
-    echo "    srv: $(tail -5 /tmp/agi-srv.log 2>/dev/null | tr '
+    echo "    srv: $(tail -5 $SRV_LOG 2>/dev/null | tr '
 ' ' ')"
   fi
 fi
@@ -369,7 +408,7 @@ else
     ok "a DNS-shaped initiation is treated as tunnel traffic, not answered as a probe"
   else
     bad "a client whose S1 junk is a valid DNS query did not handshake -- classification order"
-    echo "    srv: $(tail -5 /tmp/agi-srv.log 2>/dev/null | tr '
+    echo "    srv: $(tail -5 $SRV_LOG 2>/dev/null | tr '
 ' ' ')"
   fi
 fi

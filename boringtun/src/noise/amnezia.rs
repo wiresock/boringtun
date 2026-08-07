@@ -714,16 +714,23 @@ impl AmneziaConfig {
     /// configuration this shape is refused rather than merely warned about.
     pub(crate) fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
-        for (label, junk, base) in [
+
+        // The *tightest* bound, not the first one that trips. S3 has to satisfy
+        // both kinds, so reporting whichever happens to be checked first can
+        // name a limit that is still too high: at S1=100, S2=0, S3=185 the
+        // initiation bound says "at most 184", and 184 still fails the response
+        // bound of 28. An operator following that advice is sent round twice.
+        //
+        // `min_by_key` keeps the first on a tie, so an equal pair still reports
+        // S1 and the message stays stable for the common symmetric config.
+        [
             ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
             ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
-        ] {
-            let request = base + junk as usize;
-            if reply > request {
-                return Some((label, request, reply));
-            }
-        }
-        None
+        ]
+        .iter()
+        .map(|&(label, junk, base)| (label, base + junk as usize, reply))
+        .min_by_key(|&(_, request, _)| request)
+        .filter(|&(_, request, _)| reply > request)
     }
 
     pub(crate) fn prepend_outbound<'a>(
@@ -2261,5 +2268,52 @@ mod tests {
         AmneziaConfig::default()
             .validate()
             .expect("the default configuration must load");
+    }
+
+    /// Following the error message's advice must actually produce a loadable
+    /// configuration.
+    ///
+    /// The message names a maximum S3. If the helper reports whichever bound it
+    /// checks first rather than the binding one, that maximum can still be too
+    /// high -- at S1=100, S2=0, S3=185 the initiation bound advises 184, and 184
+    /// still fails the response bound of 28. This asserts the property the
+    /// operator actually cares about rather than the mechanism: take the number
+    /// the message gives, apply it, and the config must validate.
+    #[test]
+    fn the_maximum_s3_the_error_recommends_actually_validates() {
+        for (s1, s2, s3) in [
+            (100u16, 0u16, 185u16), // both bounds violated, response the tighter
+            (0, 100, 185),          // both violated, initiation the tighter
+            (15, 15, 150),          // the installer shape
+            (0, 0, 100),            // no S padding at all
+            (100, 156, 185),        // one byte past a symmetric parity
+        ] {
+            let cfg = AmneziaConfig::new(s1, s2, s3, 0);
+            let (_, request, _) = cfg
+                .cookie_reply_amplifies()
+                .unwrap_or_else(|| panic!("S1={} S2={} S3={} should amplify", s1, s2, s3));
+
+            let advised = (request - COOKIE_REPLY_SZ) as u16;
+            AmneziaConfig::new(s1, s2, advised, 0)
+                .validate()
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "S1={} S2={}: advised S3={} still rejected: {}",
+                        s1, s2, advised, e
+                    )
+                });
+
+            // And it is the *largest* such value, or the advice is needlessly
+            // strict and the operator loses padding they could have kept.
+            assert!(
+                AmneziaConfig::new(s1, s2, advised + 1, 0)
+                    .validate()
+                    .is_err(),
+                "S1={} S2={}: S3={} should have been advised instead",
+                s1,
+                s2,
+                advised + 1
+            );
+        }
     }
 }
