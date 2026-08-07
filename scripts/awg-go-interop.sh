@@ -47,7 +47,15 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 info() { printf '\033[1m==> %s\033[0m\n' "$1"; }
 
+# Set to 1 only once this run has created something. Until then `teardown` is a
+# no-op, because the names below are fixed: a namespace already called `agi-srv`
+# belongs to somebody else, and killing every process in it is exactly the host
+# damage the safety notice promises not to do. Preflight refuses on collision,
+# and teardown only ever removes what this run made.
+SETUP_STARTED=0
+
 teardown() {
+  [ "$SETUP_STARTED" -eq 1 ] || return 0
   for ns in "$NS_SRV" "$NS_CLI"; do
     p=$(ip netns pids "$ns" 2>/dev/null); [ -n "$p" ] && kill $p 2>/dev/null
   done
@@ -59,6 +67,25 @@ teardown() {
   return 0
 }
 trap teardown EXIT
+
+die() { printf '\033[31mpreflight: %s\033[0m\n' "$1" >&2; exit 2; }
+
+[ "$(id -u)" -eq 0 ] || die "must run as root (creates network namespaces)"
+[ -x "$BT" ]         || die "boringtun-cli not found or not executable: $BT"
+[ -x "$GO" ]         || die "amneziawg-go not found or not executable: $GO"
+
+# Refuse to clobber anything already using our names, before the first teardown.
+for ns in "$NS_SRV" "$NS_CLI"; do
+  ip netns list 2>/dev/null | grep -qw "$ns" && die "namespace $ns already exists; refusing to touch it"
+done
+for l in agi-vs agi-vc; do
+  ip link show "$l" >/dev/null 2>&1 && die "interface $l already exists; refusing to touch it"
+done
+for sock in "${IF_SRV}" "${IF_CLI}"; do
+  for d in /var/run/amneziawg /var/run/wireguard; do
+    [ -e "$d/$sock.sock" ] && die "$d/$sock.sock already exists; refusing to touch it"
+  done
+done
 
 # `amneziawg-go` publishes its UAPI socket in /var/run/amneziawg only -- the
 # directory the AmneziaWG fork of wireguard-tools searches. boringtun publishes
@@ -113,6 +140,7 @@ wait_sock() { # <iface>
 start_pair() {
   local srv_obf=$1 cli_obf=$2; shift 2
   teardown
+  SETUP_STARTED=1
   ip netns add "$NS_SRV"; ip netns add "$NS_CLI"
   ip link add agi-vs type veth peer name agi-vc
   ip link set agi-vs netns "$NS_SRV"; ip link set agi-vc netns "$NS_CLI"
@@ -167,6 +195,68 @@ EOF
   return 0
 }
 
+# Both ends boringtun, both with the same imitation setting. Used only by check
+# 5, where the client has to produce a DNS-shaped S1 prefix and amneziawg-go
+# cannot.
+start_bt_pair() {
+  teardown
+  SETUP_STARTED=1
+  ip netns add "$NS_SRV"; ip netns add "$NS_CLI"
+  ip link add agi-vs type veth peer name agi-vc
+  ip link set agi-vs netns "$NS_SRV"; ip link set agi-vc netns "$NS_CLI"
+  ip netns exec "$NS_SRV" sh -c "ip link set lo up; ip addr add $SRV_LINK/30 dev agi-vs; ip link set agi-vs up"
+  ip netns exec "$NS_CLI" sh -c "ip link set lo up; ip addr add $CLI_LINK/30 dev agi-vc; ip link set agi-vc up"
+
+  SRV_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' 
+')
+  CLI_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' 
+')
+  SRV_PUB=$(pubkey "$SRV_KEY"); CLI_PUB=$(pubkey "$CLI_KEY")
+
+  ip netns exec "$NS_SRV" env WG_LOG_FILE=/tmp/agi-srv.log WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_SRV" >/dev/null 2>&1
+  ip netns exec "$NS_CLI" env WG_LOG_FILE=/tmp/agi-btcli.log WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_CLI" >/dev/null 2>&1
+
+  wait_sock "$IF_SRV" || { echo "server socket never appeared"; return 1; }
+  wait_sock "$IF_CLI" || { echo "boringtun client socket never appeared"; return 1; }
+
+  local AWG
+  AWG=$'jc='"$JC"$'
+jmin='"$JMIN"$'
+jmax='"$JMAX"$'
+s1='"$S1"$'
+s2='"$S2"$'
+s3='"$S3"$'
+s4='"$S4"$'
+h1='"$H1"$'
+h2='"$H2"$'
+h3='"$H3"$'
+h4='"$H4"$'
+'
+
+  uapi "$NS_SRV" "$IF_SRV" >/dev/null <<EOF
+set=1
+private_key=$SRV_KEY
+listen_port=$PORT
+${AWG}public_key=$CLI_PUB
+allowed_ip=$CLI_TUN/32
+
+EOF
+  uapi "$NS_CLI" "$IF_CLI" >/dev/null <<EOF
+set=1
+private_key=$CLI_KEY
+listen_port=51821
+${AWG}public_key=$SRV_PUB
+endpoint=$SRV_LINK:$PORT
+persistent_keepalive_interval=5
+allowed_ip=$SRV_TUN/32
+
+EOF
+  ip netns exec "$NS_SRV" sh -c "ip addr add $SRV_TUN/24 dev $IF_SRV; ip link set $IF_SRV up mtu 1420" 2>/dev/null
+  ip netns exec "$NS_CLI" sh -c "ip addr add $CLI_TUN/32 dev $IF_CLI; ip link set $IF_CLI up mtu 1420; ip route add $SRV_TUN/32 dev $IF_CLI" 2>/dev/null
+  ip netns exec "$NS_CLI" ping -c2 -w 8 -q "$SRV_TUN" >/dev/null 2>&1
+  return 0
+}
+
 handshaked() { # -> 0 if the server recorded a handshake
   local hs
   for _ in $(seq 1 24); do
@@ -215,19 +305,51 @@ else
   fi
 fi
 
-info "4. The ordering guarantee, against a third-party peer"
-# Under ip=dns our own S1 junk is a valid DNS query by construction. A server
-# that asked "is this a probe?" before "is this one of my peers?" would SERVFAIL
-# this client's handshake. Unit tests pin the order; this is the confirmation
-# with an implementation that is not ours.
+info "4. The probe responder does not break interop"
+# NOT an ordering test, though an earlier version of this script claimed it was.
+#
+# The ordering rule matters because a datagram can be *simultaneously* a valid
+# AmneziaWG initiation and a valid DNS query, so a server that classified probes
+# first would answer its own peers. But that collision needs a client whose S1
+# filler is DNS-shaped, and that shaping is this fork's own extension:
+# amneziawg-go fills its prefix with `rand.Read` (device/send.go), so its
+# initiations are random bytes and `detect` returns None for them.
+#
+# Measured, not assumed: with `classify` mutated to ask "is this a probe?"
+# first, this check still passed. A third-party client therefore cannot test the
+# ordering at all -- it can only show that turning the responder on does not
+# break a peer that does not collide with it, which is what it now claims.
 if ! start_pair 1 1 --imitate-protocol dns; then
   bad "setup failed with --imitate-protocol dns"
 else
   if handshaked && ip netns exec "$NS_CLI" ping -c3 -w 20 -q "$SRV_TUN" >/dev/null 2>&1; then
     ok "amneziawg-go still handshakes and passes traffic while the port answers DNS probes"
   else
-    bad "the probe responder broke interop with a third-party client"
-    echo "    srv: $(tail -5 /tmp/agi-srv.log 2>/dev/null | tr '\n' ' ')"
+    bad "enabling the probe responder broke interop with a third-party client"
+    echo "    srv: $(tail -5 /tmp/agi-srv.log 2>/dev/null | tr '
+' ' ')"
+  fi
+fi
+
+info "5. The ordering guarantee, with a client that actually collides"
+# The client here is boringtun, not amneziawg-go, because only our own filler
+# produces an S1 prefix that is a well-formed DNS query -- which is the whole
+# premise of the rule. Both ends being ours is a real weakness of this check and
+# the reason it is numbered separately rather than folded into 4; the
+# deterministic version is the unit test
+# `a_conforming_initiation_is_tunnel_traffic_even_though_it_is_a_valid_dns_query`.
+# What this adds is a real socket and a real ingress path.
+#
+# Verified load-bearing: reordering `classify` fails this check.
+if ! start_bt_pair --imitate-protocol dns; then
+  bad "boringtun client setup failed -- not an ordering result"
+else
+  if handshaked; then
+    ok "a DNS-shaped initiation is treated as tunnel traffic, not answered as a probe"
+  else
+    bad "a client whose S1 junk is a valid DNS query did not handshake -- classification order"
+    echo "    srv: $(tail -5 /tmp/agi-srv.log 2>/dev/null | tr '
+' ' ')"
   fi
 fi
 

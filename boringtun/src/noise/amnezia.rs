@@ -696,10 +696,10 @@ impl AmneziaConfig {
     /// alone — `64 + S3 > 148 + S1` for an initiation, `64 + S3 > 92 + S2` for a
     /// response — so there is no reason to discover it at send time.
     ///
-    /// It deliberately does **not** reject. The AmneziaWG kernel module accepts
-    /// these combinations, and a config this fork refuses but the reference
-    /// implementation runs would be an interoperability break for a
-    /// configuration that is merely unwise.
+    /// This function only *reports*. [`Self::validate`] is what rejects, and it
+    /// does so deliberately: see the argument there for why refusing a
+    /// configuration the AmneziaWG kernel module would accept is the right trade
+    /// rather than an interoperability break worth avoiding.
     ///
     /// No longer gated: [`Self::validate`] calls it on every build, because a
     /// configuration this shape is refused rather than merely warned about.
