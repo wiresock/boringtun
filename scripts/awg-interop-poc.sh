@@ -16,6 +16,12 @@
 #           because a missing dependency otherwise surfaces as a bogus test
 #           failure rather than as a setup problem.
 #
+# A sibling, scripts/awg-go-interop.sh, makes the same cross-implementation
+# claim against amneziawg-go instead of the kernel module. It needs no kernel
+# headers, so it runs where this cannot -- but it exercises two userspace
+# implementations, not the kernel datapath, so it complements this rather than
+# replacing it.
+#
 # SAFETY: everything lives in throwaway network namespaces. The host's own
 # interfaces, routes, firewall rules and WireGuard/AmneziaWG devices are never
 # touched, and the module is never loaded or unloaded. Cleanup runs on any exit
