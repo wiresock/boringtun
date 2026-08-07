@@ -31,8 +31,13 @@ const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
 /// ceiling rather than the transport one. The 28-byte difference is deliberate:
 /// a configuration in that window passes the kernel's check and then fails at
 /// send time with `EMSGSIZE`, so it does not work there either. Rejecting it up
-/// front is not a parity break — every configuration that *functions* on the
-/// kernel module is still accepted here.
+/// front is not a parity break: nothing that *functions* on the kernel module
+/// is refused on size grounds here.
+///
+/// That is a claim about size only. [`AmneziaConfig::validate`] also refuses a
+/// configuration whose cookie replies would amplify, and that one *is* a
+/// deliberate parity break — the kernel accepts those and runs them. The
+/// argument for it is at the check.
 const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 const DNS_JUNK_SIZE_MIN: usize = 50;
 const DNS_JUNK_SIZE_MAX: usize = 200;
@@ -404,12 +409,16 @@ impl AmneziaConfig {
     /// (`MESSAGE_MAX_SIZE = 65535`) while this uses `MAX_SENDABLE_DATAGRAM`,
     /// what a UDP socket can actually carry.
     ///
-    /// The relationship is therefore one-way, not symmetric: every
-    /// configuration that *functions* on the kernel module is accepted here,
-    /// but a configuration landing in the 28-byte gap is accepted by the kernel
-    /// and rejected here. Nothing is lost — such a configuration fails on the
-    /// kernel too, at send time with `EMSGSIZE`, so it never worked there
-    /// either. See `MAX_SENDABLE_DATAGRAM` for the arithmetic.
+    /// The relationship is therefore one-way, not symmetric: on **size**, a
+    /// configuration landing in the 28-byte gap is accepted by the kernel and
+    /// rejected here, and nothing is lost — it fails on the kernel too, at send
+    /// time with `EMSGSIZE`, so it never worked there either. See
+    /// `MAX_SENDABLE_DATAGRAM` for the arithmetic.
+    ///
+    /// The amplification check below is a different matter and the one place
+    /// this genuinely refuses a configuration the kernel module runs. It is
+    /// intentional, and argued at the check rather than here, so that "every
+    /// working kernel configuration is accepted" is not read as covering it.
     pub fn validate(&self) -> Result<(), String> {
         for (label, junk, base) in [
             ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),

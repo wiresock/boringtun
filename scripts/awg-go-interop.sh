@@ -131,6 +131,37 @@ wait_sock() { # <iface>
   return 0
 }
 
+# Build the two namespaces and the veth between them, checking every step.
+#
+# Unchecked setup is how a negative control passes for the wrong reason: if the
+# veth or an address never came up, check 3 sees no handshake and reports
+# "vanilla server correctly cannot serve an obfuscated client" for a topology
+# that could not have carried one either way. That is the exact vacuous pass
+# check 3 exists to prevent, so the link is also *proven* to work below rather
+# than assumed.
+build_underlay() {
+  SETUP_STARTED=1
+  ip netns add "$NS_SRV" || return 1
+  ip netns add "$NS_CLI" || return 1
+  ip link add agi-vs type veth peer name agi-vc || return 1
+  ip link set agi-vs netns "$NS_SRV" || return 1
+  ip link set agi-vc netns "$NS_CLI" || return 1
+  ip netns exec "$NS_SRV" ip link set lo up || return 1
+  ip netns exec "$NS_CLI" ip link set lo up || return 1
+  ip netns exec "$NS_SRV" ip addr add "$SRV_LINK/30" dev agi-vs || return 1
+  ip netns exec "$NS_CLI" ip addr add "$CLI_LINK/30" dev agi-vc || return 1
+  ip netns exec "$NS_SRV" ip link set agi-vs up || return 1
+  ip netns exec "$NS_CLI" ip link set agi-vc up || return 1
+
+  # Positive control on the underlay itself, before any daemon exists. If this
+  # fails, nothing below is a statement about WireGuard.
+  ip netns exec "$NS_CLI" ping -c1 -w 5 -q "$SRV_LINK" >/dev/null 2>&1 || {
+    echo "underlay ping $CLI_LINK -> $SRV_LINK failed; the link is broken, not the tunnel"
+    return 1
+  }
+  return 0
+}
+
 # $1 = server obfuscated (1/0), $2 = client obfuscated (1/0), $3.. = boringtun flags.
 #
 # Two flags, not one, because the negative control has to be *born* mismatched.
@@ -140,12 +171,7 @@ wait_sock() { # <iface>
 start_pair() {
   local srv_obf=$1 cli_obf=$2; shift 2
   teardown
-  SETUP_STARTED=1
-  ip netns add "$NS_SRV"; ip netns add "$NS_CLI"
-  ip link add agi-vs type veth peer name agi-vc
-  ip link set agi-vs netns "$NS_SRV"; ip link set agi-vc netns "$NS_CLI"
-  ip netns exec "$NS_SRV" sh -c "ip link set lo up; ip addr add $SRV_LINK/30 dev agi-vs; ip link set agi-vs up"
-  ip netns exec "$NS_CLI" sh -c "ip link set lo up; ip addr add $CLI_LINK/30 dev agi-vc; ip link set agi-vc up"
+  build_underlay || return 1
 
   SRV_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
   CLI_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -190,8 +216,8 @@ EOF
   grep -q 'errno=0' /tmp/agi-srv-set.txt || { echo "server set=1 failed: $(cat /tmp/agi-srv-set.txt)"; return 1; }
   grep -q 'errno=0' /tmp/agi-cli-set.txt || { echo "amneziawg-go set=1 failed: $(cat /tmp/agi-cli-set.txt)"; return 1; }
 
-  ip netns exec "$NS_SRV" sh -c "ip addr add $SRV_TUN/24 dev $IF_SRV; ip link set $IF_SRV up mtu 1420" 2>/dev/null
-  ip netns exec "$NS_CLI" sh -c "ip addr add $CLI_TUN/32 dev $IF_CLI; ip link set $IF_CLI up mtu 1420; ip route add $SRV_TUN/32 dev $IF_CLI" 2>/dev/null
+  ip netns exec "$NS_SRV" sh -c "ip addr add $SRV_TUN/24 dev $IF_SRV && ip link set $IF_SRV up mtu 1420" || return 1
+  ip netns exec "$NS_CLI" sh -c "ip addr add $CLI_TUN/32 dev $IF_CLI && ip link set $IF_CLI up mtu 1420 && ip route add $SRV_TUN/32 dev $IF_CLI" || return 1
   return 0
 }
 
@@ -200,12 +226,7 @@ EOF
 # cannot.
 start_bt_pair() {
   teardown
-  SETUP_STARTED=1
-  ip netns add "$NS_SRV"; ip netns add "$NS_CLI"
-  ip link add agi-vs type veth peer name agi-vc
-  ip link set agi-vs netns "$NS_SRV"; ip link set agi-vc netns "$NS_CLI"
-  ip netns exec "$NS_SRV" sh -c "ip link set lo up; ip addr add $SRV_LINK/30 dev agi-vs; ip link set agi-vs up"
-  ip netns exec "$NS_CLI" sh -c "ip link set lo up; ip addr add $CLI_LINK/30 dev agi-vc; ip link set agi-vc up"
+  build_underlay || return 1
 
   SRV_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' 
 ')
