@@ -424,6 +424,38 @@ impl AmneziaConfig {
                 ));
             }
         }
+
+        // A cookie reply that is larger than the packet provoking it makes this
+        // port a reflector, and the ratio is fixed by S1/S2/S3 alone -- an
+        // attacker cannot influence it. `device::reply_policy` refuses to send
+        // such a reply, which costs the peer every handshake for as long as the
+        // device is over its handshake rate limit, because a peer that never
+        // receives a cookie can never produce a valid mac2.
+        //
+        // Refusing the configuration outright is the louder failure and the one
+        // the operator can act on: it happens at `awg set`, naming the values,
+        // rather than silently during a flood. The AmneziaWG kernel module
+        // accepts these combinations, so this is deliberately stricter than the
+        // reference implementation -- a config rejected here would have run
+        // there, weakly reflecting.
+        if let Some((which, request, reply)) = self.cookie_reply_amplifies() {
+            return Err(format!(
+                "S3 = {} makes a cookie reply {} bytes, larger than the {}-byte packet that provokes it ({} = {}); the reply would be suppressed and handshakes would fail under load. Lower S3 to at most {}, or raise {}.",
+                self.cookie_packet_junk_size,
+                reply,
+                request,
+                which,
+                request
+                    - if which == "S1" {
+                        HANDSHAKE_INIT_SZ
+                    } else {
+                        HANDSHAKE_RESP_SZ
+                    },
+                request - COOKIE_REPLY_SZ,
+                which
+            ));
+        }
+
         Ok(())
     }
 
@@ -669,8 +701,8 @@ impl AmneziaConfig {
     /// implementation runs would be an interoperability break for a
     /// configuration that is merely unwise.
     ///
-    /// Gated with `cookie_reply_len` above: `device::api` is the only caller.
-    #[cfg(any(test, feature = "device"))]
+    /// No longer gated: [`Self::validate`] calls it on every build, because a
+    /// configuration this shape is refused rather than merely warned about.
     pub(crate) fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
         for (label, junk, base) in [
@@ -1879,7 +1911,13 @@ mod tests {
     fn the_predicted_cookie_reply_length_is_the_one_actually_produced() {
         let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
         for s3 in [0u16, 1, 110, 1280, max_s3] {
-            let cfg = AmneziaConfig::new(0, 0, s3, 0);
+            // S1 and S2 are derived rather than zeroed: `validate` now refuses a
+            // cookie reply larger than the packet provoking it, so a bare
+            // `new(0, 0, max_s3, 0)` is no longer a configuration an operator
+            // could set, and asserting against it would be testing the
+            // prediction on a config that cannot exist. These are the smallest
+            // values that keep each S3 legal.
+            let cfg = AmneziaConfig::new(s3.saturating_sub(84), s3.saturating_sub(28), s3, 0);
             cfg.validate().expect("S3 within the validated range");
 
             let produced = packet_after_prepend(
@@ -2154,5 +2192,65 @@ mod tests {
             None,
             "the sizes scripts/awg-interop-poc.sh runs must keep their cookies"
         );
+    }
+
+    /// `validate` refuses a configuration whose cookie replies would amplify,
+    /// on both packet kinds and at the boundary.
+    ///
+    /// This is deliberately stricter than the AmneziaWG kernel module, which
+    /// accepts these combinations. The trade is stated in `validate`: a config
+    /// refused here would have run there, weakly reflecting, and would have lost
+    /// every handshake under load once `device::reply_policy` suppressed its
+    /// cookie replies. Failing at `awg set` is the one place the operator can
+    /// still act on it.
+    #[test]
+    fn validate_refuses_a_configuration_whose_cookie_replies_would_amplify() {
+        // Parity exactly: 64 + S3 == 148 + S1 and == 92 + S2. Legal.
+        AmneziaConfig::new(100, 156, 184, 0)
+            .validate()
+            .expect("parity is not amplification");
+
+        // One byte past the initiation bound.
+        let err = AmneziaConfig::new(100, 156, 185, 0)
+            .validate()
+            .expect_err("one byte over must be refused");
+        assert!(
+            err.contains("S1"),
+            "the error must name the binding value: {}",
+            err
+        );
+        assert!(
+            err.contains("249") && err.contains("248"),
+            "and both sizes, so the operator can see the margin: {}",
+            err
+        );
+
+        // The response bound is the tighter of the two, so a config can clear
+        // S1 and still fail on S2.
+        let err = AmneziaConfig::new(200, 100, 250, 0)
+            .validate()
+            .expect_err("the response bound must be checked too");
+        assert!(
+            err.contains("S2"),
+            "the error must name S2 here, not S1: {}",
+            err
+        );
+
+        // The shape an installer rolling S values independently produces.
+        assert!(
+            AmneziaConfig::new(15, 15, 150, 0).validate().is_err(),
+            "S1=15 S3=150 amplifies and must not load"
+        );
+
+        // And the sizes the interop harness runs must remain loadable, or this
+        // rule has broken the project's own reference configuration.
+        AmneziaConfig::new(120, 130, 110, 80)
+            .validate()
+            .expect("scripts/awg-interop-poc.sh must still be a legal config");
+
+        // As must the default: vanilla WireGuard has no S values at all.
+        AmneziaConfig::default()
+            .validate()
+            .expect("the default configuration must load");
     }
 }
