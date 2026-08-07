@@ -10,7 +10,8 @@
 # reachable from any unit test.
 #
 # Requires: root, the amneziawg kernel module, amneziawg-tools (awg), iproute2
-#           (ip), tcpdump, timeout, ping, and awk/cut/date/grep/head/lsmod.
+#           (ip), tcpdump, timeout, ping, and awk/cut/date/dd/grep/head/lsmod/
+#           od/tr.
 #           Preflight enforces every one of them and names the missing tool,
 #           because a missing dependency otherwise surfaces as a bogus test
 #           failure rather than as a setup problem.
@@ -167,7 +168,7 @@ command -v timeout >/dev/null     || die "timeout not installed (needed by the w
 # without ping, checks 3 and 5 report a dead datapath; and without grep or
 # lsmod the module check below reports the module as not loaded. ping is the
 # realistic one: minimal images frequently ship without iputils.
-for tool in awk cut date dd grep head lsmod od ping; do
+for tool in awk cut date dd grep head lsmod od ping tr; do
   command -v "$tool" >/dev/null || die "$tool not installed (used by preflight or the checks)"
 done
 
@@ -329,9 +330,10 @@ start_client() {  # $1 = ns, $2 = conf, $3 = tunnel addr
 # after \x -- and the whole thing is 29 bytes.
 readonly DNS_PROBE='\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01'
 
-# Send one datagram and print the reply as lowercase hex; empty means the
-# datagram was sent and nothing came back, and `SENDFAIL` means it could not be
-# sent at all.
+# Send one datagram and print the reply as lowercase hex. Three other outcomes
+# are distinguishable from a reply and from each other: empty means the datagram
+# was sent and nothing came back, `SENDFAIL` means the probe ran but could not
+# send, and `HARNESSFAIL(rc=N)` means the probe never ran at all.
 #
 # Distinguishing those two is the whole point. The checks below assert
 # *silence*, so a probe that never left the namespace -- a bash without
@@ -348,20 +350,39 @@ readonly DNS_PROBE='\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\
 # it as the *format* means a future probe containing a `%` produces garbage or
 # an error -- which, again, the silence checks would score as a PASS.
 udp_probe() { # <ns> <dst-ip> <dst-port> <printf-escapes-for-payload>
-  ip netns exec "$1" env P_IP="$2" P_PORT="$3" P_FMT="$4" timeout 3 bash -c '
+  local out rc
+  out=$(ip netns exec "$1" env P_IP="$2" P_PORT="$3" P_FMT="$4" timeout 3 bash -c '
     exec 3<>/dev/udp/$P_IP/$P_PORT || { echo SENDFAIL; exit 0; }
     printf "%b" "$P_FMT" >&3 || { echo SENDFAIL; exit 0; }
     dd bs=512 count=1 <&3 2>/dev/null | od -An -tx1 | tr -d " \n"
-  ' 2>/dev/null
+  ' 2>/dev/null)
+  rc=$?
+
+  # The inner script handles its own failures and always exits 0, so a non-zero
+  # status here is the *harness* failing before the probe ever ran: a missing
+  # namespace, no `timeout` or `bash` on PATH, `ip netns exec` refused. Those
+  # produce no output either, so without this they would arrive at the callers
+  # as an empty string and be scored as silence -- which is exactly the
+  # confusion `SENDFAIL` was added to remove, just one level further out.
+  #
+  # 124 is the exception: that is `timeout` killing a `dd` that is still waiting
+  # for a reply, which is the ordinary no-answer case and the thing the silence
+  # checks are actually asserting.
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+    echo "HARNESSFAIL(rc=$rc)"
+    return 0
+  fi
+  printf '%s' "$out"
 }
 
 # Assert that a probe was delivered and drew no reply, keeping "could not send"
 # distinct from "sent, no answer".
 expect_silence() { # <label> <reply-from-udp_probe>
   case "$2" in
-    SENDFAIL) bad "$1: the probe could not be sent -- harness failure, not a result" ;;
-    "")       ok  "$1" ;;
-    *)        bad "$1: answered with $2" ;;
+    SENDFAIL)      bad "$1: the probe could not be sent -- harness failure, not a result" ;;
+    HARNESSFAIL*)  bad "$1: the probe never ran ($2) -- harness failure, not a result" ;;
+    "")            ok  "$1" ;;
+    *)             bad "$1: answered with $2" ;;
   esac
 }
 
@@ -570,6 +591,10 @@ if ! start_server srv.conf; then
 else
   probe_reply=$(udp_probe "$NS_CLI" 10.201.0.1 "$PORT" "$DNS_PROBE")
   # 24 hex chars = the 12-byte header; anything shorter cannot be parsed at all.
+  case "$probe_reply" in
+    SENDFAIL|HARNESSFAIL*)
+      bad "imitating DNS: the probe never reached the server ($probe_reply) -- harness failure, not a result" ;;
+  esac
   if [ "${#probe_reply}" -lt 24 ]; then
     bad "imitating DNS: no usable reply to a DNS probe (got '${probe_reply:-<silence>}')"
   else
