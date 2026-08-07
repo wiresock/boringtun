@@ -29,8 +29,6 @@ set -uo pipefail
 BT=${1:?path to boringtun-cli}
 GO=${2:?path to amneziawg-go}
 
-NS_SRV=agi-srv; NS_CLI=agi-cli
-IF_SRV=agi0;    IF_CLI=agic
 PORT=51820
 SRV_TUN=10.77.0.1; CLI_TUN=10.77.0.2
 SRV_LINK=10.55.0.1; CLI_LINK=10.55.0.2
@@ -42,6 +40,14 @@ readonly JC=4 JMIN=50 JMAX=1000
 readonly S1=120 S2=130 S3=110 S4=80
 readonly H1=169887817 H2=390382747 H3=1033691040 H4=1526332224
 
+# One definition. This was written out inline in both `start_pair` and
+# `start_bt_pair`, and the two copies had already drifted apart in formatting --
+# which is how a difference in the *values* would arrive next.
+AWG_BLOCK=$'jc='"$JC"$'\njmin='"$JMIN"$'\njmax='"$JMAX"$'\ns1='"$S1"$'\ns2='"$S2"$'\ns3='"$S3"$'\ns4='"$S4"$'\nh1='"$H1"$'\nh2='"$H2"$'\nh3='"$H3"$'\nh4='"$H4"$'\n'
+readonly AWG_BLOCK
+
+genkey() { head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
 # Every artifact goes here, not to a predictable /tmp path. This runs as root:
 # a local user who pre-creates $SRV_LOG as a symlink would have root
 # truncate whatever it points at. `mktemp -d` plus `umask 077` is what
@@ -52,6 +58,23 @@ WORKDIR=$(mktemp -d /tmp/awg-go-interop.XXXXXX) || {
   exit 2
 }
 readonly WORKDIR
+
+# Every kernel-visible name this run creates carries the `mktemp` token.
+#
+# Fixed names were the reason cleanup needed an ownership flag at all: a
+# namespace called `agi-srv` might be somebody else's, and `ip netns pids | kill`
+# on somebody else's namespace is exactly the host damage the safety notice
+# above promises not to do. Preflight could only check for a collision, never
+# prevent one opening between the check and the create. A suffix the kernel has
+# just proved unique retires that question -- and lets two runs proceed at once,
+# which fixed names could not. The longest interface name below is 13
+# characters, inside the kernel's limit of 15.
+RUN=${WORKDIR##*.}
+NS_SRV="agi-srv-$RUN";  NS_CLI="agi-cli-$RUN"
+IF_SRV="agi0-$RUN";     IF_CLI="agic-$RUN"
+VETH_SRV="agi-vs-$RUN"; VETH_CLI="agi-vc-$RUN"
+readonly RUN NS_SRV NS_CLI IF_SRV IF_CLI VETH_SRV VETH_CLI
+
 SRV_LOG="$WORKDIR/srv.log"
 CLI_LOG="$WORKDIR/cli.log"
 BTCLI_LOG="$WORKDIR/btcli.log"
@@ -63,23 +86,51 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 info() { printf '\033[1m==> %s\033[0m\n' "$1"; }
 
-# Set to 1 only once this run has created something. Until then `teardown` is a
-# no-op, because the names below are fixed: a namespace already called `agi-srv`
-# belongs to somebody else, and killing every process in it is exactly the host
-# damage the safety notice promises not to do. Preflight refuses on collision,
-# and teardown only ever removes what this run made.
-SETUP_STARTED=0
+# What this run has actually created, appended to only after the creating
+# command reports success. A single "setup has started" flag could not say this:
+# it was set by the first successful create and then claimed everything, so a
+# later `ip netns add` that failed *because the name was already taken* still
+# left teardown believing the namespace was ours. It also never cleared, so from
+# the second check onward the claim outlived the resources entirely.
+#
+# Emptied by `teardown`, so each rebuild has to acquire ownership again.
+OWNED_NS=()
+OWNED_LINKS=()
+OWNED_SOCKS=()
 
+# The UAPI sockets are created by the daemons, not by us, and they live outside
+# the namespaces -- /var/run is not network namespaced -- so they have to be
+# removed by name. The name is claimed when the daemon is launched rather than
+# when the socket appears: a daemon that starts and then hangs still has to be
+# cleaned up after, and `wait_sock` giving up does not mean nothing was created.
+own_socks() { # <iface>
+  OWNED_SOCKS+=("/var/run/wireguard/$1.sock" "/var/run/amneziawg/$1.sock")
+}
+
+# `${a[@]+"${a[@]}"}` and not `"${a[@]}"`: under `set -u` an empty array is an
+# unbound variable to bash 4.3 and older, and this script is run on whatever the
+# host has.
 teardown() {
-  [ "$SETUP_STARTED" -eq 1 ] || return 0
-  for ns in "$NS_SRV" "$NS_CLI"; do
-    p=$(ip netns pids "$ns" 2>/dev/null); [ -n "$p" ] && kill $p 2>/dev/null
+  local ns link sock p killed=0
+  for ns in ${OWNED_NS[@]+"${OWNED_NS[@]}"}; do
+    p=$(ip netns pids "$ns" 2>/dev/null)
+    [ -n "$p" ] && { kill $p 2>/dev/null; killed=1; }
   done
-  sleep 0.4
-  ip netns del "$NS_SRV" 2>/dev/null; ip netns del "$NS_CLI" 2>/dev/null
-  ip link del agi-vs 2>/dev/null
-  rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock" \
-        "/var/run/wireguard/${IF_CLI}.sock" "/var/run/amneziawg/${IF_CLI}.sock"
+  [ "$killed" -eq 1 ] && sleep 0.4
+  for ns in ${OWNED_NS[@]+"${OWNED_NS[@]}"}; do
+    ip netns del "$ns" 2>/dev/null
+  done
+  # Usually already gone with the namespaces they were moved into; this covers
+  # a failure between creating the veth pair and moving it.
+  for link in ${OWNED_LINKS[@]+"${OWNED_LINKS[@]}"}; do
+    ip link del "$link" 2>/dev/null
+  done
+  for sock in ${OWNED_SOCKS[@]+"${OWNED_SOCKS[@]}"}; do
+    rm -f "$sock"
+  done
+  OWNED_NS=()
+  OWNED_LINKS=()
+  OWNED_SOCKS=()
   return 0
 }
 # `$WORKDIR` came from `mktemp -d`, so this only ever removes a directory this
@@ -98,11 +149,13 @@ die() { printf '\033[31mpreflight: %s\033[0m\n' "$1" >&2; exit 2; }
 [ -x "$BT" ]         || die "boringtun-cli not found or not executable: $BT"
 [ -x "$GO" ]         || die "amneziawg-go not found or not executable: $GO"
 
-# Refuse to clobber anything already using our names, before the first teardown.
+# The names carry this run's `mktemp` token, so a hit here means the token was
+# not unique after all. Kept as an assertion on that premise, not as the safety
+# mechanism it used to be -- ownership tracking is what makes teardown safe now.
 for ns in "$NS_SRV" "$NS_CLI"; do
   ip netns list 2>/dev/null | grep -qw "$ns" && die "namespace $ns already exists; refusing to touch it"
 done
-for l in agi-vs agi-vc; do
+for l in "$VETH_SRV" "$VETH_CLI"; do
   ip link show "$l" >/dev/null 2>&1 && die "interface $l already exists; refusing to touch it"
 done
 for sock in "${IF_SRV}" "${IF_CLI}"; do
@@ -164,22 +217,23 @@ wait_sock() { # <iface>
 # check 3 exists to prevent, so the link is also *proven* to work below rather
 # than assumed.
 build_underlay() {
-  # Marked *after* the first create succeeds, not before. Two runs can both
-  # clear preflight; the loser of this `ip netns add` race must not then have
-  # its EXIT trap delete the winner's namespaces. The first successful add is
-  # the serialisation point, so ownership begins there.
+  # Each name is claimed only by the command that created it, immediately after
+  # that command reports success. Anything below this that fails leaves the
+  # names it did not create unclaimed, so teardown cannot reach them.
   ip netns add "$NS_SRV" || return 1
-  SETUP_STARTED=1
+  OWNED_NS+=("$NS_SRV")
   ip netns add "$NS_CLI" || return 1
-  ip link add agi-vs type veth peer name agi-vc || return 1
-  ip link set agi-vs netns "$NS_SRV" || return 1
-  ip link set agi-vc netns "$NS_CLI" || return 1
+  OWNED_NS+=("$NS_CLI")
+  ip link add "$VETH_SRV" type veth peer name "$VETH_CLI" || return 1
+  OWNED_LINKS+=("$VETH_SRV" "$VETH_CLI")
+  ip link set "$VETH_SRV" netns "$NS_SRV" || return 1
+  ip link set "$VETH_CLI" netns "$NS_CLI" || return 1
   ip netns exec "$NS_SRV" ip link set lo up || return 1
   ip netns exec "$NS_CLI" ip link set lo up || return 1
-  ip netns exec "$NS_SRV" ip addr add "$SRV_LINK/30" dev agi-vs || return 1
-  ip netns exec "$NS_CLI" ip addr add "$CLI_LINK/30" dev agi-vc || return 1
-  ip netns exec "$NS_SRV" ip link set agi-vs up || return 1
-  ip netns exec "$NS_CLI" ip link set agi-vc up || return 1
+  ip netns exec "$NS_SRV" ip addr add "$SRV_LINK/30" dev "$VETH_SRV" || return 1
+  ip netns exec "$NS_CLI" ip addr add "$CLI_LINK/30" dev "$VETH_CLI" || return 1
+  ip netns exec "$NS_SRV" ip link set "$VETH_SRV" up || return 1
+  ip netns exec "$NS_CLI" ip link set "$VETH_CLI" up || return 1
 
   # Positive control on the underlay itself, before any daemon exists. If this
   # fails, nothing below is a statement about WireGuard.
@@ -201,29 +255,28 @@ start_pair() {
   teardown
   build_underlay || return 1
 
-  SRV_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  CLI_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  SRV_KEY=$(genkey); CLI_KEY=$(genkey)
   SRV_PUB=$(pubkey "$SRV_KEY"); CLI_PUB=$(pubkey "$CLI_KEY")
 
-  ip netns exec "$NS_SRV" env WG_LOG_FILE=$SRV_LOG WG_LOG_LEVEL=debug \
+  own_socks "$IF_SRV"
+  ip netns exec "$NS_SRV" env WG_LOG_FILE="$SRV_LOG" WG_LOG_LEVEL=debug \
     "$BT" --disable-drop-privileges "$@" "$IF_SRV" >/dev/null 2>&1
   # `-f`, not its default daemonise. Forking under WSL loses the process
   # before the UAPI socket appears -- the same failure boringtun's own
   # daemonised logs have here. Foreground plus `&` keeps it in the
   # namespace and observable.
+  own_socks "$IF_CLI"
   ip netns exec "$NS_CLI" env LOG_LEVEL=verbose \
-    "$GO" -f "$IF_CLI" >$CLI_LOG 2>&1 &
+    "$GO" -f "$IF_CLI" >"$CLI_LOG" 2>&1 &
 
   wait_sock "$IF_SRV" || { echo "server socket never appeared"; return 1; }
   wait_sock "$IF_CLI" || { echo "amneziawg-go socket never appeared"; return 1; }
 
-  local AWG
-  AWG=$'jc='"$JC"$'\njmin='"$JMIN"$'\njmax='"$JMAX"$'\ns1='"$S1"$'\ns2='"$S2"$'\ns3='"$S3"$'\ns4='"$S4"$'\nh1='"$H1"$'\nh2='"$H2"$'\nh3='"$H3"$'\nh4='"$H4"$'\n'
   local SRV_OBF='' CLI_OBF=''
-  [ "$srv_obf" = 1 ] && SRV_OBF=$AWG
-  [ "$cli_obf" = 1 ] && CLI_OBF=$AWG
+  [ "$srv_obf" = 1 ] && SRV_OBF=$AWG_BLOCK
+  [ "$cli_obf" = 1 ] && CLI_OBF=$AWG_BLOCK
 
-  uapi "$NS_SRV" "$IF_SRV" >$SRV_SET <<EOF
+  uapi "$NS_SRV" "$IF_SRV" >"$SRV_SET" <<EOF
 set=1
 private_key=$SRV_KEY
 listen_port=$PORT
@@ -231,7 +284,7 @@ ${SRV_OBF}public_key=$CLI_PUB
 allowed_ip=$CLI_TUN/32
 
 EOF
-  uapi "$NS_CLI" "$IF_CLI" >$CLI_SET <<EOF
+  uapi "$NS_CLI" "$IF_CLI" >"$CLI_SET" <<EOF
 set=1
 private_key=$CLI_KEY
 listen_port=51821
@@ -256,31 +309,20 @@ start_bt_pair() {
   teardown
   build_underlay || return 1
 
-  SRV_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' 
-')
-  CLI_KEY=$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' 
-')
+  SRV_KEY=$(genkey); CLI_KEY=$(genkey)
   SRV_PUB=$(pubkey "$SRV_KEY"); CLI_PUB=$(pubkey "$CLI_KEY")
 
-  ip netns exec "$NS_SRV" env WG_LOG_FILE=$SRV_LOG WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_SRV" >/dev/null 2>&1
-  ip netns exec "$NS_CLI" env WG_LOG_FILE=$BTCLI_LOG WG_LOG_LEVEL=debug     "$BT" --disable-drop-privileges "$@" "$IF_CLI" >/dev/null 2>&1
+  own_socks "$IF_SRV"
+  ip netns exec "$NS_SRV" env WG_LOG_FILE="$SRV_LOG" WG_LOG_LEVEL=debug \
+    "$BT" --disable-drop-privileges "$@" "$IF_SRV" >/dev/null 2>&1
+  own_socks "$IF_CLI"
+  ip netns exec "$NS_CLI" env WG_LOG_FILE="$BTCLI_LOG" WG_LOG_LEVEL=debug \
+    "$BT" --disable-drop-privileges "$@" "$IF_CLI" >/dev/null 2>&1
 
   wait_sock "$IF_SRV" || { echo "server socket never appeared"; return 1; }
   wait_sock "$IF_CLI" || { echo "boringtun client socket never appeared"; return 1; }
 
-  local AWG
-  AWG=$'jc='"$JC"$'
-jmin='"$JMIN"$'
-jmax='"$JMAX"$'
-s1='"$S1"$'
-s2='"$S2"$'
-s3='"$S3"$'
-s4='"$S4"$'
-h1='"$H1"$'
-h2='"$H2"$'
-h3='"$H3"$'
-h4='"$H4"$'
-'
+  local AWG=$AWG_BLOCK
 
   # Both responses are inspected, as `start_pair` does. `validate` refuses some
   # S combinations outright, so a bad set of sizes here would otherwise surface
@@ -340,8 +382,8 @@ else
     ok "amneziawg-go completed a handshake against boringtun"
   else
     bad "no handshake -- wire format disagreement"
-    echo "    srv: $(tail -3 $SRV_LOG 2>/dev/null | tr '\n' ' ')"
-    echo "    cli: $(tail -3 $CLI_LOG 2>/dev/null | tr '\n' ' ')"
+    echo "    srv: $(tail -3 "$SRV_LOG" 2>/dev/null | tr '\n' ' ')"
+    echo "    cli: $(tail -3 "$CLI_LOG" 2>/dev/null | tr '\n' ' ')"
   fi
 
   info "2. and passes bidirectional traffic through the tunnel"
@@ -386,8 +428,7 @@ else
     ok "amneziawg-go still handshakes and passes traffic while the port answers DNS probes"
   else
     bad "enabling the probe responder broke interop with a third-party client"
-    echo "    srv: $(tail -5 $SRV_LOG 2>/dev/null | tr '
-' ' ')"
+    echo "    srv: $(tail -5 "$SRV_LOG" 2>/dev/null | tr '\n' ' ')"
   fi
 fi
 
@@ -408,8 +449,7 @@ else
     ok "a DNS-shaped initiation is treated as tunnel traffic, not answered as a probe"
   else
     bad "a client whose S1 junk is a valid DNS query did not handshake -- classification order"
-    echo "    srv: $(tail -5 $SRV_LOG 2>/dev/null | tr '
-' ' ')"
+    echo "    srv: $(tail -5 "$SRV_LOG" 2>/dev/null | tr '\n' ' ')"
   fi
 fi
 
