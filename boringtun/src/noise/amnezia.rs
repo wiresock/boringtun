@@ -31,8 +31,13 @@ const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
 /// ceiling rather than the transport one. The 28-byte difference is deliberate:
 /// a configuration in that window passes the kernel's check and then fails at
 /// send time with `EMSGSIZE`, so it does not work there either. Rejecting it up
-/// front is not a parity break — every configuration that *functions* on the
-/// kernel module is still accepted here.
+/// front is not a parity break: nothing that *functions* on the kernel module
+/// is refused on size grounds here.
+///
+/// That is a claim about size only. [`AmneziaConfig::validate`] also refuses a
+/// configuration whose cookie replies would amplify, and that one *is* a
+/// deliberate parity break — the kernel accepts those and runs them. The
+/// argument for it is at the check.
 const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 const DNS_JUNK_SIZE_MIN: usize = 50;
 const DNS_JUNK_SIZE_MAX: usize = 200;
@@ -404,12 +409,16 @@ impl AmneziaConfig {
     /// (`MESSAGE_MAX_SIZE = 65535`) while this uses `MAX_SENDABLE_DATAGRAM`,
     /// what a UDP socket can actually carry.
     ///
-    /// The relationship is therefore one-way, not symmetric: every
-    /// configuration that *functions* on the kernel module is accepted here,
-    /// but a configuration landing in the 28-byte gap is accepted by the kernel
-    /// and rejected here. Nothing is lost — such a configuration fails on the
-    /// kernel too, at send time with `EMSGSIZE`, so it never worked there
-    /// either. See `MAX_SENDABLE_DATAGRAM` for the arithmetic.
+    /// The relationship is therefore one-way, not symmetric: on **size**, a
+    /// configuration landing in the 28-byte gap is accepted by the kernel and
+    /// rejected here, and nothing is lost — it fails on the kernel too, at send
+    /// time with `EMSGSIZE`, so it never worked there either. See
+    /// `MAX_SENDABLE_DATAGRAM` for the arithmetic.
+    ///
+    /// The amplification check below is a different matter and the one place
+    /// this genuinely refuses a configuration the kernel module runs. It is
+    /// intentional, and argued at the check rather than here, so that "every
+    /// working kernel configuration is accepted" is not read as covering it.
     pub fn validate(&self) -> Result<(), String> {
         for (label, junk, base) in [
             ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
@@ -424,6 +433,49 @@ impl AmneziaConfig {
                 ));
             }
         }
+
+        // A cookie reply that is larger than the packet provoking it makes this
+        // port a reflector, and the ratio is fixed by S1/S2/S3 alone -- an
+        // attacker cannot influence it. `device::reply_policy` refuses to send
+        // such a reply, which costs the peer every handshake for as long as the
+        // device is over its handshake rate limit, because a peer that never
+        // receives a cookie can never produce a valid mac2.
+        //
+        // Refusing the configuration outright is the louder failure and the one
+        // the operator can act on: it happens at `awg set`, naming the values,
+        // rather than silently during a flood. The AmneziaWG kernel module
+        // accepts these combinations, so this is deliberately stricter than the
+        // reference implementation -- a config rejected here would have run
+        // there, weakly reflecting.
+        // Both alternatives the message offers have to work in one pass. The
+        // "raise" side therefore names every violated bound, not just the
+        // binding one: at S1=100, S2=0, S3=185 both are violated, and raising
+        // S2 alone still leaves the initiation a byte short.
+        let bounds = self.cookie_amplification_bounds();
+        if let Some(&(which, request, _)) = bounds.first() {
+            let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
+            let raise = bounds
+                .iter()
+                .map(|&(label, _, min_junk)| format!("{} to at least {}", label, min_junk))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            return Err(format!(
+                "S3 = {} makes a cookie reply {} bytes, larger than the {}-byte packet that provokes it ({} = {}); the reply would be suppressed and handshakes would fail under load. Lower S3 to at most {}, or raise {}.",
+                self.cookie_packet_junk_size,
+                reply,
+                request,
+                which,
+                request
+                    - if which == "S1" {
+                        HANDSHAKE_INIT_SZ
+                    } else {
+                        HANDSHAKE_RESP_SZ
+                    },
+                request - COOKIE_REPLY_SZ,
+                raise
+            ));
+        }
+
         Ok(())
     }
 
@@ -649,8 +701,10 @@ impl AmneziaConfig {
     /// The S sizes at which a cookie reply would be larger than the packet that
     /// provokes it, if there are any.
     ///
-    /// Returns `(kind, request_len, reply_len)` for the first packet kind that
-    /// amplifies, where `kind` is `"S1"` (an initiation) or `"S2"` (a response).
+    /// Every request kind the reply would exceed, tightest bound first, as
+    /// `(kind, request_len, smallest_junk_that_clears_it)`, where `kind` is
+    /// `"S1"` (an initiation) or `"S2"` (a response). Empty when the
+    /// configuration does not amplify.
     ///
     /// `device::reply_policy::cookie_verdict` suppresses such a reply, because a
     /// cookie reply aimed at a forged source is a reflector and the ratio is
@@ -664,25 +718,60 @@ impl AmneziaConfig {
     /// alone — `64 + S3 > 148 + S1` for an initiation, `64 + S3 > 92 + S2` for a
     /// response — so there is no reason to discover it at send time.
     ///
-    /// It deliberately does **not** reject. The AmneziaWG kernel module accepts
-    /// these combinations, and a config this fork refuses but the reference
-    /// implementation runs would be an interoperability break for a
-    /// configuration that is merely unwise.
+    /// Both kinds can be violated at once, and they are independent: S3 has to
+    /// clear *both*. That is why this reports all of them rather than the first
+    /// or the tightest. At S1=100, S2=0, S3=185 the reply is 249 bytes against a
+    /// 248-byte initiation and a 92-byte response — advice naming either alone
+    /// leaves the other failing, and the operator is sent round twice.
     ///
-    /// Gated with `cookie_reply_len` above: `device::api` is the only caller.
-    #[cfg(any(test, feature = "device"))]
-    pub(crate) fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
+    /// The `min_junk` values are always reachable: `min_junk + base` is exactly
+    /// `COOKIE_REPLY_SZ + S3`, and [`Self::validate`] has already bounded that
+    /// by `MAX_SENDABLE_DATAGRAM` before it gets here, so following this advice
+    /// can never trip the size check instead.
+    ///
+    /// This function only *reports*. [`Self::validate`] is what rejects, and it
+    /// does so deliberately: see the argument there for why refusing a
+    /// configuration the AmneziaWG kernel module would accept is the right trade
+    /// rather than an interoperability break worth avoiding.
+    ///
+    /// Not gated: [`Self::validate`] calls it on every build, because a
+    /// configuration this shape is refused rather than merely warned about.
+    fn cookie_amplification_bounds(&self) -> Vec<(&'static str, usize, usize)> {
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
-        for (label, junk, base) in [
+        let mut bounds: Vec<(&'static str, usize, usize)> = [
             ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
             ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
-        ] {
-            let request = base + junk as usize;
-            if reply > request {
-                return Some((label, request, reply));
-            }
-        }
-        None
+        ]
+        .iter()
+        // Filter before the subtraction, not after: `reply - base` underflows
+        // on a configuration that does not amplify, which is most of them.
+        // `reply > base + junk` implies `reply > base`, so the map is safe only
+        // in this order.
+        .filter(|&&(_, junk, base)| reply > base + junk as usize)
+        .map(|&(label, junk, base)| (label, base + junk as usize, reply - base))
+        .collect();
+        // Stable, so an equal pair still reports S1 first and the message stays
+        // the same for the common symmetric configuration.
+        bounds.sort_by_key(|&(_, request, _)| request);
+        bounds
+    }
+
+    /// The **binding** bound as `(kind, request_len, reply_len)` — the shortest
+    /// provoking packet, the one S3 actually has to clear — or `None` when the
+    /// configuration does not amplify.
+    ///
+    /// A view over [`Self::cookie_amplification_bounds`], not a second
+    /// derivation. `validate` needs every violated bound, so it calls that
+    /// directly; this narrower shape is only convenient for asserting *which*
+    /// bound binds, and `#[cfg(test)]` accordingly — left ungated it is dead
+    /// code, and the crate carries a `dead_code` warning for it with or without
+    /// the `device` feature.
+    #[cfg(test)]
+    fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
+        let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
+        // Sorted tightest-first, so the first entry is the binding one.
+        let (label, request, _) = self.cookie_amplification_bounds().into_iter().next()?;
+        Some((label, request, reply))
     }
 
     pub(crate) fn prepend_outbound<'a>(
@@ -1879,7 +1968,13 @@ mod tests {
     fn the_predicted_cookie_reply_length_is_the_one_actually_produced() {
         let max_s3 = (MAX_SENDABLE_DATAGRAM - COOKIE_REPLY_SZ) as u16;
         for s3 in [0u16, 1, 110, 1280, max_s3] {
-            let cfg = AmneziaConfig::new(0, 0, s3, 0);
+            // S1 and S2 are derived rather than zeroed: `validate` now refuses a
+            // cookie reply larger than the packet provoking it, so a bare
+            // `new(0, 0, max_s3, 0)` is no longer a configuration an operator
+            // could set, and asserting against it would be testing the
+            // prediction on a config that cannot exist. These are the smallest
+            // values that keep each S3 legal.
+            let cfg = AmneziaConfig::new(s3.saturating_sub(84), s3.saturating_sub(28), s3, 0);
             cfg.validate().expect("S3 within the validated range");
 
             let produced = packet_after_prepend(
@@ -2154,5 +2249,211 @@ mod tests {
             None,
             "the sizes scripts/awg-interop-poc.sh runs must keep their cookies"
         );
+    }
+
+    /// `validate` refuses a configuration whose cookie replies would amplify,
+    /// on both packet kinds and at the boundary.
+    ///
+    /// This is deliberately stricter than the AmneziaWG kernel module, which
+    /// accepts these combinations. The trade is stated in `validate`: a config
+    /// refused here would have run there, weakly reflecting, and would have lost
+    /// every handshake under load once `device::reply_policy` suppressed its
+    /// cookie replies. Failing at `awg set` is the one place the operator can
+    /// still act on it.
+    #[test]
+    fn validate_refuses_a_configuration_whose_cookie_replies_would_amplify() {
+        // Parity exactly: 64 + S3 == 148 + S1 and == 92 + S2. Legal.
+        AmneziaConfig::new(100, 156, 184, 0)
+            .validate()
+            .expect("parity is not amplification");
+
+        // One byte past the initiation bound.
+        let err = AmneziaConfig::new(100, 156, 185, 0)
+            .validate()
+            .expect_err("one byte over must be refused");
+        assert!(
+            err.contains("S1"),
+            "the error must name the binding value: {}",
+            err
+        );
+        assert!(
+            err.contains("249") && err.contains("248"),
+            "and both sizes, so the operator can see the margin: {}",
+            err
+        );
+
+        // The response bound is the tighter of the two, so a config can clear
+        // S1 and still fail on S2.
+        let err = AmneziaConfig::new(200, 100, 250, 0)
+            .validate()
+            .expect_err("the response bound must be checked too");
+        assert!(
+            err.contains("S2"),
+            "the error must name S2 here, not S1: {}",
+            err
+        );
+
+        // The shape an installer rolling S values independently produces.
+        assert!(
+            AmneziaConfig::new(15, 15, 150, 0).validate().is_err(),
+            "S1=15 S3=150 amplifies and must not load"
+        );
+
+        // And the sizes the interop harness runs must remain loadable, or this
+        // rule has broken the project's own reference configuration.
+        AmneziaConfig::new(120, 130, 110, 80)
+            .validate()
+            .expect("scripts/awg-interop-poc.sh must still be a legal config");
+
+        // As must the default: vanilla WireGuard has no S values at all.
+        AmneziaConfig::default()
+            .validate()
+            .expect("the default configuration must load");
+    }
+
+    /// Following the error message's advice must actually produce a loadable
+    /// configuration.
+    ///
+    /// The message names a maximum S3. If the helper reports whichever bound it
+    /// checks first rather than the binding one, that maximum can still be too
+    /// high -- at S1=100, S2=0, S3=185 the initiation bound advises 184, and 184
+    /// still fails the response bound of 28. This asserts the property the
+    /// operator actually cares about rather than the mechanism: take the number
+    /// the message gives, apply it, and the config must validate.
+    #[test]
+    fn the_maximum_s3_the_error_recommends_actually_validates() {
+        for (s1, s2, s3) in [
+            (100u16, 0u16, 185u16), // both bounds violated, response the tighter
+            (0, 100, 185),          // both violated, initiation the tighter
+            (15, 15, 150),          // the installer shape
+            (0, 0, 100),            // no S padding at all
+            (100, 156, 185),        // one byte past a symmetric parity
+        ] {
+            let cfg = AmneziaConfig::new(s1, s2, s3, 0);
+            let (_, request, _) = cfg
+                .cookie_reply_amplifies()
+                .unwrap_or_else(|| panic!("S1={} S2={} S3={} should amplify", s1, s2, s3));
+
+            let advised = (request - COOKIE_REPLY_SZ) as u16;
+            AmneziaConfig::new(s1, s2, advised, 0)
+                .validate()
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "S1={} S2={}: advised S3={} still rejected: {}",
+                        s1, s2, advised, e
+                    )
+                });
+
+            // And it is the *largest* such value, or the advice is needlessly
+            // strict and the operator loses padding they could have kept.
+            assert!(
+                AmneziaConfig::new(s1, s2, advised + 1, 0)
+                    .validate()
+                    .is_err(),
+                "S1={} S2={}: S3={} should have been advised instead",
+                s1,
+                s2,
+                advised + 1
+            );
+        }
+    }
+
+    /// The message's *other* alternative has to work in one pass too.
+    ///
+    /// "Lower S3, or raise S1/S2" offers two routes and an operator may take
+    /// either. When both bounds are violated they are independent, so naming
+    /// only the binding one leaves the other failing: at S1=100, S2=0, S3=185,
+    /// raising S2 to parity still leaves the initiation a byte short.
+    ///
+    /// Parses the minima back out of the rendered string rather than calling
+    /// the helper, because the string is what the operator acts on. A helper
+    /// that is right while the message is wrong still sends them round twice.
+    #[test]
+    fn every_raise_the_error_recommends_applied_together_actually_validates() {
+        /// -> [("S1", 101), ("S2", 157)] from "... or raise S1 to at least 101
+        /// and S2 to at least 157."
+        fn parse_raises(msg: &str) -> Vec<(String, u16)> {
+            let tail = msg
+                .split_once(", or raise ")
+                .unwrap_or_else(|| panic!("no raise advice in: {}", msg))
+                .1
+                .trim_end_matches('.');
+            tail.split(" and ")
+                .map(|clause| {
+                    let (label, value) = clause
+                        .split_once(" to at least ")
+                        .unwrap_or_else(|| panic!("malformed raise clause: {}", clause));
+                    (
+                        label.to_string(),
+                        value
+                            .parse()
+                            .unwrap_or_else(|e| panic!("bad number in {}: {}", clause, e)),
+                    )
+                })
+                .collect()
+        }
+
+        for (s1, s2, s3, expected_count) in [
+            (100u16, 0u16, 185u16, 2), // both bounds violated
+            (0, 100, 185, 2),          // both violated, the other way round
+            (200, 100, 250, 1),        // clears S1, fails S2
+            (15, 15, 150, 2),          // the installer shape
+            (100, 156, 185, 2),        // one byte past a symmetric parity
+        ] {
+            let err = AmneziaConfig::new(s1, s2, s3, 0)
+                .validate()
+                .expect_err("this configuration must be refused");
+            let raises = parse_raises(&err);
+            assert_eq!(
+                raises.len(),
+                expected_count,
+                "S1={} S2={} S3={}: wrong number of bounds named in {}",
+                s1,
+                s2,
+                s3,
+                err
+            );
+
+            // Apply every raise the message names, all at once, and the
+            // configuration must load.
+            let mut raised_s1 = s1;
+            let mut raised_s2 = s2;
+            for (label, min) in &raises {
+                match label.as_str() {
+                    "S1" => raised_s1 = *min,
+                    "S2" => raised_s2 = *min,
+                    other => panic!("unexpected label {} in {}", other, err),
+                }
+            }
+            AmneziaConfig::new(raised_s1, raised_s2, s3, 0)
+                .validate()
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "S1={}->{} S2={}->{} S3={}: following the advice still fails: {}",
+                        s1, raised_s1, s2, raised_s2, s3, e
+                    )
+                });
+
+            // And each is the *smallest* value that works, or the advice costs
+            // the operator padding they could have kept.
+            for (label, min) in &raises {
+                let (probe_s1, probe_s2) = match label.as_str() {
+                    "S1" => (min - 1, raised_s2),
+                    _ => (raised_s1, min - 1),
+                };
+                assert!(
+                    AmneziaConfig::new(probe_s1, probe_s2, s3, 0)
+                        .validate()
+                        .is_err(),
+                    "S1={} S2={} S3={}: {} = {} would have done, so {} is too strict",
+                    s1,
+                    s2,
+                    s3,
+                    label,
+                    min - 1,
+                    min
+                );
+            }
+        }
     }
 }

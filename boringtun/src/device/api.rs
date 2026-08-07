@@ -172,26 +172,6 @@ impl AwgParams {
             return Err(EINVAL);
         }
 
-        // Not a rejection: the kernel module accepts these sizes and refusing
-        // them here would be an interop break for a configuration that is
-        // merely unwise. But `reply_policy::cookie_verdict` will suppress every
-        // cookie reply this config produces, and the peer that needs one cannot
-        // complete a handshake while the device is under load. The operator can
-        // only fix that if they are told, and here -- at `awg set` -- is when
-        // they can, rather than during the flood.
-        if let Some((which, request, reply)) = amnezia.cookie_reply_amplifies() {
-            tracing::warn!(
-                // One line, single-spaced. A `\`-continued literal here read
-                // fine in the source and then `cargo fmt` joined the lines,
-                // leaving ~28 literal spaces inside the message -- which is what
-                // an operator would have had to grep past in the log.
-                message = "S3 makes cookie replies larger than the packets that provoke them, so they will be suppressed and handshakes will fail while the device is under load; lower S3, or raise the S value named below",
-                larger_than = which,
-                request_bytes = request,
-                reply_bytes = reply
-            );
-        }
-
         Ok((obf, amnezia))
     }
 }

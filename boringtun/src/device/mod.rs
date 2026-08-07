@@ -1627,14 +1627,34 @@ mod ingress_tests {
     /// stands between it and 65 KB aimed at a stranger.
     #[test]
     fn the_largest_permitted_s3_is_refused_as_an_amplifier() {
-        // 65443 is the largest S3 `validate` accepts -- the IPv4 UDP payload
-        // limit less the 64-byte cookie reply. Pinned by its neighbour rather
-        // than quoted, so this is the real edge of the configuration space and
-        // not a number someone remembered.
-        assert!(AmneziaConfig::new(0, 0, 65_443, 0).validate().is_ok());
-        assert!(AmneziaConfig::new(0, 0, 65_444, 0).validate().is_err());
+        // 65443 is the largest S3 the *size* rule permits -- the IPv4 UDP
+        // payload limit less the 64-byte cookie reply. Pinned by its neighbour
+        // rather than quoted, so this is the real edge of the configuration
+        // space and not a number someone remembered. S1 and S2 are at their own
+        // maxima, which is what it takes for an S3 that large to also clear the
+        // amplification rule.
+        assert!(AmneziaConfig::new(65_359, 65_415, 65_443, 0)
+            .validate()
+            .is_ok());
+        assert!(AmneziaConfig::new(65_359, 65_415, 65_444, 0)
+            .validate()
+            .is_err());
 
+        // With S1 = 0 the same S3 is now refused at configuration time -- the
+        // first of the two doors, and the loud one.
         let amnezia = AmneziaConfig::new(0, 0, 65_443, 0);
+        let err = amnezia
+            .validate()
+            .expect_err("an amplifying S3 must not be a loadable configuration");
+        assert!(
+            err.contains("larger than"),
+            "the error must say what is wrong, not just that something is: {}",
+            err
+        );
+
+        // And the second door still holds, because it has to: a `DeviceConfig`
+        // supplied at startup never passes through `validate`, so `cookie_verdict`
+        // is the only thing standing between this config and the reflector below.
         let (request_len, reply_len) = cookie_exchange_sizes(&amnezia);
 
         assert_eq!(
