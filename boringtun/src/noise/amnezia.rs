@@ -1,7 +1,9 @@
 // Copyright (c) 2024 BoringTun contributors. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-#[cfg(test)]
+// For `conforming_initiation` only, and gated exactly as it is: its caller is
+// `device::probe_reply`, which does not exist without the `device` feature.
+#[cfg(all(test, feature = "device"))]
 use super::HANDSHAKE_INIT;
 use super::{
     handshake::ObfuscationRanges, COOKIE_REPLY_SZ, DATA_OVERHEAD_SZ, HANDSHAKE_INIT_SZ,
@@ -226,7 +228,12 @@ impl AmneziaImitation {
 /// Building it there instead meant exporting `HANDSHAKE_INIT` and
 /// `HANDSHAKE_INIT_SZ` crate-wide for a test, permanently widening two
 /// protocol constants that nothing in production needs outside `noise`.
-#[cfg(test)]
+///
+/// Gated on `device` as well as `test`, for the reason [`super::packet_sizes`]
+/// gives: the only caller is behind that feature, so a test build without it
+/// carries a `dead_code` warning for this function -- and `cargo hack test
+/// --each-feature`, which CI runs, compiles exactly that configuration.
+#[cfg(all(test, feature = "device"))]
 pub(crate) fn conforming_initiation(
     cfg: &AmneziaConfig,
     obf: ObfuscationRanges,
@@ -622,7 +629,11 @@ impl AmneziaConfig {
     /// 65 KB of keystream, which is a cheaper attack than the amplification it
     /// was meant to prevent.
     ///
-    /// Duplicates what `prepend_outbound` derives from the packet's own tag, so
+    /// Reads the prefix size through [`Self::outbound_junk_size`], the same
+    /// accessor `prepend_outbound` uses, so the prediction cannot drift from
+    /// the production by way of two spellings of one lookup. What it still has
+    /// to assume is the packet *kind*, which `prepend_outbound` derives from
+    /// the tag on the wire, so
     /// [`tests::the_predicted_cookie_reply_length_is_the_one_actually_produced`]
     /// pins the two together.
     ///
@@ -632,7 +643,46 @@ impl AmneziaConfig {
     /// runs on a default-feature `cargo test`.
     #[cfg(any(test, feature = "device"))]
     pub(crate) fn cookie_reply_len(&self, cookie_len: usize) -> usize {
-        cookie_len.saturating_add(self.cookie_packet_junk_size as usize)
+        cookie_len.saturating_add(self.outbound_junk_size(PacketKind::CookieReply))
+    }
+
+    /// The S sizes at which a cookie reply would be larger than the packet that
+    /// provokes it, if there are any.
+    ///
+    /// Returns `(kind, request_len, reply_len)` for the first packet kind that
+    /// amplifies, where `kind` is `"S1"` (an initiation) or `"S2"` (a response).
+    ///
+    /// `device::reply_policy::cookie_verdict` suppresses such a reply, because a
+    /// cookie reply aimed at a forged source is a reflector and the ratio is
+    /// fixed entirely by this configuration — an attacker cannot influence it.
+    /// The cost is real: the peer never learns the cookie, so it can never
+    /// produce a valid mac2, and every one of its handshakes fails for as long
+    /// as the device stays over `HANDSHAKE_RATE_LIMIT`.
+    ///
+    /// This exists so the operator hears about that when they set the sizes,
+    /// rather than during the flood. The condition is decidable from S1/S2/S3
+    /// alone — `64 + S3 > 148 + S1` for an initiation, `64 + S3 > 92 + S2` for a
+    /// response — so there is no reason to discover it at send time.
+    ///
+    /// It deliberately does **not** reject. The AmneziaWG kernel module accepts
+    /// these combinations, and a config this fork refuses but the reference
+    /// implementation runs would be an interoperability break for a
+    /// configuration that is merely unwise.
+    ///
+    /// Gated with `cookie_reply_len` above: `device::api` is the only caller.
+    #[cfg(any(test, feature = "device"))]
+    pub(crate) fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
+        let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
+        for (label, junk, base) in [
+            ("S1", self.init_packet_junk_size, HANDSHAKE_INIT_SZ),
+            ("S2", self.response_packet_junk_size, HANDSHAKE_RESP_SZ),
+        ] {
+            let request = base + junk as usize;
+            if reply > request {
+                return Some((label, request, reply));
+            }
+        }
+        None
     }
 
     pub(crate) fn prepend_outbound<'a>(
@@ -2056,5 +2106,53 @@ mod tests {
             let mut dns = vec![0u8; size];
             fill_dns_minimal_root_query(&mut dns, &mut rng);
         }
+    }
+
+    /// `cookie_reply_amplifies` agrees with the rule `reply_policy` enforces,
+    /// on both packet kinds and at the boundary.
+    ///
+    /// The two live in different modules and neither can see the other, so the
+    /// only thing keeping them in step is this test. The response bound
+    /// (`S3 > S2 + 28`) is the tighter of the two and had no coverage at all.
+    #[test]
+    fn cookie_reply_amplifies_agrees_with_the_rule_that_suppresses() {
+        // Parity exactly: 64 + S3 == 148 + S1 and == 92 + S2. Not an amplifier.
+        let ok = AmneziaConfig::new(100, 156, 184, 0);
+        assert_eq!(
+            ok.cookie_reply_amplifies(),
+            None,
+            "parity is not amplifying"
+        );
+
+        // One byte over on the initiation side.
+        let over_s1 = AmneziaConfig::new(100, 156, 185, 0);
+        assert_eq!(
+            over_s1.cookie_reply_amplifies(),
+            Some(("S1", 248, 249)),
+            "one byte past the initiation bound must be reported"
+        );
+
+        // The response bound is tighter, so a config can clear S1 and fail S2.
+        let over_s2 = AmneziaConfig::new(200, 100, 250, 0);
+        assert_eq!(
+            over_s2.cookie_reply_amplifies(),
+            Some(("S2", 192, 314)),
+            "the response bound is the tighter one and must be checked too"
+        );
+
+        // The shape a real installer rolls: S1 small, S3 large.
+        let installer = AmneziaConfig::new(15, 15, 150, 0);
+        assert!(
+            installer.cookie_reply_amplifies().is_some(),
+            "S1=15 S3=150 is a shape independent rolls produce, and it amplifies"
+        );
+
+        // And the interop harness's own sizes must not trip it.
+        let harness = AmneziaConfig::new(120, 130, 110, 80);
+        assert_eq!(
+            harness.cookie_reply_amplifies(),
+            None,
+            "the sizes scripts/awg-interop-poc.sh runs must keep their cookies"
+        );
     }
 }

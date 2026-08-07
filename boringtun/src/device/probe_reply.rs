@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use rand_core::RngCore;
 
 use super::probe_budget::ProbeBudget;
-use super::reply_policy::reply_target;
+use super::reply_policy::{reply_target, Door};
 use crate::noise::amnezia::{AmneziaConfig, AmneziaImitationProtocol};
 use crate::noise::handshake::ObfuscationRanges;
 use crate::noise::imitation::detect::{detect, Probe};
@@ -50,21 +50,33 @@ use crate::noise::quic::version_negotiation;
 /// carries its own bound, asserted where it is derived rather than restated
 /// here as a number that would go stale: a DNS SERVFAIL is never larger than
 /// its query, a STUN Binding Success is capped by `stun::MAX_SOFTWARE_LEN`, and
-/// a Version Negotiation by [`version_negotiation::MAX_LEN`] (525 bytes, and
-/// pinned there against `MIN_INITIAL_DATAGRAM`).
+/// a Version Negotiation by [`version_negotiation::MAX_LEN`], which is pinned
+/// against `MIN_INITIAL_DATAGRAM` in the module that derives it.
+///
+/// Two of those three bounds are *ratios* and one is not. A SERVFAIL and a
+/// Version Negotiation are each smaller than any datagram that can elicit them,
+/// so those responders attenuate. A Binding Success is not: against a bare
+/// 20-byte Binding Request it is around 52 bytes, so the STUN responder is a
+/// ~2.6x reflector and [`ProbeBudget`]'s aggregate ceiling is the only thing
+/// bounding it. Refusing to answer a request smaller than the reply would fix
+/// the ratio and cost the imitation — every public STUN server answers a bare
+/// Binding Request, so silence there is a one-packet tell — which is the
+/// trade this module has not made. Said here because the number is otherwise
+/// invisible beside two bounds that do hold.
 ///
 /// This is the backstop for a generator changing shape unnoticed. It must stay
 /// **below** `MIN_INITIAL_DATAGRAM` (1200): the QUIC responder only answers
-/// datagrams of at least that size, so a ceiling under it is what keeps a reply
-/// from ever exceeding the smallest request able to elicit one. Raising this to
-/// buy a test some margin would give that away.
+/// datagrams of at least that size, so a ceiling under it is what keeps a QUIC
+/// reply from ever exceeding the smallest request able to elicit one. Raising
+/// this to buy a test some margin would give that away.
 const MAX_REPLY_LEN: usize = 1024;
 
 // Both relationships are between constants, so they are enforced by the
 // compiler rather than by a test that someone could delete. The second is the
-// one that carries the security meaning: a reply can never be larger than the
-// smallest datagram able to elicit one.
-const _: () = assert!(version_negotiation::MAX_LEN < MAX_REPLY_LEN);
+// one that carries the security meaning: a *QUIC* reply can never be larger
+// than the smallest datagram able to elicit one. It says nothing about the
+// other two responders -- see the note on `MAX_REPLY_LEN` above.
+const _: () = assert!(version_negotiation::MAX_LEN <= MAX_REPLY_LEN);
 const _: () = assert!(MAX_REPLY_LEN < version_negotiation::MIN_INITIAL_DATAGRAM);
 
 /// Device-scoped state for answering probes.
@@ -180,7 +192,7 @@ fn reply_to(
     // also goes through. It hands back the *unmapped* address, which is what
     // `binding_success` must put in XOR-MAPPED-ADDRESS; see `reply_target` for
     // why the check and the unmapping are one call rather than two.
-    let from = reply_target(from)?;
+    let from = reply_target(from, Door::Probe)?;
 
     // One protocol, not four: only answer as the service we are imitating.
     let probe = detect(request)?;
@@ -263,9 +275,13 @@ mod tests {
         let mut p = vec![0xC3];
         p.extend_from_slice(&version.to_be_bytes());
         p.push(cid_len as u8);
-        p.extend(std::iter::repeat_n(0xAB, cid_len));
+        // `resize`, not `repeat_n`: the latter is Rust 1.82, three years newer
+        // than anything else this edition-2018 crate needs, and it would raise
+        // the toolchain floor for a two-line test helper. (`repeat().take()`
+        // does that job too, but clippy answers it by suggesting `repeat_n`.)
+        p.resize(p.len() + cid_len, 0xAB);
         p.push(cid_len as u8);
-        p.extend(std::iter::repeat_n(0xCD, cid_len));
+        p.resize(p.len() + cid_len, 0xCD);
         p.resize(MIN_INITIAL_DATAGRAM.max(p.len()), 0);
         p
     }
@@ -618,6 +634,17 @@ mod tests {
             dns_max,
             query.len()
         );
+        // `<=`, matching the production guard `reply.len() > MAX_REPLY_LEN`
+        // exactly. The claim is "no reply this build produces is ever dropped",
+        // and equality is not dropped -- asserting `<` here would be a second,
+        // stricter opinion about the boundary, which is how a test and the code
+        // it guards start disagreeing.
+        assert!(
+            dns_max <= MAX_REPLY_LEN,
+            "the largest DNS reply is {} bytes, over the {}-byte backstop",
+            dns_max,
+            MAX_REPLY_LEN
+        );
 
         // STUN: the longest SOFTWARE `binding_success` accepts, to an IPv6
         // client (the larger XOR-MAPPED-ADDRESS).
@@ -627,7 +654,7 @@ mod tests {
                 .expect("a minimal Binding Request is answerable")
                 .len();
         assert!(
-            stun_max < MAX_REPLY_LEN,
+            stun_max <= MAX_REPLY_LEN,
             "the largest STUN reply is {} bytes, over the {}-byte backstop",
             stun_max,
             MAX_REPLY_LEN
@@ -642,7 +669,6 @@ mod tests {
             version_negotiation::version_negotiation(&quic_initial(0xff00_001d, 255), &mut rng)
                 .expect("a draft-version Initial is answerable");
         assert_eq!(vn.len(), VN_MAX_LEN, "the worst case really is VN_MAX_LEN");
-        assert!(dns_max < MAX_REPLY_LEN, "DNS reply over the backstop");
 
         // `VN_MAX_LEN < MAX_REPLY_LEN` and `MAX_REPLY_LEN < MIN_INITIAL_DATAGRAM`
         // are relationships between constants, so they are `const _: () =

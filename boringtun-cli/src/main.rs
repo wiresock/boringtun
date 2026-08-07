@@ -180,6 +180,22 @@ fn main() {
         None => DEFAULT_PROBE_REPLY_BYTES_PER_SEC,
     };
 
+    // A rate without a protocol builds a responder that answers nothing:
+    // `probe_reply::reply_to` returns before it classifies anything when the
+    // imitation protocol is `none`. Refused rather than accepted for the same
+    // reason `--imitate-domain` is below -- an operator who asked for a service
+    // to be answerable and silently got silence has no way to find out but a
+    // packet capture. `--probe-reply-rate 0` stays legal everywhere: that is
+    // the spelling for "answer nothing", and it means the same thing here.
+    if probe_reply_rate > 0 && imitate == AmneziaImitationProtocol::None {
+        eprintln!(
+            "--probe-reply-rate {} has no effect without --imitate-protocol; \
+             the listen port only answers probes for the service it imitates",
+            probe_reply_rate
+        );
+        exit(1);
+    }
+
     // A domain that reaches `AmneziaImitation::new` and fails its validation is
     // dropped, and a *random* one is generated at emit time instead. Silently
     // camouflaging as a name the operator never chose is worse than refusing to

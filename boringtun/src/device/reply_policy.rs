@@ -59,24 +59,68 @@ fn unmap(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Which caller is asking, because the two can afford different answers about
+/// one address: `127.0.0.1`.
+///
+/// **A loopback source cannot be forged from off-host.** Linux drops a datagram
+/// whose source is in `127/8` on any non-loopback interface, as a martian
+/// source, and that drop is unconditional — measured across a veth with a raw
+/// socket, it still happens with `rp_filter=0` *and* `route_localnet=1` on every
+/// relevant interface. So a reply aimed at `127.0.0.1` can never leave this
+/// host, and there is no off-host reflection or amplification to bound. Refusing
+/// it buys nothing against the threat this module exists for.
+///
+/// It is not free, though, and the two doors pay differently:
+///
+/// - [`Door::Cookie`] **allows** loopback. A cookie is stock WireGuard's flood
+///   defence: suppress it and the peer can never produce a valid mac2, so every
+///   handshake from that peer fails for as long as the device stays over
+///   `HANDSHAKE_RATE_LIMIT`. A peer behind a local relay (udp2raw, phantun,
+///   wstunnel — the ordinary way this fork gets deployed past a filter) is
+///   exactly the peer that address belongs to, and refusing costs it every
+///   handshake at the moment cookies matter most.
+/// - [`Door::Probe`] **refuses** it. There is no such cost: a probe from
+///   loopback comes from this host, and the camouflage is aimed at an observer
+///   who is not on it. Refusing also denies a local process the ability to drain
+///   [`super::probe_budget::ProbeBudget`] and silence genuine probe replies.
+///
+/// Link-local is refused at both doors, and that one is a real trade rather than
+/// a free win: an on-link peer can legitimately hold `fe80::/10`, but unlike
+/// loopback a spoofed link-local source is deliverable, so refusing closes an
+/// on-segment reflection that nothing else closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Door {
+    /// The probe responder. Refuses loopback.
+    Probe,
+    /// The WireGuard cookie reply. Allows loopback.
+    Cookie,
+}
+
 /// Should we reply to this source address at all?
 ///
 /// Independent of what the datagram contains. A source address is
 /// attacker-chosen on a UDP socket, so these are the addresses a reply must
 /// never be aimed at:
 ///
-/// - **unspecified / loopback** — either bogus or a reply to ourselves;
+/// - **unspecified** — not a real source;
 /// - **multicast / broadcast** — one forged datagram becomes a reply hitting
 ///   every host on the segment, a multiplier no byte-based ceiling models;
-/// - **link-local** — not routable, and reachable only by an on-segment host
-///   that could have addressed us directly;
+/// - **link-local** — reachable only by an on-segment host, and a spoofed
+///   link-local source *is* deliverable (measured: it passes with
+///   `rp_filter=0`), so refusing it does close an on-segment reflection;
 /// - **`0.0.0.0/8` and `240.0.0.0/4`** — "this network" and reserved space; a
 ///   reply to either dies at the first hop, so it is budget spent on nothing;
-/// - **port 0** — not a real source.
+/// - **port 0** — not a real source;
+/// - **loopback**, for the probe door only — see [`Door`].
 ///
-/// None of these is an address a real peer can hold, which is what makes the
-/// rule safe to apply to the cookie path as well: a cookie reply suppressed
-/// here was never going to reach anyone who could use it.
+/// An earlier version of this doc claimed "none of these is an address a real
+/// peer can hold". That was false, and it was the premise for applying the whole
+/// list to the cookie path. A WireGuard peer reached through a local UDP relay
+/// holds `127.0.0.1`, and this repository's own integration tests configure
+/// exactly that — "a peer whose endpoint is on this machine"
+/// (`integration_tests/mod.rs`). A peer on a point-to-point link holds an IPv6
+/// link-local address and nothing else. Both are real; see [`Door`] for which
+/// of them each caller can afford to refuse.
 ///
 /// What it does **not** catch is a directed broadcast (`192.168.1.255`), which
 /// needs the local prefix to recognise. Linux refuses `sendto` to a
@@ -99,9 +143,12 @@ fn unmap(addr: SocketAddr) -> SocketAddr {
 /// from 40000 got silence and a SERVFAIL — a one-packet discriminator that no
 /// real DNS, STUN or QUIC server exhibits, in a module whose entire purpose is
 /// not to be discriminable.
-fn may_reply_to(from: SocketAddr) -> bool {
+fn may_reply_to(from: SocketAddr, door: Door) -> bool {
     if from.port() == 0 {
         return false;
+    }
+    if from.ip().is_loopback() {
+        return door == Door::Cookie;
     }
     match from.ip() {
         IpAddr::V4(v4) => {
@@ -112,7 +159,6 @@ fn may_reply_to(from: SocketAddr) -> bool {
             let this_network = v4.octets()[0] == 0;
             let reserved = v4.octets()[0] >= 240;
             !(v4.is_unspecified()
-                || v4.is_loopback()
                 || v4.is_multicast()
                 || v4.is_broadcast()
                 || v4.is_link_local()
@@ -123,7 +169,7 @@ fn may_reply_to(from: SocketAddr) -> bool {
             // `is_unicast_link_local` is unstable, so the fe80::/10 test is
             // written out rather than waiting for it.
             let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-            !(v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() || is_link_local)
+            !(v6.is_unspecified() || v6.is_multicast() || is_link_local)
         }
     }
 }
@@ -138,9 +184,9 @@ fn may_reply_to(from: SocketAddr) -> bool {
 /// `::ffff:255.255.255.255` — the form every IPv4 datagram arrives in on a
 /// dual-stack socket. Returning the normalised address makes it impossible to
 /// hold the check without also holding the normalisation.
-pub(crate) fn reply_target(from: SocketAddr) -> Option<SocketAddr> {
+pub(crate) fn reply_target(from: SocketAddr, door: Door) -> Option<SocketAddr> {
     let from = unmap(from);
-    if may_reply_to(from) {
+    if may_reply_to(from, door) {
         Some(from)
     } else {
         None
@@ -231,7 +277,7 @@ pub(crate) fn cookie_verdict(
     request_len: usize,
     reply_len: usize,
 ) -> CookieVerdict {
-    if reply_target(from).is_none() {
+    if reply_target(from, Door::Cookie).is_none() {
         return CookieVerdict::RefusedSource;
     }
     if reply_len > request_len {
@@ -247,6 +293,128 @@ mod tests {
 
     fn peer(addr: &str) -> SocketAddr {
         addr.parse().unwrap()
+    }
+
+    /// The one address the two doors answer differently, and why.
+    ///
+    /// A loopback source cannot be forged from off-host: Linux drops `127/8` as
+    /// a martian source on every non-loopback interface, unconditionally — it
+    /// still does with `rp_filter=0` and `route_localnet=1`, measured across a
+    /// veth with a raw socket. So a reply aimed there can never leave the host,
+    /// and refusing it prevents no reflection and no amplification.
+    ///
+    /// It does prevent a handshake. A peer reached through a local UDP relay
+    /// holds `127.0.0.1`, and this repository's own integration tests configure
+    /// exactly that. Suppressing its cookie means it can never produce a valid
+    /// mac2, so every one of its handshakes fails for as long as the device
+    /// stays over `HANDSHAKE_RATE_LIMIT` — the moment cookies exist for.
+    ///
+    /// Re-unifying the two doors is the mutation this guards against, and it is
+    /// the shape the module shipped with before this test existed.
+    #[test]
+    fn loopback_is_answered_at_the_cookie_door_and_refused_at_the_probe_door() {
+        for addr in [
+            "127.0.0.1:51820",
+            "[::1]:51820",
+            // Every IPv4 datagram reaching the dual-stack v6 socket arrives in
+            // the mapped form, so a relay-fronted peer looks like this.
+            "[::ffff:127.0.0.1]:51820",
+        ] {
+            assert!(
+                reply_target(peer(addr), Door::Cookie).is_some(),
+                "{} is a peer behind a local relay; its cookie must go out",
+                addr
+            );
+            assert_eq!(
+                reply_target(peer(addr), Door::Probe),
+                None,
+                "{} has no reason to be answered as a probe",
+                addr
+            );
+        }
+    }
+
+    /// The deployment case end to end: a loopback peer, an attenuating reply,
+    /// and the sizes the interop harness actually uses.
+    ///
+    /// Asserted through `cookie_verdict` rather than `reply_target` because the
+    /// regression was in the composition — the size rule was fine and the
+    /// address rule refused first.
+    #[test]
+    fn a_relay_fronted_peer_still_gets_its_cookie() {
+        // S1 = 120, S3 = 110: request 268, reply 174. The reply attenuates.
+        for addr in ["127.0.0.1:51820", "[::1]:51820", "[::ffff:127.0.0.1]:51820"] {
+            assert_eq!(
+                cookie_verdict(peer(addr), 268, 174),
+                CookieVerdict::Send,
+                "{} must receive the cookie its next handshake needs",
+                addr
+            );
+        }
+    }
+
+    /// Loopback is the *only* term that differs between the doors. Everything
+    /// else on the list is refused at both, so the split cannot quietly widen.
+    #[test]
+    fn the_doors_differ_on_loopback_and_nothing_else() {
+        let both_refuse = [
+            "0.0.0.0:40000",
+            "224.0.0.1:40000",
+            "255.255.255.255:40000",
+            "169.254.1.1:40000",
+            "0.1.2.3:40000",
+            "240.0.0.1:40000",
+            "203.0.113.5:0",
+            "[::]:40000",
+            "[ff02::1]:40000",
+            "[fe80::1]:40000",
+            "[::ffff:255.255.255.255]:40000",
+            "[::ffff:224.0.0.1]:40000",
+            "[::ffff:169.254.1.1]:40000",
+        ];
+        for addr in both_refuse {
+            assert_eq!(
+                reply_target(peer(addr), Door::Probe),
+                None,
+                "probe: {}",
+                addr
+            );
+            assert_eq!(
+                reply_target(peer(addr), Door::Cookie),
+                None,
+                "cookie: {} is refused at both doors",
+                addr
+            );
+        }
+        // And an ordinary routable source is allowed at both.
+        for addr in ["203.0.113.5:40000", "[2001:db8::1]:40000"] {
+            assert!(
+                reply_target(peer(addr), Door::Probe).is_some(),
+                "probe: {}",
+                addr
+            );
+            assert!(
+                reply_target(peer(addr), Door::Cookie).is_some(),
+                "cookie: {}",
+                addr
+            );
+        }
+        // The name of this test promises loopback *does* differ, so assert it
+        // here too rather than leaving that half to a sibling: re-unifying the
+        // doors must fail every test whose name claims they are split.
+        for addr in ["127.0.0.1:40000", "[::1]:40000"] {
+            assert_eq!(
+                reply_target(peer(addr), Door::Probe),
+                None,
+                "probe: {}",
+                addr
+            );
+            assert!(
+                reply_target(peer(addr), Door::Cookie).is_some(),
+                "cookie: {} is the one address the doors disagree about",
+                addr
+            );
+        }
     }
 
     /// A source address is attacker-chosen. Each of these turns one forged
@@ -277,7 +445,7 @@ mod tests {
         ];
         for (addr, what) in cases {
             assert_eq!(
-                reply_target(peer(addr)),
+                reply_target(peer(addr), Door::Probe),
                 None,
                 "{} must not be replied to",
                 what
@@ -291,7 +459,7 @@ mod tests {
     fn an_ordinary_source_is_allowed_over_either_family() {
         for addr in ["203.0.113.5:40000", "[2001:db8::1]:40000"] {
             assert_eq!(
-                reply_target(peer(addr)),
+                reply_target(peer(addr), Door::Probe),
                 Some(peer(addr)),
                 "{} is an ordinary peer address",
                 addr
@@ -309,7 +477,7 @@ mod tests {
     #[test]
     fn an_allowed_v4_mapped_source_comes_back_unmapped() {
         assert_eq!(
-            reply_target(peer("[::ffff:203.0.113.5]:40000")),
+            reply_target(peer("[::ffff:203.0.113.5]:40000"), Door::Probe),
             Some(peer("203.0.113.5:40000")),
             "the reply must be aimed at, and described by, the IPv4 address"
         );
@@ -325,7 +493,7 @@ mod tests {
         // address it is neither unspecified nor loopback nor multicast nor
         // link-local, so it is allowed *as itself*, not as 203.0.113.5.
         let compat = peer("[::203.0.113.5]:40000");
-        assert_eq!(reply_target(compat), Some(compat));
+        assert_eq!(reply_target(compat, Door::Probe), Some(compat));
     }
 
     /// The ~440x reflector this module exists to close, with the real numbers:

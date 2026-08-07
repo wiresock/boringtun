@@ -122,13 +122,15 @@ impl ProbeBudget {
     pub(crate) fn try_consume(&self, bytes: usize) -> bool {
         // The clock is read *inside* the retry loop, not snapshotted here.
         //
-        // One budget is shared by every worker (`Device::probe_budget`), so a
-        // thread that read the clock at millisecond 99 can find millisecond 100
-        // already stored by a thread that read it later. With a snapshot taken
-        // once up front, that thread sees `now < old_ts` on every retry and
-        // takes the wrap branch below -- which grants a *full* refill. That is
-        // not the rare 49-day event the branch was written for; it is ordinary
-        // contention under exactly the flood this ceiling exists to bound.
+        // One budget is shared by every worker -- `Device::probe_responder`
+        // holds the only one, and every thread reaches it through the device
+        // read guard -- so a thread that read the clock at millisecond 99 can
+        // find millisecond 100 already stored by a thread that read it later.
+        // With a snapshot taken once up front, that thread sees `now < old_ts`
+        // on every retry and takes the wrap branch below -- which grants a
+        // *full* refill. That is not the rare 49-day event the branch was
+        // written for; it is ordinary contention under exactly the flood this
+        // ceiling exists to bound.
         //
         // Reading after the state load makes it impossible: whatever `old_ts`
         // we observe was stored by a thread whose own read happened before our
@@ -178,11 +180,18 @@ impl ProbeBudget {
 
             if available < want {
                 // Store the refilled state even on refusal, so the next caller
-                // does not recompute the same elapsed window.
+                // does not recompute the same elapsed window -- but only when
+                // there is something to store. Once the bucket is empty and no
+                // time has passed, `new == old`, and issuing the CAS anyway
+                // would put a contended read-modify-write on this cache line
+                // for every refused datagram of a flood, which is the state
+                // this ceiling puts the process into by design.
                 let new = pack(available as u32, now);
-                let _ = self
-                    .state
-                    .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire);
+                if new != old {
+                    let _ =
+                        self.state
+                            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire);
+                }
                 return false;
             }
 

@@ -233,8 +233,10 @@ pub struct Device {
     /// so a per-thread copy would multiply the allowance the operator configured
     /// by `n_threads`; sharing it is also what made the clock handling in
     /// `ProbeBudget::try_consume` load-bearing (see the comment there). Its
-    /// STUN SOFTWARE value is per-device for the opposite reason: a single ICE
-    /// agent announces one stack, so it must not vary per worker or per reply.
+    /// STUN SOFTWARE value goes the other way and is wider still — one draw per
+    /// *process*, via `stun::host_software`, because a single ICE agent
+    /// announces one stack and the outbound Binding Requests read the same
+    /// value; it must not vary per worker, per reply, or per device.
     probe_responder: Option<ProbeResponder>,
 
     #[cfg(target_os = "linux")]
@@ -928,14 +930,25 @@ impl Device {
         // the whole signal: the operator needs to know traffic arrived before
         // the key, not how much of it did.
         let warned_keyless = AtomicBool::new(false);
-        // Also at most once per socket, and for a sharper reason than volume.
-        // Whether a cookie reply amplifies is fixed by S1/S2/S3, so once it is
-        // true it is true for every datagram of that kind until the operator
-        // changes the configuration -- and the datagrams that reach it arrive
-        // at flood rate by construction, since a cookie is only produced once
-        // the limiter is under load. Logging per refusal would turn one
-        // misconfiguration into a log flood driven by the attacker.
-        let warned_cookie_amplifier = AtomicBool::new(false);
+        // Also at most once, and for a sharper reason than volume. Whether a
+        // cookie reply amplifies is fixed by S1/S2/S3, so once it is true it is
+        // true for every datagram of that kind until the operator changes the
+        // configuration -- and the datagrams that reach it arrive at flood rate
+        // by construction, since a cookie is only produced once the limiter is
+        // under load. Logging per refusal would turn one misconfiguration into
+        // a log flood driven by the attacker.
+        //
+        // Keyed on the reply length rather than latched to a bare `true`,
+        // because "until the operator changes the configuration" is exactly
+        // what a `bool` cannot express: `set_obfuscation` rewrites S3 under a
+        // live socket (`awg syncconf` re-sends the whole `[Interface]` block on
+        // any peer add or revoke), and a latched flag would suppress the
+        // warning for every configuration after the first. The reply length is
+        // `S3 + 64`, so it moves only when the operator moves it -- unlike the
+        // request length, which alternates between an initiation and a response
+        // and would hand an attacker a way to drive the log.
+        const NEVER_WARNED: usize = usize::MAX;
+        let warned_cookie_amplifier = AtomicUsize::new(NEVER_WARNED);
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -988,20 +1001,26 @@ impl Device {
                 // bytes to the buffer, so this casting is safe.
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    // Bound the batch on datagrams *received*, not on datagrams
-                    // fully processed. Every `continue` below -- unrecognised
-                    // framing, a probe reply, a cookie reply, an unknown peer --
-                    // skips the bottom of the loop, so with the decrement down
-                    // there a flood of anything that is not a valid peer packet
-                    // kept this worker inside a single dispatch indefinitely. It
-                    // holds the device read lock while it spins, so `awg set`
-                    // blocks for the duration of the flood, and this worker's
-                    // timers never run. `MAX_ITR` is what `drain_datagrams`
-                    // already bounds itself by; this makes the main path agree.
-                    if iter == 0 {
+                // Bound the batch on datagrams *received*, not on datagrams
+                // fully processed. Every `continue` below -- unrecognised
+                // framing, a probe reply, a cookie reply, an unknown peer --
+                // skips the bottom of the loop, so with the decrement down
+                // there a flood of anything that is not a valid peer packet
+                // kept this worker inside a single dispatch indefinitely. It
+                // holds the device read lock while it spins, so `awg set`
+                // blocks for the duration of the flood, and this worker's
+                // timers never run. `MAX_ITR` is what `drain_datagrams`
+                // already bounds itself by; this makes the main path agree.
+                //
+                // The budget is spent *before* the receive, not after it: with
+                // the test inside the loop body the last iteration called
+                // `recv_from` first and broke afterwards, so one datagram per
+                // saturated dispatch was taken off the socket and dropped
+                // unprocessed -- a legitimate handshake as readily as junk.
+                while iter > 0 {
+                    let Ok((packet_len, addr)) = udp.recv_from(src_buf) else {
                         break;
-                    }
+                    };
                     iter -= 1;
 
                     // Resolved once, here, rather than twice further down behind
@@ -1073,7 +1092,9 @@ impl Device {
                                 }
                                 reply_policy::CookieVerdict::RefusedSource => {}
                                 reply_policy::CookieVerdict::WouldAmplify => {
-                                    if !warned_cookie_amplifier.swap(true, Ordering::Relaxed) {
+                                    if warned_cookie_amplifier.swap(reply_len, Ordering::Relaxed)
+                                        != reply_len
+                                    {
                                         tracing::warn!(
                                             message = "suppressing cookie replies: S3 makes them \
                                                        larger than the packets that provoke them, \

@@ -684,11 +684,6 @@ mod tests {
         String::from_utf8(v).expect("SOFTWARE is ASCII")
     }
 
-    /// The regression this pins: `generate` drew a fresh SOFTWARE per call, so a
-    /// device configured `ip=stun` announced a different ICE stack in every
-    /// pre-handshake burst. One host does not change ICE implementation between
-    /// connectivity checks.
-    ///
     /// How many bursts the two tests below compare.
     ///
     /// Not 2. The pool has five entries, so a re-drawing `generate` still
