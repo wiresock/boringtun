@@ -10,8 +10,8 @@
 # reachable from any unit test.
 #
 # Requires: root, the amneziawg kernel module, amneziawg-tools (awg), iproute2
-#           (ip), tcpdump, timeout, ping, and awk/cut/date/dd/grep/head/lsmod/
-#           od/tr.
+#           (ip), tcpdump, timeout, ping, and these coreutils:
+#           awk, cut, date, dd, grep, head, lsmod, od, tr.
 #           Preflight enforces every one of them and names the missing tool,
 #           because a missing dependency otherwise surfaces as a bogus test
 #           failure rather than as a setup problem.

@@ -403,7 +403,11 @@ mod tests {
         // `assert!` sites need it.
         assert!(
             got <= ceiling,
-            "{} workers admitted {} bytes in {} ms against a {} B/s ceiling              (bound {}); the budget is not aggregate",
+            // One line, single-spaced. A `\`-continued literal reads fine in the
+            // source and then `cargo fmt` joins the lines, leaving the
+            // indentation inside the string -- which is what a reader would have
+            // had to look past in the failure output.
+            "{} workers admitted {} bytes in {} ms against a {} B/s ceiling (bound {}); the budget is not aggregate",
             WORKERS,
             got,
             elapsed_ms,
