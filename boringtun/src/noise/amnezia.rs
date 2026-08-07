@@ -701,14 +701,10 @@ impl AmneziaConfig {
     /// The S sizes at which a cookie reply would be larger than the packet that
     /// provokes it, if there are any.
     ///
-    /// Returns `(kind, request_len, reply_len)` for the **binding** bound — the
-    /// shortest provoking packet, which is the one S3 has to clear — where
-    /// `kind` is `"S1"` (an initiation) or `"S2"` (a response).
-    ///
-    /// Not the first kind that amplifies: both can, and reporting whichever is
-    /// checked first names a limit that is still too high. See
-    /// [`Self::cookie_amplification_bounds`], which reports every violated
-    /// bound and which this narrows to the tightest.
+    /// Every request kind the reply would exceed, tightest bound first, as
+    /// `(kind, request_len, smallest_junk_that_clears_it)`, where `kind` is
+    /// `"S1"` (an initiation) or `"S2"` (a response). Empty when the
+    /// configuration does not amplify.
     ///
     /// `device::reply_policy::cookie_verdict` suppresses such a reply, because a
     /// cookie reply aimed at a forged source is a reflector and the ratio is
@@ -722,35 +718,24 @@ impl AmneziaConfig {
     /// alone — `64 + S3 > 148 + S1` for an initiation, `64 + S3 > 92 + S2` for a
     /// response — so there is no reason to discover it at send time.
     ///
-    /// This function only *reports*. [`Self::validate`] is what rejects, and it
-    /// does so deliberately: see the argument there for why refusing a
-    /// configuration the AmneziaWG kernel module would accept is the right trade
-    /// rather than an interoperability break worth avoiding.
-    ///
-    /// No longer gated: [`Self::validate`] calls it on every build, because a
-    /// configuration this shape is refused rather than merely warned about.
-    pub(crate) fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
-        let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
-        // Sorted tightest-first, so the first entry is the binding one.
-        let (label, request, _) = self.cookie_amplification_bounds().into_iter().next()?;
-        Some((label, request, reply))
-    }
-
-    /// Every request kind the cookie reply would exceed, tightest bound first,
-    /// as `(kind, request_len, smallest_junk_that_clears_it)`.
-    ///
-    /// Empty when the configuration does not amplify.
-    ///
     /// Both kinds can be violated at once, and they are independent: S3 has to
-    /// clear *both*. That is why this reports all of them rather than one. At
-    /// S1=100, S2=0, S3=185 the reply is 249 bytes against a 248-byte
-    /// initiation and a 92-byte response — advice naming either alone leaves
-    /// the other failing, and the operator is sent round twice.
+    /// clear *both*. That is why this reports all of them rather than the first
+    /// or the tightest. At S1=100, S2=0, S3=185 the reply is 249 bytes against a
+    /// 248-byte initiation and a 92-byte response — advice naming either alone
+    /// leaves the other failing, and the operator is sent round twice.
     ///
     /// The `min_junk` values are always reachable: `min_junk + base` is exactly
     /// `COOKIE_REPLY_SZ + S3`, and [`Self::validate`] has already bounded that
     /// by `MAX_SENDABLE_DATAGRAM` before it gets here, so following this advice
     /// can never trip the size check instead.
+    ///
+    /// This function only *reports*. [`Self::validate`] is what rejects, and it
+    /// does so deliberately: see the argument there for why refusing a
+    /// configuration the AmneziaWG kernel module would accept is the right trade
+    /// rather than an interoperability break worth avoiding.
+    ///
+    /// Not gated: [`Self::validate`] calls it on every build, because a
+    /// configuration this shape is refused rather than merely warned about.
     fn cookie_amplification_bounds(&self) -> Vec<(&'static str, usize, usize)> {
         let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
         let mut bounds: Vec<(&'static str, usize, usize)> = [
@@ -769,6 +754,24 @@ impl AmneziaConfig {
         // the same for the common symmetric configuration.
         bounds.sort_by_key(|&(_, request, _)| request);
         bounds
+    }
+
+    /// The **binding** bound as `(kind, request_len, reply_len)` — the shortest
+    /// provoking packet, the one S3 actually has to clear — or `None` when the
+    /// configuration does not amplify.
+    ///
+    /// A view over [`Self::cookie_amplification_bounds`], not a second
+    /// derivation. `validate` needs every violated bound, so it calls that
+    /// directly; this narrower shape is only convenient for asserting *which*
+    /// bound binds, and `#[cfg(test)]` accordingly — left ungated it is dead
+    /// code, and the crate carries a `dead_code` warning for it with or without
+    /// the `device` feature.
+    #[cfg(test)]
+    fn cookie_reply_amplifies(&self) -> Option<(&'static str, usize, usize)> {
+        let reply = COOKIE_REPLY_SZ + self.cookie_packet_junk_size as usize;
+        // Sorted tightest-first, so the first entry is the binding one.
+        let (label, request, _) = self.cookie_amplification_bounds().into_iter().next()?;
+        Some((label, request, reply))
     }
 
     pub(crate) fn prepend_outbound<'a>(
