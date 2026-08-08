@@ -205,7 +205,7 @@ impl Session {
             panic!("The destination buffer is too small");
         }
 
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed);
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
