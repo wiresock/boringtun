@@ -1157,6 +1157,25 @@ mod tests {
         packet
     }
 
+    /// Move time forward past a pacing gate, whichever clock is compiled in.
+    ///
+    /// The imitation and Jc sequences are paced by `Instant::now()`, so a test
+    /// that waits for the next datagram has to advance the clock the production
+    /// code is actually reading. `std::thread::sleep` only advances the real
+    /// one: under `mock-instant` the mocked clock stays put, `update_timers`
+    /// finds nothing due, and the test sees `Done` where it expected a
+    /// datagram. That is what `cargo hack test --each-feature` hit — these
+    /// tests passed under every other feature and failed under this one.
+    ///
+    /// Advancing the mock is also strictly better where it applies: no real
+    /// sleeping, and no dependence on the scheduler waking us late enough.
+    fn advance_past_pacing_gate(d: Duration) {
+        #[cfg(feature = "mock-instant")]
+        mock_instant::MockClock::advance(d);
+        #[cfg(not(feature = "mock-instant"))]
+        std::thread::sleep(d);
+    }
+
     #[cfg(feature = "mock-instant")]
     fn update_timer_results_in_handshake(tun: &mut Tunn) {
         let mut dst = vec![0u8; 2048];
@@ -1349,7 +1368,7 @@ mod tests {
                     "expected pre-handshake datagram for protocol={:?}",
                     protocol
                 );
-                std::thread::sleep(Duration::from_millis(25));
+                advance_past_pacing_gate(Duration::from_millis(25));
                 result = my_tun.update_timers(&mut dst);
             }
             let init = unwrap_network_packet(result);
@@ -1668,7 +1687,7 @@ mod tests {
             )];
             // Sleep past the protocol-natural inter-datagram delays (max 20 ms).
             for _ in 1..count {
-                std::thread::sleep(Duration::from_millis(25));
+                advance_past_pacing_gate(Duration::from_millis(25));
                 datagrams.push(unwrap_network_packet(my_tun.update_timers(&mut dst)));
             }
             assert_eq!(datagrams.len(), count, "protocol={protocol:?}");
@@ -1719,7 +1738,7 @@ mod tests {
             }
             datagrams += 1;
             assert!(datagrams <= 8, "imitation sequence did not terminate");
-            std::thread::sleep(Duration::from_millis(25));
+            advance_past_pacing_gate(Duration::from_millis(25));
             result = my_tun.update_timers(&mut dst);
         }
         // 2 STUN imitation packets + 2 Jc junk packets, then the initiation.
@@ -1740,7 +1759,7 @@ mod tests {
         // Drain the two STUN imitation packets (second after its 15 ms delay).
         let s1 = unwrap_network_packet(my_tun.format_handshake_initiation(&mut dst, false));
         assert_eq!(&s1[0..2], &[0x00, 0x01], "STUN Binding Request");
-        std::thread::sleep(Duration::from_millis(20));
+        advance_past_pacing_gate(Duration::from_millis(20));
         let s2 = unwrap_network_packet(my_tun.update_timers(&mut dst));
         assert_eq!(&s2[0..2], &[0x00, 0x01]);
 
