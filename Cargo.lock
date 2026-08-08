@@ -164,6 +164,7 @@ dependencies = [
  "rand_core",
  "ring",
  "socket2",
+ "subtle",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",

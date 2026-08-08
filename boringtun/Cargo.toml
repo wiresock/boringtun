@@ -33,6 +33,12 @@ tracing-subscriber = { version = "0.3", features = ["fmt"], optional = true }
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
 ring = "0.17"
+# Constant-time comparison for the handshake MACs and the peer static key.
+# `ring` deprecated its own `verify_slices_are_equal` with "no promises
+# regarding side channels", which is precisely the promise those call sites
+# need. Already in the tree via curve25519-dalek, digest and poly1305, so this
+# is a new edge rather than a new crate.
+subtle = { version = "2.6", default-features = false }
 x25519-dalek = { version = "2.0.1", features = [
     "reusable_secrets",
     "static_secrets",

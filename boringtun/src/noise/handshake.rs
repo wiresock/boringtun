@@ -84,6 +84,29 @@ pub(crate) fn b2s_keyed_mac_16_2(key: &[u8], data1: &[u8], data2: &[u8]) -> [u8;
     hmac.finalize_fixed().into()
 }
 
+/// Constant-time slice equality, for the handshake MACs and the peer static key.
+///
+/// These are the comparisons an attacker can drive: mac1 gates every handshake
+/// packet, mac2 gates them again under load, and the static-key check runs on
+/// the decrypted contents of an attacker-supplied initiation. A comparison that
+/// returned early on the first differing byte would leak the correct prefix a
+/// byte at a time.
+///
+/// `subtle` rather than `ring::constant_time::verify_slices_are_equal`, which
+/// `ring` 0.17 re-exports from `deprecated_constant_time` and deprecates with
+/// "Internal function not intended for external use with no promises regarding
+/// side channels" -- the one promise these callers actually need.
+///
+/// Behaviour matches what it replaces: `false` when the lengths differ, and
+/// otherwise a comparison whose time does not depend on the contents. Both
+/// short-circuit on length, which is not secret here -- every caller compares
+/// fixed-size MACs or keys.
+#[inline]
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
+
 pub(crate) fn b2s_mac_24(key: &[u8], data1: &[u8]) -> [u8; 24] {
     let mut hmac = Blake2sMac::new_from_slice(key).unwrap();
     blake2::digest::Update::update(&mut hmac, data1);
@@ -727,11 +750,12 @@ impl Handshake {
             &hash,
         )?;
 
-        ring::constant_time::verify_slices_are_equal(
+        if !constant_time_eq(
             self.params.peer_static_public.as_bytes(),
             &peer_static_public_decrypted,
-        )
-        .map_err(|_| WireGuardError::WrongKey)?;
+        ) {
+            return Err(WireGuardError::WrongKey);
+        }
 
         // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
         hash = b2s_hash(&hash, packet.encrypted_static);
@@ -1142,5 +1166,49 @@ mod tests {
 
         aead_chacha20_open(&mut [], &key, counter, &encrypted_nothing, &aad)
             .expect("Should open what we just sealed");
+    }
+}
+
+#[cfg(test)]
+mod constant_time_tests {
+    use super::constant_time_eq;
+
+    /// Matches what `ring::constant_time::verify_slices_are_equal` returned:
+    /// equal contents of equal length, and nothing else.
+    #[test]
+    fn it_accepts_only_equal_slices_of_equal_length() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(&[0u8; 16], &[0u8; 16]));
+        assert!(constant_time_eq(b"mac1----mac1----", b"mac1----mac1----"));
+
+        // Differs in the last byte: the case a byte-at-a-time comparison would
+        // take longest to reject, and the one an attacker walks backwards.
+        assert!(!constant_time_eq(b"mac1----mac1----", b"mac1----mac1---X"));
+        // ... and in the first.
+        assert!(!constant_time_eq(b"mac1----mac1----", b"Xac1----mac1----"));
+
+        // Length mismatch is a mismatch, not a panic and not a prefix match.
+        assert!(!constant_time_eq(b"mac1----mac1----", b"mac1----mac1---"));
+        assert!(!constant_time_eq(b"mac1----mac1---", b"mac1----mac1----"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+    }
+
+    /// A prefix that matches must not read as equal. This is the property the
+    /// MAC checks depend on: an attacker who can get "longest matching prefix"
+    /// accepted recovers a 16-byte MAC in 16*256 tries instead of 2^128.
+    #[test]
+    fn a_matching_prefix_is_not_a_match() {
+        let mac = [0xABu8; 16];
+        for prefix in 0..16usize {
+            let mut guess = [0x00u8; 16];
+            guess[..prefix].copy_from_slice(&mac[..prefix]);
+            assert!(
+                !constant_time_eq(&mac, &guess),
+                "a {}-byte matching prefix must still be rejected",
+                prefix
+            );
+        }
+        assert!(constant_time_eq(&mac, &mac));
     }
 }
