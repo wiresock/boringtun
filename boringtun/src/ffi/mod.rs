@@ -172,12 +172,20 @@ pub extern "C" fn x25519_key_to_hex(key: x25519_key) -> *const c_char {
 /// Frees memory of the string given by `x25519_key_to_hex` or `x25519_key_to_base64`
 ///
 /// A NULL pointer is a no-op, as `free(NULL)` is in C.
+///
+/// `*const`, matching `wireguard_ffi.h`, which has always declared this as
+/// `void x25519_key_to_str_free(const char *)` -- and matching the two
+/// functions that produce the pointer, which return `*const c_char`. The
+/// pointer is `*mut` underneath (it came from `CString::into_raw`), so the cast
+/// back is sound; taking `*mut` here only forced every caller to cast away a
+/// constness this library never really claimed. ABI is unchanged: both are thin
+/// pointers.
 #[no_mangle]
-pub unsafe extern "C" fn x25519_key_to_str_free(stringified_key: *mut c_char) {
+pub unsafe extern "C" fn x25519_key_to_str_free(stringified_key: *const c_char) {
     if stringified_key.is_null() {
         return;
     }
-    drop(CString::from_raw(stringified_key));
+    drop(CString::from_raw(stringified_key as *mut c_char));
 }
 
 /// Check if the input C-string represents a valid base64 encoded x25519 key.
@@ -1169,7 +1177,7 @@ mod tests {
     fn the_free_functions_accept_null() {
         unsafe {
             tunnel_free(std::ptr::null_mut());
-            x25519_key_to_str_free(std::ptr::null_mut());
+            x25519_key_to_str_free(std::ptr::null());
         }
     }
 
@@ -1184,10 +1192,10 @@ mod tests {
 
         let s = x25519_key_to_base64(key);
         assert!(!s.is_null());
-        unsafe { x25519_key_to_str_free(s as *mut c_char) };
+        unsafe { x25519_key_to_str_free(s) };
 
         let h = x25519_key_to_hex(public);
         assert!(!h.is_null());
-        unsafe { x25519_key_to_str_free(h as *mut c_char) };
+        unsafe { x25519_key_to_str_free(h) };
     }
 }
