@@ -34,11 +34,6 @@
 
 set -uo pipefail
 
-readonly NS_SRV=awgpoc-srv
-readonly NS_CLI=awgpoc-cli
-readonly NS_CLI2=awgpoc-cli2
-readonly IF_SRV=awgpoc0
-readonly IF_CLI=awgpocc
 readonly PORT=51820
 # Checked: on failure this is empty, and `cd ""` succeeds in bash without
 # changing directory, so the `cd "$WORKDIR" || die` below would not fire and
@@ -48,6 +43,28 @@ WORKDIR=$(mktemp -d /tmp/awg-interop-poc.XXXXXX) || {
   exit 2
 }
 readonly WORKDIR
+
+# Every kernel-visible name carries a token from the `mktemp` directory, so no
+# two runs -- and no unrelated workload -- can collide on one. That is what lets
+# `cleanup` reason about ownership at all: with fixed names, a namespace called
+# `awgpoc-srv` might be somebody else's, and preflight can only look for a
+# collision, never prevent one opening between the check and the create.
+#
+# Four characters of the token, not all six: the kernel allows 15 for an
+# interface name and `awgpoc-vs2-` already spends 11. Preflight asserts the
+# resulting lengths rather than trusting this arithmetic to survive a rename.
+RUN=${WORKDIR##*.}
+RUN=${RUN:0:4}
+readonly RUN
+readonly NS_SRV="awgpoc-srv-$RUN"
+readonly NS_CLI="awgpoc-cli-$RUN"
+readonly NS_CLI2="awgpoc-cli2-$RUN"
+readonly IF_SRV="awgpoc0-$RUN"
+readonly IF_CLI="awgpocc-$RUN"
+readonly VETH_S1="awgpoc-vs-$RUN"
+readonly VETH_C1="awgpoc-vc-$RUN"
+readonly VETH_S2="awgpoc-vs2-$RUN"
+readonly VETH_C2="awgpoc-vc2-$RUN"
 
 # Obfuscation parameters. H1-H4 are deliberately *ranges*, not single values:
 # that is how real deployments are configured, and single values would not
@@ -63,11 +80,17 @@ readonly H4=1526332224-2026332223
 # only if we created it: it may be host-managed, and cleanup also runs when
 # preflight refuses to start, so removing it unconditionally would be a host
 # change the safety notice rules out.
-# Set to 1 immediately before the first resource is created. Cleanup runs on
-# every exit path including a preflight refusal, and at that point this run
-# owns nothing -- tearing down links and sockets it did not create would be
-# the very clobbering preflight exists to prevent.
-SETUP_STARTED=0
+# What this run has actually created, appended to only after the creating
+# command reports success. A single "setup has started" flag could not say
+# this: it was set before the first create and then claimed everything, so an
+# `ip netns add` that failed *because the name was already taken* still left
+# cleanup believing that namespace was ours. It also never cleared, so once set
+# the claim outlived the resources.
+#
+# Emptied by `cleanup`, so nothing is claimed twice.
+OWNED_NS=()
+OWNED_LINKS=()
+OWNED_SOCKS=()
 # Set on any failing path. The failure messages point at $WORKDIR, so deleting
 # it on the way out would advertise a log file that never exists -- the harness
 # would be least debuggable exactly when it has something to report.
@@ -101,19 +124,44 @@ kill_server() {
   return 0
 }
 
+# Same rule, over every namespace this run owns rather than just the server's.
+kill_owned() {
+  local ns pids
+  for ns in ${OWNED_NS[@]+"${OWNED_NS[@]}"}; do
+    pids=$(ip netns pids "$ns" 2>/dev/null)
+    [ -n "$pids" ] && kill $pids >/dev/null 2>&1
+  done
+  return 0
+}
+
 cleanup() {
   local rc=$?
   set +e
-  # Only tear down what this run actually created.
-  if [ "$SETUP_STARTED" -eq 1 ]; then
-    kill_server
-    for ns in "$NS_SRV" "$NS_CLI" "$NS_CLI2"; do ip netns del "$ns" >/dev/null 2>&1; done
-    ip link del awgpoc-vs  >/dev/null 2>&1
-    ip link del awgpoc-vs2 >/dev/null 2>&1
-    rm -f "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"
-    # Remove the runtime directory only when this run created it, and only if empty.
-    [ "$AWG_RUNDIR_PREEXISTING" -eq 0 ] && rmdir "$AWG_RUNDIR" >/dev/null 2>&1
+  # Only tear down what this run actually created. Every loop below is over a
+  # name some command of ours reported success for; a preflight refusal, or a
+  # failure part-way through setup, leaves the rest unclaimed and untouched.
+  local ns link sock
+  kill_owned
+  for ns in ${OWNED_NS[@]+"${OWNED_NS[@]}"}; do
+    ip netns del "$ns" >/dev/null 2>&1
+  done
+  # Usually gone with the namespace they were moved into; this covers a failure
+  # between creating a veth pair and moving it.
+  for link in ${OWNED_LINKS[@]+"${OWNED_LINKS[@]}"}; do
+    ip link del "$link" >/dev/null 2>&1
+  done
+  for sock in ${OWNED_SOCKS[@]+"${OWNED_SOCKS[@]}"}; do
+    rm -f "$sock"
+  done
+  # Remove the runtime directory only when this run created it, and only if
+  # empty. Unlike the names above this one is shared and host-managed, so the
+  # pre-existing check is what stands in for ownership.
+  if [ ${#OWNED_NS[@]} -gt 0 ] && [ "$AWG_RUNDIR_PREEXISTING" -eq 0 ]; then
+    rmdir "$AWG_RUNDIR" >/dev/null 2>&1
   fi
+  OWNED_NS=()
+  OWNED_LINKS=()
+  OWNED_SOCKS=()
   # The temp dir is unambiguously ours (unique mktemp name), but keep it when
   # a check failed so the logs it points at are still there.
   if [ "$KEEP_WORKDIR" -eq 1 ]; then
@@ -193,8 +241,14 @@ for ns in "$NS_SRV" "$NS_CLI" "$NS_CLI2"; do
   ip netns list 2>/dev/null | grep -qw "$ns" && die "namespace $ns already exists; refusing to touch it"
 done
 ip link show "$IF_SRV" >/dev/null 2>&1 && die "interface $IF_SRV already exists; refusing to touch it"
-for veth in awgpoc-vs awgpoc-vc awgpoc-vs2 awgpoc-vc2; do
+for veth in "$VETH_S1" "$VETH_C1" "$VETH_S2" "$VETH_C2"; do
   ip link show "$veth" >/dev/null 2>&1 && die "interface $veth already exists; refusing to touch it"
+done
+# The names above are generated, so their length is a property of this script
+# rather than of the environment. `ip link add` would otherwise fail well into
+# setup with a message that says nothing about a rename being the cause.
+for ifname in "$IF_SRV" "$IF_CLI" "$VETH_S1" "$VETH_C1" "$VETH_S2" "$VETH_C2"; do
+  [ "${#ifname}" -le 15 ] || die "generated interface name '$ifname' is ${#ifname} characters; the kernel allows 15"
 done
 for sock in "/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock"; do
   [ -e "$sock" ] && die "$sock already exists; refusing to touch it"
@@ -215,19 +269,22 @@ awg genkey > srv.key; awg pubkey < srv.key > srv.pub
 awg genkey > cli.key; awg pubkey < cli.key > cli.pub
 awg genkey > cli2.key; awg pubkey < cli2.key > cli2.pub
 
-SETUP_STARTED=1   # from here on, cleanup owns what it tears down
-
-ip netns add "$NS_SRV"; ip netns add "$NS_CLI"; ip netns add "$NS_CLI2"
-ip link add awgpoc-vs  type veth peer name awgpoc-vc
-ip link add awgpoc-vs2 type veth peer name awgpoc-vc2
-ip link set awgpoc-vs  netns "$NS_SRV";  ip link set awgpoc-vc  netns "$NS_CLI"
-ip link set awgpoc-vs2 netns "$NS_SRV";  ip link set awgpoc-vc2 netns "$NS_CLI2"
+# Each name is claimed by the command that created it, on the line after that
+# command reported success. `set -e` is in force here, so a failed create exits
+# before its claim is recorded and cleanup never reaches for it.
+ip netns add "$NS_SRV";  OWNED_NS+=("$NS_SRV")
+ip netns add "$NS_CLI";  OWNED_NS+=("$NS_CLI")
+ip netns add "$NS_CLI2"; OWNED_NS+=("$NS_CLI2")
+ip link add "$VETH_S1" type veth peer name "$VETH_C1"; OWNED_LINKS+=("$VETH_S1" "$VETH_C1")
+ip link add "$VETH_S2" type veth peer name "$VETH_C2"; OWNED_LINKS+=("$VETH_S2" "$VETH_C2")
+ip link set "$VETH_S1" netns "$NS_SRV";  ip link set "$VETH_C1" netns "$NS_CLI"
+ip link set "$VETH_S2" netns "$NS_SRV";  ip link set "$VETH_C2" netns "$NS_CLI2"
 
 ip netns exec "$NS_SRV" sh -c "ip link set lo up
-  ip addr add 10.201.0.1/30 dev awgpoc-vs  && ip link set awgpoc-vs up
-  ip addr add 10.201.1.1/30 dev awgpoc-vs2 && ip link set awgpoc-vs2 up"
-ip netns exec "$NS_CLI"  sh -c "ip link set lo up; ip addr add 10.201.0.2/30 dev awgpoc-vc  && ip link set awgpoc-vc up"
-ip netns exec "$NS_CLI2" sh -c "ip link set lo up; ip addr add 10.201.1.2/30 dev awgpoc-vc2 && ip link set awgpoc-vc2 up"
+  ip addr add 10.201.0.1/30 dev $VETH_S1 && ip link set $VETH_S1 up
+  ip addr add 10.201.1.1/30 dev $VETH_S2 && ip link set $VETH_S2 up"
+ip netns exec "$NS_CLI"  sh -c "ip link set lo up; ip addr add 10.201.0.2/30 dev $VETH_C1 && ip link set $VETH_C1 up"
+ip netns exec "$NS_CLI2" sh -c "ip link set lo up; ip addr add 10.201.1.2/30 dev $VETH_C2 && ip link set $VETH_C2 up"
 
 # $1 = output file, $2 = private key, $3..: extra [Interface] lines
 write_iface_conf() {
@@ -262,6 +319,10 @@ SRV_EXTRA_ARGS=()
 start_server() {  # $1 = config file; SRV_EXTRA_ARGS = extra daemon flags
   # `${a[@]+"${a[@]}"}` rather than `"${a[@]}"`: under `set -u` an empty array
   # expansion is an unbound-variable error on bash before 4.4.
+  # Claimed before the launch, not after the socket appears: a daemon that
+  # starts and then hangs still leaves these behind, and `$IF_SRV` carries this
+  # run's token so no other run can own the paths.
+  OWNED_SOCKS+=("/var/run/wireguard/${IF_SRV}.sock" "/var/run/amneziawg/${IF_SRV}.sock")
   ip netns exec "$NS_SRV" env WG_LOG_FILE="$WORKDIR/srv.log" \
     "$BORINGTUN" --disable-drop-privileges \
     ${SRV_EXTRA_ARGS[@]+"${SRV_EXTRA_ARGS[@]}"} "$IF_SRV" >/dev/null 2>&1
@@ -511,7 +572,7 @@ check_allowed_ips cli2.pub 10.66.201.3/32
 info "6. Wire format: the S-prefix and H-range tag are really on the wire"
 # Without this, tests 3 and 5 would also pass if both ends silently agreed to
 # speak vanilla WireGuard -- which would prove nothing about obfuscation.
-ip netns exec "$NS_SRV" timeout 10 tcpdump -i awgpoc-vs -c 2 -w "$WORKDIR/wire.pcap" udp port "$PORT" >/dev/null 2>&1 &
+ip netns exec "$NS_SRV" timeout 10 tcpdump -i "$VETH_S1" -c 2 -w "$WORKDIR/wire.pcap" udp port "$PORT" >/dev/null 2>&1 &
 tcpdump_pid=$!
 sleep 1
 ip netns exec "$NS_CLI" ping -c2 -W2 -q 10.66.201.1 >/dev/null 2>&1
