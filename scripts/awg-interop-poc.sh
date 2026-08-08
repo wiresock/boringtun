@@ -50,21 +50,26 @@ readonly WORKDIR
 # `awgpoc-srv` might be somebody else's, and preflight can only look for a
 # collision, never prevent one opening between the check and the create.
 #
-# Four characters of the token, not all six: the kernel allows 15 for an
-# interface name and `awgpoc-vs2-` already spends 11. Preflight asserts the
-# resulting lengths rather than trusting this arithmetic to survive a rename.
+# The whole token, all six characters: 62^6 rather than 62^4. The kernel allows
+# 15 characters for an interface name, so the veths carry a shortened `awgp-`
+# prefix to afford it -- the namespaces have no such limit and keep `awgpoc-`.
+# Preflight asserts the resulting lengths rather than trusting this arithmetic
+# to survive a rename.
+#
+# Entropy is not what makes cleanup safe -- the ownership lists below are. A
+# collision here costs a run, because the loser's `ip netns add` fails and it
+# exits having claimed nothing; it does not cost the winner its namespaces.
 RUN=${WORKDIR##*.}
-RUN=${RUN:0:4}
 readonly RUN
 readonly NS_SRV="awgpoc-srv-$RUN"
 readonly NS_CLI="awgpoc-cli-$RUN"
 readonly NS_CLI2="awgpoc-cli2-$RUN"
 readonly IF_SRV="awgpoc0-$RUN"
 readonly IF_CLI="awgpocc-$RUN"
-readonly VETH_S1="awgpoc-vs-$RUN"
-readonly VETH_C1="awgpoc-vc-$RUN"
-readonly VETH_S2="awgpoc-vs2-$RUN"
-readonly VETH_C2="awgpoc-vc2-$RUN"
+readonly VETH_S1="awgp-vs-$RUN"
+readonly VETH_C1="awgp-vc-$RUN"
+readonly VETH_S2="awgp-vs2-$RUN"
+readonly VETH_C2="awgp-vc2-$RUN"
 
 # Obfuscation parameters. H1-H4 are deliberately *ranges*, not single values:
 # that is how real deployments are configured, and single values would not
