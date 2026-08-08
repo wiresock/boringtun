@@ -31,7 +31,7 @@ use std::sync::Once;
 static PANIC_HOOK: Once = Once::new();
 
 thread_local! {
-    static LAST_ERROR: std::cell::RefCell<Option<CString>> = std::cell::RefCell::new(None);
+    static LAST_ERROR: std::cell::RefCell<Option<CString>> = const { std::cell::RefCell::new(None) };
 }
 
 fn set_last_error(msg: &str) {
@@ -316,6 +316,10 @@ pub unsafe extern "C" fn new_tunnel(
     )
 }
 
+// The shared body of the six `extern "C"` tunnel constructors below, which
+// take these values as scalars because a C caller cannot pass a Rust type.
+// Collapsing the list here would only move the widening one frame outward.
+#[allow(clippy::too_many_arguments)]
 unsafe fn new_tunnel_with_amnezia_config(
     static_private: *const c_char,
     server_static_public: *const c_char,
@@ -855,6 +859,91 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation_browser(
     )
 }
 
+/// Drops the Tunn object
+#[no_mangle]
+pub unsafe extern "C" fn tunnel_free(tunnel: *mut Mutex<Tunn>) {
+    drop(Box::from_raw(tunnel));
+}
+
+/// Write an IP packet from the tunnel interface.
+/// For more details check noise::tunnel_to_network functions.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_write(
+    tunnel: *const Mutex<Tunn>,
+    src: *const u8,
+    src_size: u32,
+    dst: *mut u8,
+    dst_size: u32,
+) -> wireguard_result {
+    let mut tunnel = tunnel.as_ref().unwrap().lock();
+    // Slices are not owned, and therefore will not be freed by Rust
+    let src = slice::from_raw_parts(src, src_size as usize);
+    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+    wireguard_result::from(tunnel.encapsulate(src, dst))
+}
+
+/// Read a UDP packet from the server.
+/// For more details check noise::network_to_tunnel functions.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_read(
+    tunnel: *const Mutex<Tunn>,
+    src: *const u8,
+    src_size: u32,
+    dst: *mut u8,
+    dst_size: u32,
+) -> wireguard_result {
+    let mut tunnel = tunnel.as_ref().unwrap().lock();
+    // Slices are not owned, and therefore will not be freed by Rust
+    let src = slice::from_raw_parts(src, src_size as usize);
+    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+    wireguard_result::from(tunnel.decapsulate(None, src, dst))
+}
+
+/// This is a state keeping function, that need to be called periodically.
+/// Recommended interval: 100ms.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_tick(
+    tunnel: *const Mutex<Tunn>,
+    dst: *mut u8,
+    dst_size: u32,
+) -> wireguard_result {
+    let mut tunnel = tunnel.as_ref().unwrap().lock();
+    // Slices are not owned, and therefore will not be freed by Rust
+    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+    wireguard_result::from(tunnel.update_timers(dst))
+}
+
+/// Force the tunnel to initiate a new handshake, dst buffer must be at least 148 byte long.
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_force_handshake(
+    tunnel: *const Mutex<Tunn>,
+    dst: *mut u8,
+    dst_size: u32,
+) -> wireguard_result {
+    let mut tunnel = tunnel.as_ref().unwrap().lock();
+    // Slices are not owned, and therefore will not be freed by Rust
+    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
+    wireguard_result::from(tunnel.format_handshake_initiation(dst, true))
+}
+
+/// Returns stats from the tunnel:
+/// Time of last handshake in seconds (or -1 if no handshake occurred)
+/// Number of data bytes encapsulated
+/// Number of data bytes decapsulated
+#[no_mangle]
+pub unsafe extern "C" fn wireguard_stats(tunnel: *const Mutex<Tunn>) -> stats {
+    let tunnel = tunnel.as_ref().unwrap().lock();
+    let (time, tx_bytes, rx_bytes, estimated_loss, estimated_rtt) = tunnel.stats();
+    stats {
+        time_since_last_handshake: time.map(|t| t.as_secs() as i64).unwrap_or(-1),
+        tx_bytes,
+        rx_bytes,
+        estimated_loss,
+        estimated_rtt: estimated_rtt.map(|r| r as i32).unwrap_or(-1),
+        reserved: [0u8; 56],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,90 +1145,5 @@ mod tests {
             assert_eq!(last_error_string(), "Invalid static private key");
             last_tunnel_error_free();
         }
-    }
-}
-
-/// Drops the Tunn object
-#[no_mangle]
-pub unsafe extern "C" fn tunnel_free(tunnel: *mut Mutex<Tunn>) {
-    drop(Box::from_raw(tunnel));
-}
-
-/// Write an IP packet from the tunnel interface.
-/// For more details check noise::tunnel_to_network functions.
-#[no_mangle]
-pub unsafe extern "C" fn wireguard_write(
-    tunnel: *const Mutex<Tunn>,
-    src: *const u8,
-    src_size: u32,
-    dst: *mut u8,
-    dst_size: u32,
-) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let src = slice::from_raw_parts(src, src_size as usize);
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.encapsulate(src, dst))
-}
-
-/// Read a UDP packet from the server.
-/// For more details check noise::network_to_tunnel functions.
-#[no_mangle]
-pub unsafe extern "C" fn wireguard_read(
-    tunnel: *const Mutex<Tunn>,
-    src: *const u8,
-    src_size: u32,
-    dst: *mut u8,
-    dst_size: u32,
-) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let src = slice::from_raw_parts(src, src_size as usize);
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.decapsulate(None, src, dst))
-}
-
-/// This is a state keeping function, that need to be called periodically.
-/// Recommended interval: 100ms.
-#[no_mangle]
-pub unsafe extern "C" fn wireguard_tick(
-    tunnel: *const Mutex<Tunn>,
-    dst: *mut u8,
-    dst_size: u32,
-) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.update_timers(dst))
-}
-
-/// Force the tunnel to initiate a new handshake, dst buffer must be at least 148 byte long.
-#[no_mangle]
-pub unsafe extern "C" fn wireguard_force_handshake(
-    tunnel: *const Mutex<Tunn>,
-    dst: *mut u8,
-    dst_size: u32,
-) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().lock();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.format_handshake_initiation(dst, true))
-}
-
-/// Returns stats from the tunnel:
-/// Time of last handshake in seconds (or -1 if no handshake occurred)
-/// Number of data bytes encapsulated
-/// Number of data bytes decapsulated
-#[no_mangle]
-pub unsafe extern "C" fn wireguard_stats(tunnel: *const Mutex<Tunn>) -> stats {
-    let tunnel = tunnel.as_ref().unwrap().lock();
-    let (time, tx_bytes, rx_bytes, estimated_loss, estimated_rtt) = tunnel.stats();
-    stats {
-        time_since_last_handshake: time.map(|t| t.as_secs() as i64).unwrap_or(-1),
-        tx_bytes,
-        rx_bytes,
-        estimated_loss,
-        estimated_rtt: estimated_rtt.map(|r| r as i32).unwrap_or(-1),
-        reserved: [0u8; 56],
     }
 }

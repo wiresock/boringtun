@@ -389,6 +389,12 @@ impl ObfuscationRanges {
     /// Otherwise `start <= end` is required.
     ///
     /// All four ranges must be non-overlapping.
+    // Eight scalars, which are four `(start, end)` pairs. Taking four tuples
+    // would drop this to four arguments and read better -- `api.rs` already
+    // holds them that way and unpacks at the call. Not done here only because
+    // this is `pub` and the change belongs in an API revision rather than a
+    // lint fix; the `#[allow]` is a deferral, not a defence of the shape.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         h1_start: u32,
         h1_end: u32,

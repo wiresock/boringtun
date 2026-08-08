@@ -303,11 +303,7 @@ fn build_extension(
                 ext_application_settings(out);
             }
         }
-        ext::ENCRYPTED_CLIENT_HELLO => {
-            if profile.enable_ech {
-                ext_encrypted_client_hello(out, rng);
-            }
-        }
+        ext::ENCRYPTED_CLIENT_HELLO if profile.enable_ech => ext_encrypted_client_hello(out, rng),
         _ => {}
     }
 }

@@ -2041,13 +2041,18 @@ mod tests {
         // QUIC_JUNK_SIZE_MIN would be tautological, since the junk length is
         // drawn from that very constant.
         const RFC9000_MIN_INITIAL_DATAGRAM: usize = 1200;
-        assert!(
-            QUIC_JUNK_SIZE_MIN >= RFC9000_MIN_INITIAL_DATAGRAM,
-            "QUIC_JUNK_SIZE_MIN ({}) must not drop below the RFC 9000 §14.1 \
-             minimum ({}), or the Jc path emits invalid Initials",
-            QUIC_JUNK_SIZE_MIN,
-            RFC9000_MIN_INITIAL_DATAGRAM
-        );
+        // A `const` block, so this is a compile error rather than a test
+        // failure: both sides are constants, so there is nothing to wait until
+        // runtime for. That also costs the formatted message -- `assert!` in a
+        // const context takes a literal only -- so the two values are named in
+        // the text instead.
+        const {
+            assert!(
+                QUIC_JUNK_SIZE_MIN >= RFC9000_MIN_INITIAL_DATAGRAM,
+                "QUIC_JUNK_SIZE_MIN must not drop below 1200, the RFC 9000 \
+                 §14.1 minimum, or the Jc path emits invalid Initials"
+            )
+        };
 
         let cfg = AmneziaConfig::new(0, 0, 0, 0)
             .with_pre_handshake_junk(1, 0, 0, 0)

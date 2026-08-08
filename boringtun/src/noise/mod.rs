@@ -249,6 +249,13 @@ impl Tunn {
     }
 
     /// Create a new tunnel using own private key and the peer public key
+    // The eight trailing `u32`s are the H1-H4 tag ranges, spelled out rather
+    // than passed as the `ObfuscationRanges` they build. In-tree this is only
+    // reached from tests -- `device` and the C bindings both go to
+    // `new_with_amnezia` -- but it is a `pub` constructor of a library crate,
+    // so narrowing it breaks consumers outside this repository. That belongs in
+    // an API change, not a lint fix.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,
@@ -285,6 +292,11 @@ impl Tunn {
     }
 
     /// Create a new tunnel with Amnezia S1-S4 junk prefix handling.
+    // As `new` above, plus the `AmneziaConfig`. This is the one the C bindings
+    // actually reach (`ffi::new_tunnel_with_amnezia_config`), and a C caller
+    // cannot hand over an `ObfuscationRanges`, so the eight scalars have to
+    // survive at least as far as this frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_amnezia(
         static_private: x25519::StaticSecret,
         peer_static_public: x25519::PublicKey,
@@ -1924,25 +1936,25 @@ mod tests {
         for _ in 0..1000 {
             let v = obf.random_h1(&mut rng);
             assert!(
-                v >= 100 && v <= 200,
+                (100..=200).contains(&v),
                 "H1 random {} out of range [100..200]",
                 v
             );
             let v = obf.random_h2(&mut rng);
             assert!(
-                v >= 300 && v <= 400,
+                (300..=400).contains(&v),
                 "H2 random {} out of range [300..400]",
                 v
             );
             let v = obf.random_h3(&mut rng);
             assert!(
-                v >= 500 && v <= 600,
+                (500..=600).contains(&v),
                 "H3 random {} out of range [500..600]",
                 v
             );
             let v = obf.random_h4(&mut rng);
             assert!(
-                v >= 700 && v <= 800,
+                (700..=800).contains(&v),
                 "H4 random {} out of range [700..800]",
                 v
             );
