@@ -170,8 +170,13 @@ pub extern "C" fn x25519_key_to_hex(key: x25519_key) -> *const c_char {
 }
 
 /// Frees memory of the string given by `x25519_key_to_hex` or `x25519_key_to_base64`
+///
+/// A NULL pointer is a no-op, as `free(NULL)` is in C.
 #[no_mangle]
 pub unsafe extern "C" fn x25519_key_to_str_free(stringified_key: *mut c_char) {
+    if stringified_key.is_null() {
+        return;
+    }
     drop(CString::from_raw(stringified_key));
 }
 
@@ -860,8 +865,13 @@ pub unsafe extern "C" fn new_tunnel_with_amnezia_junk_imitation_browser(
 }
 
 /// Drops the Tunn object
+///
+/// A NULL pointer is a no-op, as `free(NULL)` is in C.
 #[no_mangle]
 pub unsafe extern "C" fn tunnel_free(tunnel: *mut Mutex<Tunn>) {
+    if tunnel.is_null() {
+        return;
+    }
     drop(Box::from_raw(tunnel));
 }
 
@@ -1145,5 +1155,39 @@ mod tests {
             assert_eq!(last_error_string(), "Invalid static private key");
             last_tunnel_error_free();
         }
+    }
+
+    /// The free functions accept NULL, as `free(NULL)` does in C.
+    ///
+    /// A C caller that frees unconditionally is idiomatic, and the constructors
+    /// here return NULL on every error path -- so `tunnel_free(new_tunnel(...))`
+    /// after a bad key is a realistic sequence, not a contrived one. Without the
+    /// guard these reconstruct a `Box`/`CString` from NULL, which is undefined
+    /// behaviour rather than a panic: this test is the only thing standing
+    /// between that and a caller who does the ordinary thing.
+    #[test]
+    fn the_free_functions_accept_null() {
+        unsafe {
+            tunnel_free(std::ptr::null_mut());
+            x25519_key_to_str_free(std::ptr::null_mut());
+        }
+    }
+
+    /// And still free a real allocation, so the guard did not turn them into
+    /// no-ops. Run under a leak detector this would also catch that; here it at
+    /// least pins that the non-NULL path is still taken.
+    #[test]
+    fn the_free_functions_still_free_a_real_pointer() {
+        let key = x25519_secret_key();
+        // `x25519_key` is `#[repr(C)]` and not `Copy`, so hand each call its own.
+        let public = x25519_public_key(x25519_key { key: key.key });
+
+        let s = x25519_key_to_base64(key);
+        assert!(!s.is_null());
+        unsafe { x25519_key_to_str_free(s as *mut c_char) };
+
+        let h = x25519_key_to_hex(public);
+        assert!(!h.is_null());
+        unsafe { x25519_key_to_str_free(h as *mut c_char) };
     }
 }
