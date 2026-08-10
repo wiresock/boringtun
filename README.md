@@ -1,3 +1,21 @@
+> ## ⚠️ This repository is archived
+>
+> Development continues in **[Wiresock-Foundation/wiresock-boringtun](https://github.com/Wiresock-Foundation/wiresock-boringtun)**, which carries the AmneziaWG and WireSock protocol extensions forward.
+>
+> *That repository is private while it is under test and will be made public shortly. Until then the link above returns 404 — that is expected, not a broken link.*
+>
+> ### Nothing here has been removed
+>
+> All five branches — `master`, `wiresock`, `amnezia`, `amnezia2`, `awg-2.0-extensions` — are still present and still clonable. Archiving makes a repository read-only; it does not affect anonymous reads, so `git clone`, `git fetch`, `git submodule update` and Cargo `git =` dependencies pointed at this URL keep working unchanged.
+>
+> What archiving does mean is that **no further commits can land here**. If you build against a branch of this repository, that branch is now frozen at its current tip.
+>
+> ### If you arrived here from a search
+>
+> `master` in this repository is an unmodified snapshot of [cloudflare/boringtun](https://github.com/cloudflare/boringtun), so the README below is Cloudflare's. The WireSock and AmneziaWG work is on the other branches, and its continuation is in the new repository.
+
+---
+
 ![boringtun logo banner](./banner.png)
 
 # BoringTun
