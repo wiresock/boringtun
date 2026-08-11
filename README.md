@@ -2,11 +2,11 @@
 >
 > Development continues in **[Wiresock-Foundation/wiresock-boringtun](https://github.com/Wiresock-Foundation/wiresock-boringtun)**, which carries the AmneziaWG and WireSock protocol extensions forward.
 >
-> *That repository is private while it is under test and will be made public shortly. Until then the link above returns 404 — that is expected, not a broken link.*
->
 > ### Nothing here has been removed
 >
 > All five branches — `master`, `wiresock`, `amnezia`, `amnezia2`, `awg-2.0-extensions` — are still present and still clonable. Archiving makes a repository read-only; it does not affect anonymous reads, so `git clone`, `git fetch`, `git submodule update` and Cargo `git =` dependencies pointed at this URL keep working unchanged.
+>
+> Three of them — `wiresock`, `amnezia` and `amnezia2` — exist *only* here. They were superseded rather than carried across, so this repository is the only place those commits live.
 >
 > What archiving does mean is that **no further commits can land here**. If you build against a branch of this repository, that branch is now frozen at its current tip.
 >
